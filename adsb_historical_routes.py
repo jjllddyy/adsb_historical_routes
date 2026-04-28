@@ -501,6 +501,59 @@ def parse_kml_tracks(kml_file: str, aircraft_id: str) -> List[Tuple[List[TrackPo
     return all_tracks
 
 
+def detect_flight_segments_with_preset(track_points: List["TrackPoint"], airports: List["Airport"],
+                                        preset: ConfidencePreset,
+                                        max_gap_minutes: float
+                                        ) -> List[Tuple[List["TrackPoint"], bool, Optional["Airport"], Optional["Airport"]]]:
+    """Like detect_flight_segments, but uses preset.airport_radius_km and preset.min_segment_points."""
+    if not track_points or len(track_points) < preset.min_segment_points:
+        return []
+
+    segments = []
+    current_segment = []
+    segment_has_gap = False
+    last_point = None
+
+    for point in track_points:
+        if last_point:
+            time_gap = (point.datetime - last_point.datetime).total_seconds() / 60
+            if time_gap > max_gap_minutes:
+                if len(current_segment) >= preset.min_segment_points:
+                    origin = find_nearest_airport(
+                        current_segment[0].lat, current_segment[0].lon, current_segment[0].alt,
+                        airports, max_distance_km=preset.airport_radius_km,
+                        max_alt_diff_ft=3000.0, lenient=True
+                    )
+                    destination = find_nearest_airport(
+                        current_segment[-1].lat, current_segment[-1].lon, current_segment[-1].alt,
+                        airports, max_distance_km=preset.airport_radius_km,
+                        max_alt_diff_ft=3000.0, lenient=True
+                    )
+                    segments.append((current_segment, segment_has_gap, origin, destination))
+                current_segment = [point]
+                segment_has_gap = False
+            else:
+                current_segment.append(point)
+        else:
+            current_segment = [point]
+        last_point = point
+
+    if len(current_segment) >= preset.min_segment_points:
+        origin = find_nearest_airport(
+            current_segment[0].lat, current_segment[0].lon, current_segment[0].alt,
+            airports, max_distance_km=preset.airport_radius_km,
+            max_alt_diff_ft=3000.0, lenient=True
+        )
+        destination = find_nearest_airport(
+            current_segment[-1].lat, current_segment[-1].lon, current_segment[-1].alt,
+            airports, max_distance_km=preset.airport_radius_km,
+            max_alt_diff_ft=3000.0, lenient=True
+        )
+        segments.append((current_segment, segment_has_gap, origin, destination))
+
+    return segments
+
+
 def detect_flight_segments(track_points: List[TrackPoint], airports: List[Airport],
                           max_gap_minutes: float) -> List[Tuple[List[TrackPoint], bool, Optional[Airport], Optional[Airport]]]:
     """
