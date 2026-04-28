@@ -17,9 +17,75 @@ import sys
 import os
 import glob
 from collections import defaultdict
+from dataclasses import dataclass, replace
 from typing import List, Tuple, Dict, Optional, Set
 import csv
 import re
+
+
+@dataclass(frozen=True)
+class ConfidencePreset:
+    """Tunable knobs for flight detection and joining aggressiveness."""
+    name: str
+    airport_radius_km: float
+    max_join_gap_hours: float
+    max_join_distance_km: float
+    route_time_tolerance: float
+    route_time_rescue: bool
+    direction_aware_rescue: bool
+    min_segment_points: int = 20
+    min_flight_altitude_m: float = 300.0
+
+
+PRESETS: Dict[str, ConfidencePreset] = {
+    "strict": ConfidencePreset(
+        name="strict",
+        airport_radius_km=20,
+        max_join_gap_hours=2.0,
+        max_join_distance_km=100,
+        route_time_tolerance=0.25,
+        route_time_rescue=False,
+        direction_aware_rescue=False,
+    ),
+    "balanced": ConfidencePreset(
+        name="balanced",
+        airport_radius_km=50,
+        max_join_gap_hours=3.0,
+        max_join_distance_km=200,
+        route_time_tolerance=0.40,
+        route_time_rescue=True,
+        direction_aware_rescue=True,
+    ),
+    "permissive": ConfidencePreset(
+        name="permissive",
+        airport_radius_km=100,
+        max_join_gap_hours=4.0,
+        max_join_distance_km=500,
+        route_time_tolerance=0.60,
+        route_time_rescue=True,
+        direction_aware_rescue=True,
+    ),
+}
+
+
+def resolve_preset(args) -> ConfidencePreset:
+    """Apply CLI overrides on top of the named preset, returning a (possibly renamed) ConfidencePreset."""
+    base = PRESETS[args.confidence]
+    overrides = {}
+    if getattr(args, "airport_radius_km", None) is not None:
+        overrides["airport_radius_km"] = args.airport_radius_km
+    if getattr(args, "max_join_gap_hours", None) is not None:
+        overrides["max_join_gap_hours"] = args.max_join_gap_hours
+    if getattr(args, "max_join_distance_km", None) is not None:
+        overrides["max_join_distance_km"] = args.max_join_distance_km
+    if getattr(args, "route_time_tolerance", None) is not None:
+        overrides["route_time_tolerance"] = args.route_time_tolerance
+    rtr = getattr(args, "route_time_rescue", None)
+    if rtr is not None:
+        overrides["route_time_rescue"] = (rtr == "on")
+    if not overrides:
+        return base
+    return replace(base, name="custom", **overrides)
 
 
 class Airport:
