@@ -615,22 +615,57 @@ def detect_flight_segments(track_points: List[TrackPoint], airports: List[Airpor
     return segments
 
 
-def match_route_by_time(origin_code: str, flight_duration: float, 
+def match_route_by_time(origin_code: str, flight_duration: float,
                        routes_dict: Dict[Tuple[str, str], float],
                        tolerance: float = 0.4) -> Optional[str]:
     """Match destination airport based on origin and flight time"""
     best_match = None
     best_diff = float('inf')
-    
+
     for (orig, dest), avg_time in routes_dict.items():
         if orig == origin_code:
             time_diff = abs(flight_duration - avg_time)
             relative_diff = time_diff / avg_time
-            
+
             if relative_diff < tolerance and time_diff < best_diff:
                 best_diff = time_diff
                 best_match = dest
-    
+
+    return best_match
+
+
+def match_route_by_time_with_bearing(segment: "FlightSegment",
+                                      routes_dict: Dict[Tuple[str, str], float],
+                                      airports_dict: Dict[str, "Airport"],
+                                      tolerance: float = 0.4,
+                                      bearing_tolerance_deg: float = 45.0) -> Optional[str]:
+    """Like match_route_by_time, but also requires the bearing from segment's origin to candidate destination to align with the segment's mean cruise bearing within bearing_tolerance_deg degrees."""
+    if not segment.origin or not segment.points:
+        return None
+
+    seg_brg = mean_bearing(segment.points, window_minutes=15.0)
+    best_match = None
+    best_diff = float("inf")
+
+    for (orig, dest), avg_time in routes_dict.items():
+        if orig != segment.origin.code:
+            continue
+        if dest not in airports_dict:
+            continue
+        time_diff = abs(segment.flight_duration - avg_time)
+        relative_diff = time_diff / avg_time
+        if relative_diff >= tolerance:
+            continue
+
+        cand_brg = bearing(segment.origin.lat, segment.origin.lon,
+                           airports_dict[dest].lat, airports_dict[dest].lon)
+        if angular_diff(cand_brg, seg_brg) > bearing_tolerance_deg:
+            continue
+
+        if time_diff < best_diff:
+            best_diff = time_diff
+            best_match = dest
+
     return best_match
 
 
@@ -649,131 +684,200 @@ def assert_join_invariants(current: "FlightSegment", next_seg: "FlightSegment") 
         )
 
 
-def combine_segments_intelligently(segments: List[FlightSegment], airports: List[Airport],
+def combine_segments_intelligently(segments: List["FlightSegment"], airports: List["Airport"],
                                    routes_dict: Dict[Tuple[str, str], float],
-                                   max_join_gap_hours: float = 2.0) -> List[FlightSegment]:
-    """
-    Intelligently combine segments with aggressive joining for incomplete segments
+                                   preset: ConfidencePreset = None,
+                                   max_join_gap_hours: float = None,
+                                   recorder: Optional["DiagnosticsRecorder"] = None,
+                                   raw_idx_by_segment: Optional[Dict[int, int]] = None,
+                                   ) -> List["FlightSegment"]:
+    """Intelligently combine segments using the preset's join knobs.
+
+    Backward-compat: if ``preset`` is None, uses the legacy hardcoded values.
+    The optional ``recorder`` and ``raw_idx_by_segment`` enable diagnostics CSV output.
     """
     if not segments:
         return []
-    
-    # Sort by time
+
+    if preset is None:
+        # Legacy behavior preserved for any callers that don't pass a preset
+        eff_gap = max_join_gap_hours if max_join_gap_hours is not None else 2.0
+        eff_dist = 100.0
+        eff_route_tol = 0.4
+        rt_rescue = True
+        dir_aware = False
+    else:
+        eff_gap = preset.max_join_gap_hours
+        eff_dist = preset.max_join_distance_km
+        eff_route_tol = preset.route_time_tolerance
+        rt_rescue = preset.route_time_rescue
+        dir_aware = preset.direction_aware_rescue
+
     segments.sort(key=lambda s: s.takeoff_time if s.takeoff_time else datetime.min)
-    
     airports_dict = {a.code: a for a in airports}
     combined = []
     i = 0
-    
+
+    def raw_idx(seg):
+        return raw_idx_by_segment.get(id(seg), -1) if raw_idx_by_segment else -1
+
+    def record_outcome(seg, disposition, drop_reason="", joined_with=None, rescue_method="none"):
+        if recorder is not None:
+            recorder.record_outcome(
+                seg, segment_idx=raw_idx(seg), disposition=disposition,
+                drop_reason=drop_reason, joined_with=joined_with or [],
+                rescue_method=rescue_method, airports=airports
+            )
+
     while i < len(segments):
         current = segments[i]
-        
-        # Skip if already complete and valid
+        joined_idxs = []
+        rescue_method = "none"
+
         if current.is_complete and current.is_valid_flight():
             combined.append(current)
+            record_outcome(current, "kept_complete")
             i += 1
             continue
-        
-        # Try to enhance incomplete segment
-        if current.origin and not current.destination:
-            # Has origin, missing destination
-            # Try to match using route data
-            dest_code = match_route_by_time(current.origin.code, current.flight_duration, routes_dict)
+
+        # Forward route-time rescue (origin known, dest missing) — only if preset enables it
+        if rt_rescue and current.origin and not current.destination:
+            dest_code = match_route_by_time_with_bearing(
+                current, routes_dict, airports_dict, tolerance=eff_route_tol
+            )
             if dest_code and dest_code in airports_dict:
                 current.destination = airports_dict[dest_code]
                 current.is_complete = True
-                print(f"        Enhanced {current.origin.code} -> {dest_code} using route time matching")
-        
-        elif not current.origin and current.destination:
-            # Missing origin, has destination
-            # Look for matching origin by reverse route
+                rescue_method = "route_time_forward"
+                print(f"        Enhanced {current.origin.code} -> {dest_code} via route-time + bearing")
+
+        # Reverse route-time rescue (dest known, origin missing)
+        elif rt_rescue and not current.origin and current.destination:
             for (orig, dest), avg_time in routes_dict.items():
-                if dest == current.destination.code:
-                    time_diff = abs(current.flight_duration - avg_time)
-                    if time_diff < avg_time * 0.4 and orig in airports_dict:
-                        current.origin = airports_dict[orig]
-                        current.is_complete = True
-                        print(f"        Enhanced {orig} -> {current.destination.code} using reverse route matching")
-                        break
-        
-        # Try to join with next segment
+                if dest != current.destination.code:
+                    continue
+                time_diff = abs(current.flight_duration - avg_time)
+                if time_diff < avg_time * eff_route_tol and orig in airports_dict:
+                    if dir_aware:
+                        # Bearing from origin → destination should align with current's mean bearing
+                        cand_brg = bearing(airports_dict[orig].lat, airports_dict[orig].lon,
+                                           current.destination.lat, current.destination.lon)
+                        seg_brg = mean_bearing(current.points, window_minutes=15.0)
+                        if angular_diff(cand_brg, seg_brg) > 45.0:
+                            continue
+                    current.origin = airports_dict[orig]
+                    current.is_complete = True
+                    rescue_method = "route_time_reverse"
+                    print(f"        Enhanced {orig} -> {current.destination.code} via reverse route-time + bearing")
+                    break
+
+        # Try to join with the next segment
         if i + 1 < len(segments):
             next_seg = segments[i + 1]
-            time_gap = (next_seg.takeoff_time - current.landing_time).total_seconds() / 3600
-            
-            # Can join if time gap is reasonable
-            if time_gap < max_join_gap_hours:
-                # Check if segments should be joined
-                should_join = False
-                
-                # Case 1: Current has no dest, next has no origin, close in space/time
-                if not current.destination and not next_seg.origin:
-                    if current.points and next_seg.points:
-                        dist = haversine_distance(
-                            current.points[-1].lat, current.points[-1].lon,
-                            next_seg.points[0].lat, next_seg.points[0].lon
-                        )
-                        if dist < 100:  # Within 100km
-                            should_join = True
-                
-                # Case 2: Both at high altitude (cruise), likely same flight
-                # Only join if they're also close spatially
-                if (current.max_altitude > 3000 and next_seg.max_altitude > 3000 and
-                    time_gap < 0.5):  # Less than 30 minutes
-                    if current.points and next_seg.points:
-                        dist = haversine_distance(
-                            current.points[-1].lat, current.points[-1].lon,
-                            next_seg.points[0].lat, next_seg.points[0].lon
-                        )
-                        if dist < 200:  # Must be within 200km
-                            should_join = True
-                
-                # Case 3: Current dest matches next origin
-                if (current.destination and next_seg.origin and 
-                    current.destination.code == next_seg.origin.code):
-                    # This is probably ground time, don't join
+            if current.aircraft_id == next_seg.aircraft_id:
+                assert_join_invariants(current, next_seg)
+                time_gap_h = (next_seg.takeoff_time - current.landing_time).total_seconds() / 3600
+
+                if time_gap_h < eff_gap:
                     should_join = False
-                
-                # Case 4: Both segments are complete - DON'T JOIN
-                if current.is_complete and next_seg.is_complete:
-                    should_join = False
-                
-                if should_join:
-                    print(f"        Joining segments: {current} + {next_seg}")
-                    # Combine points
-                    new_points = current.points + next_seg.points
-                    new_segment = FlightSegment(
-                        current.aircraft_id,
-                        current.registration,
-                        new_points,
-                        current.origin or next_seg.origin,
-                        next_seg.destination or current.destination,
-                        current.style_color,
-                        current.style_width,
-                        current.style_opacity,
-                        current.source_file
-                    )
-                    new_segment.has_gaps = current.has_gaps or next_seg.has_gaps
-                    current = new_segment
-                    i += 1  # Skip the joined segment
-        
-        # Add if valid
+
+                    # Case 1: both endpoints incomplete and close in space
+                    if not current.destination and not next_seg.origin:
+                        if current.points and next_seg.points:
+                            dist = haversine_distance(
+                                current.points[-1].lat, current.points[-1].lon,
+                                next_seg.points[0].lat, next_seg.points[0].lon
+                            )
+                            if dist < eff_dist:
+                                should_join = True
+
+                    # Case 2: both at altitude, very short gap
+                    if (current.max_altitude > 3000 and next_seg.max_altitude > 3000 and
+                            time_gap_h < 0.5):
+                        if current.points and next_seg.points:
+                            dist = haversine_distance(
+                                current.points[-1].lat, current.points[-1].lon,
+                                next_seg.points[0].lat, next_seg.points[0].lon
+                            )
+                            if dist < eff_dist:
+                                should_join = True
+
+                    # Case 3: dest matches next origin → these are sequential flights, DO NOT JOIN
+                    if (current.destination and next_seg.origin and
+                            current.destination.code == next_seg.origin.code):
+                        should_join = False
+
+                    # Case 4: both already complete → DO NOT JOIN
+                    if current.is_complete and next_seg.is_complete:
+                        should_join = False
+
+                    # Case 5 (new): direction-aware mid-cruise join
+                    if (dir_aware and not current.destination and not next_seg.origin and
+                            current.points and next_seg.points):
+                        seg_brg = mean_bearing(current.points, window_minutes=10.0)
+                        gap_brg = bearing(current.points[-1].lat, current.points[-1].lon,
+                                          next_seg.points[0].lat, next_seg.points[0].lon)
+                        if angular_diff(seg_brg, gap_brg) <= 30.0:
+                            # Sanity-check: gap distance ≈ cruise-speed × time (reject extreme outliers)
+                            gap_dist = haversine_distance(
+                                current.points[-1].lat, current.points[-1].lon,
+                                next_seg.points[0].lat, next_seg.points[0].lon
+                            )
+                            implied_speed = gap_dist / max(time_gap_h, 0.01)
+                            if 200 <= implied_speed <= 1100:  # km/h, plausible cruise band
+                                should_join = True
+                                rescue_method = "bearing_join"
+
+                    if should_join:
+                        print(f"        Joining segments: {current} + {next_seg}")
+                        new_points = current.points + next_seg.points
+                        new_segment = FlightSegment(
+                            current.aircraft_id,
+                            current.registration,
+                            new_points,
+                            current.origin or next_seg.origin,
+                            next_seg.destination or current.destination,
+                            current.style_color,
+                            current.style_width,
+                            current.style_opacity,
+                            current.source_file,
+                        )
+                        new_segment.has_gaps = current.has_gaps or next_seg.has_gaps
+                        joined_idxs = [raw_idx(current), raw_idx(next_seg)]
+                        # Record the consumed `next_seg` outcome before overwriting `current`
+                        record_outcome(next_seg, "kept_joined", joined_with=[raw_idx(current)],
+                                       rescue_method=rescue_method)
+                        current = new_segment
+                        i += 1
+
         if current.is_valid_flight():
+            disp = "kept_rescued" if rescue_method != "none" else (
+                "kept_joined" if joined_idxs else "kept_complete"
+            )
             combined.append(current)
+            record_outcome(current, disp, joined_with=joined_idxs, rescue_method=rescue_method)
         else:
-            # One more attempt: if has origin, try route matching again
-            if current.origin and not current.destination and current.max_altitude > 3000:
-                dest_code = match_route_by_time(current.origin.code, current.flight_duration, 
-                                               routes_dict, tolerance=0.5)
+            # Last-chance route-time rescue with looser tolerance
+            if rt_rescue and current.origin and not current.destination and current.max_altitude > 3000:
+                dest_code = match_route_by_time_with_bearing(
+                    current, routes_dict, airports_dict, tolerance=min(eff_route_tol + 0.1, 0.7)
+                )
                 if dest_code and dest_code in airports_dict:
                     current.destination = airports_dict[dest_code]
                     current.is_complete = True
                     if current.is_valid_flight():
                         print(f"        Rescued segment: {current.origin.code} -> {dest_code}")
                         combined.append(current)
-        
+                        record_outcome(current, "kept_rescued",
+                                       joined_with=joined_idxs, rescue_method="route_time_forward")
+                        i += 1
+                        continue
+            record_outcome(current, "dropped_unjoined",
+                           drop_reason="no_airport_match" if not current.origin or not current.destination else "invalid",
+                           joined_with=joined_idxs)
+
         i += 1
-    
+
     return combined
 
 
