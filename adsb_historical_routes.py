@@ -724,8 +724,112 @@ def combine_segments_intelligently(segments: List[FlightSegment], airports: List
     return combined
 
 
+class DiagnosticsRecorder:
+    """Buffers per-segment diagnostic rows and writes them as a CSV sidecar to the output KML."""
+
+    COLUMNS = [
+        "phase", "preset", "aircraft_id", "registration", "source_file",
+        "segment_idx", "takeoff_time", "landing_time", "duration_min",
+        "num_points", "max_alt_m", "total_distance_km", "mean_bearing_deg",
+        "origin_code", "dest_code", "origin_dist_km", "dest_dist_km",
+        "nearest_airport_start_code", "nearest_airport_start_km",
+        "nearest_airport_end_code", "nearest_airport_end_km",
+        "disposition", "drop_reason", "joined_with_segment_idx", "rescue_method",
+    ]
+
+    def __init__(self, output_kml_path: str, preset_name: str):
+        self.csv_path = output_kml_path + ".diagnostics.csv"
+        self.preset_name = preset_name
+        self.rows: List[Dict[str, str]] = []
+
+    def _nearest_within(self, lat: float, lon: float, airports: List["Airport"], max_km: float = 1000.0):
+        """Return (airport, distance_km) for the closest airport.
+
+        The airport reference is None when nothing is within max_km, but the returned distance is always the true minimum distance to any airport in the list (or inf if airports is empty), so callers can record it in diagnostics regardless of the radius cap.
+        """
+        nearest_overall = None
+        min_d = float("inf")
+        for a in airports:
+            d = haversine_distance(lat, lon, a.lat, a.lon)
+            if d < min_d:
+                min_d = d
+                nearest_overall = a
+        if nearest_overall is None:
+            return (None, float("inf"))
+        return (nearest_overall if min_d <= max_km else None, min_d)
+
+    def _build_row(self, phase: str, segment: "FlightSegment", segment_idx: int, airports: List["Airport"]) -> Dict[str, str]:
+        first = segment.points[0] if segment.points else None
+        last = segment.points[-1] if segment.points else None
+
+        if first is None:
+            ns_a, ns_km = (None, float("inf"))
+            ne_a, ne_km = (None, float("inf"))
+            mb = 0.0
+        else:
+            ns_a, ns_km = self._nearest_within(first.lat, first.lon, airports)
+            ne_a, ne_km = self._nearest_within(last.lat, last.lon, airports)
+            mb = mean_bearing(segment.points, window_minutes=10.0)
+
+        origin_dist = ""
+        dest_dist = ""
+        if first and segment.origin:
+            origin_dist = f"{haversine_distance(first.lat, first.lon, segment.origin.lat, segment.origin.lon):.2f}"
+        if last and segment.destination:
+            dest_dist = f"{haversine_distance(last.lat, last.lon, segment.destination.lat, segment.destination.lon):.2f}"
+
+        return {
+            "phase": phase,
+            "preset": self.preset_name,
+            "aircraft_id": segment.aircraft_id,
+            "registration": segment.registration,
+            "source_file": segment.source_file,
+            "segment_idx": str(segment_idx),
+            "takeoff_time": segment.takeoff_time.isoformat() if segment.takeoff_time else "",
+            "landing_time": segment.landing_time.isoformat() if segment.landing_time else "",
+            "duration_min": f"{segment.flight_duration:.2f}",
+            "num_points": str(len(segment.points)),
+            "max_alt_m": f"{segment.max_altitude:.0f}",
+            "total_distance_km": f"{segment.total_distance:.2f}",
+            "mean_bearing_deg": f"{mb:.1f}",
+            "origin_code": segment.origin.code if segment.origin else "",
+            "dest_code": segment.destination.code if segment.destination else "",
+            "origin_dist_km": origin_dist,
+            "dest_dist_km": dest_dist,
+            "nearest_airport_start_code": ns_a.code if ns_a else "",
+            "nearest_airport_start_km": f"{ns_km:.2f}" if ns_km != float("inf") else "",
+            "nearest_airport_end_code": ne_a.code if ne_a else "",
+            "nearest_airport_end_km": f"{ne_km:.2f}" if ne_km != float("inf") else "",
+            "disposition": "",
+            "drop_reason": "",
+            "joined_with_segment_idx": "",
+            "rescue_method": "",
+        }
+
+    def record_raw(self, segment: "FlightSegment", segment_idx: int, airports: List["Airport"]) -> None:
+        self.rows.append(self._build_row("raw", segment, segment_idx, airports))
+
+    def record_outcome(self, segment: "FlightSegment", segment_idx: int, disposition: str,
+                       drop_reason: str = "", joined_with: Optional[List[int]] = None,
+                       rescue_method: str = "none", airports: Optional[List["Airport"]] = None) -> None:
+        row = self._build_row("final", segment, segment_idx, airports or [])
+        row["disposition"] = disposition
+        row["drop_reason"] = drop_reason
+        row["joined_with_segment_idx"] = ",".join(str(i) for i in (joined_with or []))
+        row["rescue_method"] = rescue_method
+        self.rows.append(row)
+
+    def write_csv(self) -> None:
+        with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self.COLUMNS)
+            writer.writeheader()
+            for row in self.rows:
+                writer.writerow(row)
+        print(f"Diagnostics written to: {self.csv_path}")
+
+
 def create_output_kml(flight_segments: List[FlightSegment], output_file: str,
-                     group_by: str = "destination", 
+                     group_by: str = "destination",
                      sample_minutes: float = 2.0,
                      override_color: Optional[str] = None,
                      override_width: Optional[str] = None,
