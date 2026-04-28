@@ -5,6 +5,27 @@ All notable changes to the Flight Route Splitter project will be documented in t
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-04-28 (improved-route-detection branch)
+
+### Added
+
+- **Tiered confidence presets** (`--confidence {strict,balanced,permissive}`) plus per-knob CLI overrides (`--airport-radius-km`, `--max-join-gap-hours`, `--max-join-distance-km`, `--route-time-tolerance`, `--route-time-rescue`).
+- **Bearing-aware mid-cruise joining** (Case 5 in `combine_segments_intelligently`): when two segments have unknown endpoints separated by a multi-hour cruise gap, they are joined only if the segment's mean bearing aligns with the bearing across the gap within ±30°, AND the implied speed across the gap falls in a plausible 200–1100 km/h band.
+- **Bearing-checked route-time rescue** (`match_route_by_time_with_bearing`): the existing route-time rescue now also verifies the bearing from origin to candidate destination aligns with the segment's mean cruise bearing within ±45°. Rejects coincidental time matches (e.g., SBGR→SAEZ vs. SBGR→SBSV with similar durations but opposite bearings).
+- **Hardened cross-file join invariants** via `assert_join_invariants` (same-aircraft, chronological, positive time gap).
+- **Diagnostics CSV sidecar** (`<output>.diagnostics.csv`) with one row per raw segment and one per final outcome — supports auditing dropped segments and comparing preset runs.
+- **Test suite** (`tests/`) covering bearing math, presets, invariants, join logic, route-time rescue, diagnostics format, and an integration test against real LAN data.
+
+### Changed
+
+- `process_kml_files` now requires a `ConfidencePreset` and emits the diagnostics CSV.
+- `combine_segments_intelligently` now accepts a `preset` argument; legacy default values are preserved when called without one.
+
+### Notes
+
+- Default preset is `balanced` to stay close to v1.0 behavior while recovering most of the previously-dropped segments. Use `strict` to reproduce v1.0 output exactly (within rounding); use `permissive` for the most aggressive recovery.
+- Empirical recovery on a 3-day single-aircraft LAN sample: strict=13, balanced=17, permissive=18 valid flights.
+
 ## [1.0.0] - 2026-04-28
 
 ### Changed

@@ -516,3 +516,31 @@ Input KML → parse_kml_tracks() → Dict[registration, List[tracks]]
 **Document Status**: Living Document  
 **Next Review**: 2025-05-27  
 **Owner**: Aviation Data Processing Team
+
+## Cross-File Joining Invariants
+
+The `combine_segments_intelligently` function MUST satisfy the following invariants when attempting to join two raw flight segments. These are encoded as runtime assertions in `assert_join_invariants`.
+
+1. **Same aircraft.** Joins are only attempted between segments with the same `aircraft_id` (extracted from the KML filename's hex prefix and uppercased).
+2. **Chronological order.** `next_seg.takeoff_time` must be strictly greater than `current.landing_time`.
+3. **Positive time gap.** Implicit in (2) — zero or negative gaps are rejected.
+4. **Time-gap ceiling.** The gap between segment end and next segment start must be `< preset.max_join_gap_hours`. Beyond this, the segments are kept separate even if all other criteria match.
+
+## Confidence Presets
+
+| Knob | strict | balanced | permissive |
+|---|---|---|---|
+| `airport_radius_km` | 20 | 50 | 100 |
+| `max_join_gap_hours` | 2.0 | 3.0 | 4.0 |
+| `max_join_distance_km` | 100 | 200 | 500 |
+| `route_time_tolerance` | 0.25 | 0.40 | 0.60 |
+| `route_time_rescue` | off | on | on |
+| `direction_aware_rescue` | off | on | on |
+| `min_segment_points` | 20 | 20 | 20 |
+| `min_flight_altitude_m` | 300 | 300 | 300 |
+
+CLI: `--confidence {strict,balanced,permissive}` selects the preset (default: `balanced`). Any individual knob can be overridden with `--airport-radius-km`, `--max-join-gap-hours`, `--max-join-distance-km`, `--route-time-tolerance`, `--route-time-rescue {on,off}`. Overriding any knob renames the active preset to `custom` in logs and the diagnostics CSV.
+
+## Diagnostics CSV
+
+Every run writes `<output>.diagnostics.csv` next to the output KML. One row per raw segment (`phase=raw`) and one row per outcome (`phase=final`). Columns are documented in the design spec at `docs/superpowers/specs/2026-04-28-improved-route-detection-design.md`.
