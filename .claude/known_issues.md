@@ -183,7 +183,7 @@ Desktop GUI in v7.0 using tkinter:
 
 ### ISSUE-007: Fixed Threshold Parameters
 
-**Severity**: Flexibility  
+**Severity**: Resolved
 **Impact**: Some use cases need different thresholds  
 **Affects**: General aviation, cargo operations, unusual aircraft
 
@@ -210,11 +210,13 @@ python adsb_historical_routes.py \
 
 **Effort**: Low
 
+**Resolution**: v1.1 — replaced with ConfidencePreset + CLI overrides (see ADR-011).
+
 ---
 
 ### ISSUE-008: No Validation Mode
 
-**Severity**: Quality Assurance  
+**Severity**: Resolved
 **Impact**: Cannot verify output correctness programmatically  
 **Affects**: Automated workflows, CI/CD pipelines
 
@@ -240,6 +242,8 @@ python adsb_historical_routes.py --validate input.kml output.kml
 ```
 
 **Effort**: Low
+
+**Resolution**: v1.1 — diagnostics CSV provides per-segment audit data including drop reasons and nearest-airport distances (see ADR-012).
 
 ---
 

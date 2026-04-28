@@ -402,6 +402,94 @@ Enable mypy strict mode for v7.0.
 
 ---
 
+## ADR-011: Tiered Confidence Presets
+
+**Status**: Accepted
+**Date**: 2026-04-28
+**Decision**: Expose detection/joining aggressiveness via `--confidence {strict,balanced,permissive}` plus per-knob overrides.
+
+### Context
+v6_old's hardcoded thresholds (20km airport radius, 2-hour join window, 100km join distance) drop ~22% of raw segments because mid-cruise data outages produce endpoints that fall outside these tight constraints. Users want the ability to compare runs at different confidence levels rather than re-tuning code.
+
+### Decision
+A `ConfidencePreset` frozen dataclass holds eight tunable knobs. Three named presets (`strict`, `balanced`, `permissive`) cover the typical confidence/recovery tradeoff. Individual knobs can be overridden via CLI flags; overriding any knob renames the preset to `custom` for traceability.
+
+### Rationale
+- Single-knob CLI is too coarse for experimentation.
+- Pure per-knob CLI is too fiddly for daily use.
+- Combined: presets for ease, knobs for experimentation.
+- Default `balanced` recovers most dropped segments without unsafe joins.
+
+### Alternatives Considered
+- Per-knob only: rejected — too many flags to remember for routine use.
+- Preset only: rejected — no flexibility to experiment with one knob at a time.
+- Layered config files: rejected for v6.x — overkill given the small knob count.
+
+### Consequences
+- All preset values flow through one resolver (`resolve_preset`), making future additions cheap.
+- Diagnostics CSV records the active preset (or `custom`), so cross-run comparisons are unambiguous.
+
+---
+
+## ADR-012: Diagnostics CSV Sidecar
+
+**Status**: Accepted
+**Date**: 2026-04-28
+**Decision**: Always emit `<output>.diagnostics.csv` next to the output KML.
+
+### Context
+With confidence presets, users will run the same dataset under multiple settings to compare results. Without a structured per-segment audit, it's impossible to tell why a particular flight appeared/disappeared between runs.
+
+### Decision
+A `DiagnosticsRecorder` buffers one row per raw segment (phase=raw) and one row per final outcome (phase=final). Columns include preset name, aircraft ID, source file, segment timing, endpoint distances to nearest airport (regardless of preset radius), disposition, drop reason, joined-with indices, and rescue method.
+
+### Rationale
+- Enables cross-preset comparison (delta of `kept_*` rows).
+- `nearest_airport_*_km` lets users audit "would a wider radius recover this?" without rerunning.
+- CSV is universal — opens in Excel, easily diff-able, queryable from Python/Pandas/Athena.
+
+### Alternatives Considered
+- JSON sidecar: rejected — less convenient for spreadsheet inspection.
+- SQLite: rejected — adds a dependency or stdlib weight.
+- Print-only logs: rejected — not machine-parseable.
+
+### Consequences
+- Sidecar size is proportional to segment count (~100 bytes/row), tractable for any practical run.
+- The CSV path is suffix-appended to the output KML path, keeping artifacts together.
+
+---
+
+## ADR-013: Bearing-Aware Route Rescue
+
+**Status**: Accepted
+**Date**: 2026-04-28
+**Decision**: Augment route-time matching and cross-file joining with mean-bearing alignment checks.
+
+### Context
+The original `match_route_by_time` could rescue a segment with origin known and dest missing by finding a route in `routes_time.csv` whose flight time matches. This produces false positives when two routes from the same origin have similar durations (e.g., SBGR→SAEZ ~140 min, SBGR→SBSV ~140 min, opposite bearings).
+
+Similarly, joining mid-cruise segments by spatial+temporal proximity alone (Case 1/2 of v6_old) misses long cruise gaps where the segments are >100 km apart but along the same heading.
+
+### Decision
+- `match_route_by_time_with_bearing` rejects rescues where the bearing from origin to candidate destination misaligns from the segment's mean cruise bearing by more than ±45°.
+- Case 5 (new) joins mid-cruise segments when the bearing across the gap aligns with the segment's mean bearing within ±30° AND the implied speed falls in 200–1100 km/h.
+
+### Rationale
+- Mean cruise bearing is robust against turn-final variation.
+- ±30° / ±45° tolerances correspond roughly to airway dispersion vs. typical multi-hop divergence.
+- The implied-speed band rejects unrealistic stitches (e.g., 1500 km gap in 30 min).
+
+### Alternatives Considered
+- Trajectory-extrapolation rescue (extend the segment's last 100 km along the bearing and look for an airport): rejected — more code, marginal gain over route-time + bearing.
+- ML-based stitching: rejected — adds dependencies, not justified for this problem size.
+- Tighter bearing tolerances: rejected — would over-reject legitimate joins on routes with significant en-route turns.
+
+### Consequences
+- The two helpers (`bearing`, `mean_bearing`, `angular_diff`) are reusable for any future direction-aware logic.
+- Diagnostics CSV's `rescue_method` column makes false rescues inspectable.
+
+---
+
 ## Questions for Future ADRs
 
 1. Should we add spatial indexing (R-tree) for airport lookup optimization?
