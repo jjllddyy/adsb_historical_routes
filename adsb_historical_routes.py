@@ -581,6 +581,21 @@ def match_route_by_time(origin_code: str, flight_duration: float,
     return best_match
 
 
+def assert_join_invariants(current: "FlightSegment", next_seg: "FlightSegment") -> None:
+    """Enforce that any join attempt is between two segments of the same aircraft, in chronological order, with a positive time gap.
+
+    These conditions are guaranteed by the upstream partition-by-aircraft + sort-by-time logic; the assertions exist to fail loudly if a future refactor breaks that contract.
+    """
+    if current.aircraft_id != next_seg.aircraft_id:
+        raise AssertionError(
+            f"Cross-aircraft join blocked: {current.aircraft_id} vs {next_seg.aircraft_id}"
+        )
+    if next_seg.takeoff_time <= current.landing_time:
+        raise AssertionError(
+            f"Non-chronological join blocked: next.takeoff={next_seg.takeoff_time} not after current.landing={current.landing_time}"
+        )
+
+
 def combine_segments_intelligently(segments: List[FlightSegment], airports: List[Airport],
                                    routes_dict: Dict[Tuple[str, str], float],
                                    max_join_gap_hours: float = 2.0) -> List[FlightSegment]:
