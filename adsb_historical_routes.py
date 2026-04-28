@@ -1277,7 +1277,27 @@ def main():
                        help='Show airport icons (default: false)')
     parser.add_argument('--ground', choices=['true', 'false'], default='false',
                        help='Extend flight paths to ground (default: false)')
-    
+
+    # Confidence preset and per-knob overrides
+    parser.add_argument('--confidence', choices=['strict', 'balanced', 'permissive'],
+                       default='balanced',
+                       help='Detection/joining aggressiveness preset (default: balanced)')
+    parser.add_argument('--airport-radius-km', type=float, default=None,
+                       dest='airport_radius_km',
+                       help='Override airport-match radius in km')
+    parser.add_argument('--max-join-gap-hours', type=float, default=None,
+                       dest='max_join_gap_hours',
+                       help='Override max gap (hours) for cross-file joining')
+    parser.add_argument('--max-join-distance-km', type=float, default=None,
+                       dest='max_join_distance_km',
+                       help='Override max spatial gap (km) for cross-file joining')
+    parser.add_argument('--route-time-tolerance', type=float, default=None,
+                       dest='route_time_tolerance',
+                       help='Override route-time matching tolerance (e.g., 0.30 = ±30%%)')
+    parser.add_argument('--route-time-rescue', choices=['on', 'off'], default=None,
+                       dest='route_time_rescue',
+                       help='Override route-time rescue (on/off)')
+
     args = parser.parse_args()
     
     # Convert string arguments to boolean
@@ -1331,8 +1351,18 @@ def main():
     print(f"  Cross-file segment joining: ENABLED")
     print(f"  Route time matching: ENABLED")
     
+    preset = resolve_preset(args)
+    print(f"  Confidence preset: {preset.name}")
+    print(f"    airport_radius_km={preset.airport_radius_km}, "
+          f"max_join_gap_hours={preset.max_join_gap_hours}, "
+          f"max_join_distance_km={preset.max_join_distance_km}, "
+          f"route_time_tolerance={preset.route_time_tolerance}, "
+          f"route_time_rescue={preset.route_time_rescue}, "
+          f"direction_aware_rescue={preset.direction_aware_rescue}")
+
     process_kml_files(
         kml_files, airports, routes, args.output,
+        preset=preset,
         group_by=args.group,
         sample_minutes=args.sample,
         max_gap_minutes=args.maxgap,
@@ -1341,7 +1371,7 @@ def main():
         override_opacity=args.opacity,
         show_labels=show_labels,
         show_icons=show_icons,
-        extend_to_ground=extend_to_ground
+        extend_to_ground=extend_to_ground,
     )
     
     print("\nProcessing complete!")
