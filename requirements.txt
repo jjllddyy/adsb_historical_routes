@@ -1,0 +1,26 @@
+# Flight Route Splitter - Python Requirements
+# Version: 6.0
+
+# Core dependencies
+# No external dependencies required - uses Python standard library only
+
+# Development dependencies (optional)
+# Uncomment for development environment:
+
+# pytest>=7.0.0              # Testing framework
+# pytest-cov>=4.0.0          # Code coverage
+# black>=22.0.0              # Code formatting
+# flake8>=5.0.0              # Linting
+# mypy>=0.990                # Type checking
+# pylint>=2.15.0             # Additional linting
+
+# Documentation (optional)
+# sphinx>=5.0.0              # Documentation generation
+# sphinx-rtd-theme>=1.0.0    # ReadTheDocs theme
+
+# Note: This project intentionally has no runtime dependencies
+# to maximize portability and minimize installation complexity.
+# All functionality is implemented using Python standard library.
+
+# Python Version Requirement
+# python_requires='>=3.6'

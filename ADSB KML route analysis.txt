@@ -1,0 +1,58 @@
+ADSB route analysis KML instructions:
+
+1) Get list of tails (registration - e.g. N1234G)
+	Source: planespotters.net   
+	search for airline - open to view fleet details
+	Copy table and paste in google sheets (CMD-SHFT-V)
+	Create csv of tails with header "Registration"
+
+2) Run 'icao_hex_lookup' script to get icao hex code for each tail
+	Code: https://github.com/jjllddyy/icao_hex_lookup
+
+*Alternatively - request from Zach, list of tails/hex from planespotters api
+
+3) Get data from adsbexchange 
+	Code: https://github.com/jjllddyy/adsb_kml_fetch
+	Generate list of hex codes to search (csv, no header)
+	Split list to approx 10 tails per run (split -l 10 -d filename.csv)
+	Run script to download kml route file (baro_avg mode) from each split list specifying start/end dates
+		python3 adsb_kml_downloader.py -s 2025-09-01 -e 2025-10-31 -f x06 
+		(Note, file writes to kml_downloads folder, be sure this is clear before running)
+
+4) Create airports list
+		OFP or Cirium. Generate airport list with ICAO, lat, long, elevation_ft
+			If cirium, convert list from IATA to ICAO
+
+5) Create routes list
+		OFP or Cirium.  Get average enroute time in mins for each city pair.	
+			If cirium, convert IATA to ICAO (excel, vlookup)
+
+6) Analyze kml to find routes
+	Code:
+	Generate KML with script, specify parameters
+		python3 adsb_historical_routes.py --kml-folder ~/Git/adsb_kml_fetch/voi/kml_downloads/ --airports voi_airports.csv --routes voi_routes_time.csv --output voi_routes_2025-aug-sept.kml --group destination --maxgap 20 --sample 2 --color 8b008b --width 1 --opacity 100
+
+7) copy route frequency data to file (**update script to write summary to txt file)
+
+
+Routes from SWIM 
+	Get data from turbofire
+		python3 s3_get_jsondata.py --bucket datalake-apijet --prefix prod/turbofire/swim_fdps/airline_icao_code=MXY/year=2025/month=10/ --output mxy/mxy_routes_swim_10.csv --keys airline_icao_code source source_ts raw_route tail_number flight_number status origin_airport_icao_code dest_airport_icao_code etd eta source_feed altitude air_speed flight_plan_id
+	Edit excel (add: ppos	count	fid-eta	route_full	route_city	route	decoded)
+	remove cells with ppos " =isnumber(search("./.",E2)) " (remove all but value false (sort, delete all "TRUE"))
+	remove landing time from route " =if(left(right(E2,5),1)="/",left(E2,len(E2)-5),E2) "
+	count occurances of exact route " =countif(V:V,V2) "
+		create the fid, route field values : 
+		fid (eta based) tail-fltno-orig-dest-date	=F2&"-"&G2&"-"&I2&"-"&J2&"-"&TEXT(L2,"mm-dd-yy")  
+		route_full	fltno-origin-dest				=G2&"-"&I2&"-"&J2  
+		route_city	fltno-origin-dest				=I2&"-"&J2
+	count occurances of flights per city pair (rte_frq) =countif(U:U,U2) **** do after cleanup of routes, before dedupe to unqiue route)
+	count occurances of flights per route (plan_frq)
+	dedupe to city pair, route (keep count field)
+	** copy paste values before sorting
+	sort (route_city A-Z, count Large-small, source_ts a-z)
+	dedupe (route_city, route) (4753-722)
+	count unique route (citypair) =countif(V:V,V2)
+	calc pct flights per route
+	sort route_city pct_rte
+	

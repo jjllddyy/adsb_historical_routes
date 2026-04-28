@@ -1,0 +1,21 @@
+# Build/test artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Local data and outputs
+output/
+kml_input/
+*.tar.gz
+*.diagnostics.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
