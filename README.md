@@ -48,6 +48,66 @@ python adsb_historical_routes.py \
     --group destination
 ```
 
+## Confidence Presets
+
+The `--confidence` flag controls how aggressively the script recovers flight routes from incomplete ADS-B data. Each preset is a bundle of detection/joining knobs:
+
+| Knob | strict | balanced (default) | permissive |
+|---|---|---|---|
+| `airport_radius_km` | 20 | 50 | 100 |
+| `max_join_gap_hours` | 2.0 | 3.0 | 4.0 |
+| `max_join_distance_km` | 100 | 200 | 500 |
+| `route_time_tolerance` | 0.25 | 0.40 | 0.60 |
+| `route_time_rescue` | off | on | on |
+| `direction_aware_rescue` | off | on | on |
+
+- **strict** — Closest to v1.0 behavior. Highest confidence per route, lowest recovery rate.
+- **balanced** — Default. Recovers most legitimate dropped routes; safe for downstream ML.
+- **permissive** — Maximum recovery; emit-and-audit. Some routes may be wrong joins; review the diagnostics CSV.
+
+Override individual knobs:
+
+```bash
+python adsb_historical_routes.py \
+    --kml-folder kml_input/kml_downloads \
+    --airports input/latam_la_airports.csv \
+    --routes input/latam_la_routes_time.csv \
+    --output lan_routes.kml \
+    --confidence balanced \
+    --airport-radius-km 75 \
+    --route-time-rescue off
+```
+
+When any knob is overridden, logs and the diagnostics CSV mark the run as `custom` (the named preset is no longer truthful).
+
+## Diagnostics CSV
+
+Every run writes `<output>.diagnostics.csv` next to the output KML:
+
+```
+out.kml
+out.kml.diagnostics.csv
+```
+
+One row per raw segment (`phase=raw`) and one per final outcome (`phase=final`). Useful columns:
+
+- `disposition`: `kept_complete`, `kept_rescued`, `kept_joined`, `dropped_invalid`, `dropped_unjoined`
+- `nearest_airport_*_km`: distance to nearest airport regardless of preset radius — answers "would a wider radius recover this?"
+- `joined_with_segment_idx`: traceability for joined segments
+- `rescue_method`: which logic path saved or merged this segment
+
+Compare runs at different presets by diffing their CSVs.
+
+## Same-Aircraft + Chronological Invariants
+
+Cross-file segment joining strictly enforces:
+
+1. Same aircraft (ICAO hex from filename).
+2. `next.takeoff > current.landing`.
+3. Time gap > 0 and < `preset.max_join_gap_hours`.
+
+Cross-aircraft and out-of-order joins fail loudly with `AssertionError`.
+
 ## 💾 Installation
 
 ### Requirements
