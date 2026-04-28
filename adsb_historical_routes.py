@@ -182,6 +182,46 @@ def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
     return c * 6371
 
 
+def bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Initial great-circle bearing in degrees (0-360, clockwise from north) from point 1 to point 2."""
+    from math import atan2, cos, degrees, radians, sin
+    rlat1, rlat2 = radians(lat1), radians(lat2)
+    dlon = radians(lon2 - lon1)
+    x = sin(dlon) * cos(rlat2)
+    y = cos(rlat1) * sin(rlat2) - sin(rlat1) * cos(rlat2) * cos(dlon)
+    return (degrees(atan2(x, y)) + 360.0) % 360.0
+
+
+def angular_diff(a: float, b: float) -> float:
+    """Smallest angular difference between two bearings in degrees (0-180)."""
+    d = abs(a - b) % 360.0
+    return d if d <= 180.0 else 360.0 - d
+
+
+def mean_bearing(points: List["TrackPoint"], window_minutes: float = 10.0) -> float:
+    """Average bearing over the last `window_minutes` of a track. Uses vector mean to avoid wrap-around bias."""
+    from math import atan2, cos, degrees, radians, sin
+
+    if len(points) < 2:
+        return 0.0
+
+    last_time = points[-1].datetime
+    cutoff = last_time - timedelta(minutes=window_minutes)
+    window = [p for p in points if p.datetime >= cutoff]
+    if len(window) < 2:
+        window = points[-min(10, len(points)):]
+    if len(window) < 2:
+        return 0.0
+
+    sum_x = 0.0
+    sum_y = 0.0
+    for i in range(len(window) - 1):
+        b = bearing(window[i].lat, window[i].lon, window[i + 1].lat, window[i + 1].lon)
+        sum_x += sin(radians(b))
+        sum_y += cos(radians(b))
+    return (degrees(atan2(sum_x, sum_y)) + 360.0) % 360.0
+
+
 def calculate_groundspeed(p1: TrackPoint, p2: TrackPoint) -> float:
     """Calculate groundspeed between two points (in knots)"""
     distance_km = haversine_distance(p1.lat, p1.lon, p2.lat, p2.lon)
