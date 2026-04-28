@@ -1127,8 +1127,9 @@ def create_output_kml(flight_segments: List[FlightSegment], output_file: str,
     return total_segments
 
 
-def process_kml_files(kml_files: List[str], airports: List[Airport], routes: List[Route],
-                     output_file: str, group_by: str = "destination",
+def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: List["Route"],
+                     output_file: str, preset: ConfidencePreset,
+                     group_by: str = "destination",
                      sample_minutes: float = 2.0,
                      max_gap_minutes: float = 20.0,
                      override_color: Optional[str] = None,
@@ -1137,40 +1138,36 @@ def process_kml_files(kml_files: List[str], airports: List[Airport], routes: Lis
                      show_labels: bool = False,
                      show_icons: bool = False,
                      extend_to_ground: bool = False):
-    """Main processing function with improved segment joining"""
-    
-    airports_dict = {airport.code: airport for airport in airports}
-    
-    routes_dict = {}
-    for route in routes:
-        routes_dict[(route.origin, route.destination)] = route.avg_time_min
-    
-    # Collect ALL segments from ALL files first (for cross-file joining)
-    all_segments = []
-    
-    # Sort files by date
-    kml_files.sort()
-    
+    """Main processing pipeline driven by a ConfidencePreset, emitting both KML and a diagnostics CSV."""
+    routes_dict = {(r.origin, r.destination): r.avg_time_min for r in routes}
+    recorder = DiagnosticsRecorder(output_file, preset_name=preset.name)
+
+    all_segments: List[FlightSegment] = []
+    raw_idx_by_segment: Dict[int, int] = {}
+    next_idx = 0
+
+    kml_files = sorted(kml_files)
+
     for input_file in kml_files:
         aircraft_id = extract_aircraft_id(input_file)
         print(f"\nProcessing: {os.path.basename(input_file)} (Aircraft: {aircraft_id})")
-        
+
         all_tracks = parse_kml_tracks(input_file, aircraft_id)
-        print(f"Found {len(all_tracks)} useful tracks (zero-altitude tracks skipped)")
-        
+        print(f"Found {len(all_tracks)} useful tracks")
+
         for track_points, registration, style_color, style_width, style_opacity in all_tracks:
             if not track_points:
                 continue
-            
-            print(f"  Processing track with {len(track_points)} points (Reg: {registration})")
-            
-            raw_segments = detect_flight_segments(track_points, airports, max_gap_minutes)
+            print(f"  Track with {len(track_points)} points (Reg: {registration})")
+
+            raw_segments = detect_flight_segments_with_preset(
+                track_points, airports, preset, max_gap_minutes=max_gap_minutes
+            )
             print(f"    Detected {len(raw_segments)} raw segments")
-            
+
             for segment_points, has_gap, origin, destination in raw_segments:
-                if len(segment_points) < 20:
+                if len(segment_points) < preset.min_segment_points:
                     continue
-                
                 segment = FlightSegment(
                     aircraft_id, registration, segment_points,
                     origin, destination,
@@ -1178,40 +1175,38 @@ def process_kml_files(kml_files: List[str], airports: List[Airport], routes: Lis
                     os.path.basename(input_file)
                 )
                 segment.has_gaps = has_gap
-                
+
+                raw_idx_by_segment[id(segment)] = next_idx
+                recorder.record_raw(segment, segment_idx=next_idx, airports=airports)
+                next_idx += 1
+
                 all_segments.append(segment)
-                
                 orig = origin.code if origin else "NONE"
                 dest = destination.code if destination else "NONE"
                 print(f"      {orig} -> {dest}: {len(segment_points)} pts, "
                       f"{segment.flight_duration:.1f} min, max alt {segment.max_altitude:.0f}m")
-    
+
     print(f"\n\nTotal raw segments collected: {len(all_segments)}")
-    
-    # Group by aircraft for intelligent combination
-    print("\nCombining segments intelligently by aircraft...")
+
+    print("\nCombining segments by aircraft...")
     segments_by_aircraft = defaultdict(list)
     for seg in all_segments:
         segments_by_aircraft[seg.aircraft_id].append(seg)
-    
-    final_segments = []
+
+    final_segments: List[FlightSegment] = []
     for aircraft_id, segments in segments_by_aircraft.items():
         print(f"\n  Aircraft {aircraft_id}: {len(segments)} raw segments")
-        
-        combined = combine_segments_intelligently(segments, airports, routes_dict)
-        
+        combined = combine_segments_intelligently(
+            segments, airports, routes_dict,
+            preset=preset, recorder=recorder,
+            raw_idx_by_segment=raw_idx_by_segment
+        )
         complete_valid = [s for s in combined if s.is_complete and s.is_valid_flight()]
         print(f"    Final valid flights: {len(complete_valid)}")
-        
-        for seg in complete_valid:
-            print(f"      {seg.origin.code} -> {seg.destination.code}: "
-                  f"{seg.flight_duration:.1f} min, {seg.max_altitude:.0f}m, "
-                  f"{seg.total_distance:.0f}km")
-        
         final_segments.extend(complete_valid)
-    
+
     print(f"\n\nTOTAL VALID COMPLETE FLIGHTS: {len(final_segments)}")
-    
+
     print("\nCreating output KML...")
     total_flights = create_output_kml(
         final_segments, output_file, group_by,
@@ -1219,23 +1214,24 @@ def process_kml_files(kml_files: List[str], airports: List[Airport], routes: Lis
         override_color, override_width, override_opacity,
         show_labels, show_icons, extend_to_ground
     )
-    
-    print("\n" + "="*60)
+
+    recorder.write_csv()
+
+    print("\n" + "=" * 60)
     print("FLIGHT PARSING SUMMARY")
-    print("="*60)
-    print(f"Total valid complete flights parsed: {total_flights}")
-    print(f"Match rate: {total_flights}/{len(all_segments)} = {total_flights/max(len(all_segments),1)*100:.1f}%")
-    
+    print("=" * 60)
+    print(f"Confidence preset: {preset.name}")
+    print(f"Total valid complete flights: {total_flights}")
+    print(f"Match rate: {total_flights}/{len(all_segments)} = "
+          f"{total_flights / max(len(all_segments), 1) * 100:.1f}%")
+
     route_counts = defaultdict(int)
     for seg in final_segments:
-        route = f"{seg.origin.code}-{seg.destination.code}"
-        route_counts[route] += 1
-    
+        route_counts[f"{seg.origin.code}-{seg.destination.code}"] += 1
     print("\nFlights by route:")
     for route, count in sorted(route_counts.items()):
         print(f"  {route}: {count} flights")
-    
-    print("="*60)
+    print("=" * 60)
 
 
 def main():
