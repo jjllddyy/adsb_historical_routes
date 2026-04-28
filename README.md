@@ -103,10 +103,10 @@ Compare runs at different presets by diffing their CSVs.
 Cross-file segment joining strictly enforces:
 
 1. Same aircraft (ICAO hex from filename).
-2. `next.takeoff > current.landing`.
-3. Time gap > 0 and < `preset.max_join_gap_hours`.
+2. `next.takeoff >= current.landing` (equal boundary timestamps are allowed — ADS-B Exchange placemark splits often share the boundary instant).
+3. Time gap < `preset.max_join_gap_hours`.
 
-Cross-aircraft and out-of-order joins fail loudly with `AssertionError`.
+Cross-aircraft joins and true chronological inversion (`next.takeoff < current.landing`) fail loudly with `AssertionError`.
 
 ## 💾 Installation
 

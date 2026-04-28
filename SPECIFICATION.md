@@ -522,9 +522,8 @@ Input KML → parse_kml_tracks() → Dict[registration, List[tracks]]
 The `combine_segments_intelligently` function MUST satisfy the following invariants when attempting to join two raw flight segments. These are encoded as runtime assertions in `assert_join_invariants`.
 
 1. **Same aircraft.** Joins are only attempted between segments with the same `aircraft_id` (extracted from the KML filename's hex prefix and uppercased).
-2. **Chronological order.** `next_seg.takeoff_time` must be strictly greater than `current.landing_time`.
-3. **Positive time gap.** Implicit in (2) — zero or negative gaps are rejected.
-4. **Time-gap ceiling.** The gap between segment end and next segment start must be `< preset.max_join_gap_hours`. Beyond this, the segments are kept separate even if all other criteria match.
+2. **Chronological order.** `next_seg.takeoff_time` must be greater than or equal to `current.landing_time`. Equal boundary timestamps are allowed because ADS-B Exchange's KML placemark splitter often shares the boundary instant between adjacent placemarks; this is a data artifact, not chronological inversion. Only `next_seg.takeoff_time < current.landing_time` is rejected.
+3. **Time-gap ceiling.** The gap between segment end and next segment start must be `< preset.max_join_gap_hours`. Beyond this, the segments are kept separate even if all other criteria match.
 
 ## Confidence Presets
 
