@@ -135,3 +135,76 @@ def convert_routes_to_icao(route_times: Dict[Tuple[str, str], float],
         "elev_defaulted": sorted(elev_defaulted),
         "dropped_routes": dropped_routes,
     }
+
+
+def write_routes_time(path: str, routes: List[Tuple[str, str, float]]) -> None:
+    """Write routes to CSV: origin,destination,avg_enroute_min (rounded to 1 dp)."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["origin", "destination", "avg_enroute_min"])
+        for orig, dest, minutes in routes:
+            w.writerow([orig, dest, round(minutes, 1)])
+
+
+def write_airports(path: str, airports: Dict[str, dict]) -> None:
+    """Write airports to CSV: airport,latitude,longitude,elevation_ft (sorted by ICAO)."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["airport", "latitude", "longitude", "elevation_ft"])
+        for icao in sorted(airports):
+            a = airports[icao]
+            w.writerow([a["airport"], a["latitude"], a["longitude"], a["elevation_ft"]])
+
+
+def build_report(result: dict, dropped_no_flights: List[Tuple[str, str]], n_rows: int) -> Tuple[str, bool]:
+    """Compose the human-readable validation report and compute the READY verdict."""
+    endpoints = set()
+    for orig, dest, _ in result["routes"]:
+        endpoints.update((orig, dest))
+    missing_in_airports = sorted(endpoints - set(result["airports"]))
+
+    ready = bool(result["routes"]) and not result["unmapped"] \
+        and not result["missing_coords"] and not missing_in_airports
+
+    lines = ["=" * 60, "Cirium input build report", "=" * 60,
+             f"Source rows read:        {n_rows}",
+             f"Routes written:          {len(result['routes'])}",
+             f"Airports written:        {len(result['airports'])}",
+             f"Routes dropped (no map): {len(result['dropped_routes'])}",
+             f"Routes dropped (no flts):{len(dropped_no_flights)}", ""]
+
+    def section(title, items):
+        if items:
+            lines.append(f"{title} ({len(items)}):")
+            lines.extend(f"    {x}" for x in items)
+            lines.append("")
+
+    section("Unmapped IATA codes (need ICAO mapping in airport_lookup)", result["unmapped"])
+    section("Airports missing coordinates", result["missing_coords"])
+    section("Routes dropped for unmapped/missing endpoints",
+            [f"{o}-{d}: {why}" for o, d, why in result["dropped_routes"]])
+    section("Routes dropped for no valid flights", [f"{o}-{d}" for o, d in dropped_no_flights])
+    section("Elevations defaulted to 0 (verify)", result["elev_defaulted"])
+    section("Route endpoints missing from airports file (INVARIANT BREACH)", missing_in_airports)
+
+    if ready:
+        lines.append("VERDICT: READY — both files complete; adsb_historical_routes.py can run.")
+    else:
+        reasons = []
+        if not result["routes"]:
+            reasons.append("no routes produced")
+        if result["unmapped"]:
+            reasons.append(f"{len(result['unmapped'])} unmapped IATA code(s)")
+        if result["missing_coords"]:
+            reasons.append(f"{len(result['missing_coords'])} airport(s) without coordinates")
+        if missing_in_airports:
+            reasons.append("airports-file invariant breached")
+        lines.append("VERDICT: NEEDS INPUT — " + "; ".join(reasons) + ".")
+    lines.append("=" * 60)
+    return "\n".join(lines), ready
+
+
+def write_report(path: str, report_text: str) -> None:
+    """Write validation report to file."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(report_text + "\n")

@@ -152,3 +152,46 @@ def test_convert_drops_route_missing_coordinates(bci):
     out = bci.convert_routes_to_icao({("A", "B"): 60.0}, _fake_resolver(mapping))
     assert out["routes"] == []
     assert out["missing_coords"] == ["A"]
+
+
+def test_writers_produce_expected_files(bci, tmp_path):
+    result = {
+        "routes": [("SABE", "SBGL", 170.53), ("SBGL", "SABE", 168.4)],
+        "airports": {
+            "SABE": {"airport": "SABE", "latitude": "-34.55", "longitude": "-58.41", "elevation_ft": "18"},
+            "SBGL": {"airport": "SBGL", "latitude": "-22.81", "longitude": "-43.25", "elevation_ft": 0},
+        },
+    }
+    rt = tmp_path / "x_routes_time.csv"
+    ap = tmp_path / "x_airports.csv"
+    bci.write_routes_time(str(rt), result["routes"])
+    bci.write_airports(str(ap), result["airports"])
+    rt_lines = rt.read_text().splitlines()
+    assert rt_lines[0] == "origin,destination,avg_enroute_min"
+    assert rt_lines[1] == "SABE,SBGL,170.5"   # rounded to 1 dp
+    ap_lines = ap.read_text().splitlines()
+    assert ap_lines[0] == "airport,latitude,longitude,elevation_ft"
+    assert ap_lines[1].startswith("SABE,")     # sorted by ICAO
+
+
+def test_report_ready_when_clean(bci):
+    result = {
+        "routes": [("SABE", "SBGL", 170.5)],
+        "airports": {"SABE": {}, "SBGL": {}},
+        "unmapped": [], "missing_coords": [], "elev_defaulted": [], "dropped_routes": [],
+    }
+    text, ready = bci.build_report(result, [], n_rows=1)
+    assert ready is True
+    assert "READY" in text
+
+
+def test_report_needs_input_when_unmapped(bci):
+    result = {
+        "routes": [("SABE", "SBGL", 170.5)],
+        "airports": {"SABE": {}, "SBGL": {}},
+        "unmapped": ["ZZZ"], "missing_coords": [], "elev_defaulted": [],
+        "dropped_routes": [("AEP", "ZZZ", "no ICAO/coords for ZZZ")],
+    }
+    text, ready = bci.build_report(result, [], n_rows=2)
+    assert ready is False
+    assert "NEEDS INPUT" in text and "ZZZ" in text
