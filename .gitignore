@@ -11,6 +11,13 @@ kml_input/
 *.tar.gz
 *.diagnostics.csv
 
+# Large local bulk data (keep small reference CSVs in input/, exclude the bulk)
+/*.kml
+input/Airports_2606.txt
+
+# Stray directory from a failed brace-expansion (not real project files)
+{docs,examples,.claude,tests/
+
 # OS
 .DS_Store
 Thumbs.db
