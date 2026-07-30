@@ -208,3 +208,70 @@ def write_report(path: str, report_text: str) -> None:
     """Write validation report to file."""
     with open(path, "w", encoding="utf-8") as f:
         f.write(report_text + "\n")
+
+
+DEFAULT_AIRPORT_LOOKUP_DIR = os.path.expanduser("~/Git/conversion_tools/airport_lookup")
+
+
+def make_resolver(airport_lookup_dir: str) -> Callable[[str], Optional[dict]]:
+    """Return an iata->record resolver backed by the shared airport_lookup tool (cache pinned)."""
+    if airport_lookup_dir not in sys.path:
+        sys.path.insert(0, airport_lookup_dir)
+    from airport_converter import AirportDatabase  # lazy: only needed for real runs
+    db = AirportDatabase(
+        cache_dir=os.path.join(airport_lookup_dir, ".airport_cache"),
+        auto_update=False,
+    )
+    db.load_database(min_type="small_airport")
+
+    def resolve(iata: str) -> Optional[dict]:
+        rec = db.convert_iata_to_icao(iata)
+        if not rec:
+            return None
+        return {
+            "icao": rec.get("icao"),
+            "latitude": rec.get("latitude"),
+            "longitude": rec.get("longitude"),
+            "elevation_ft": rec.get("elevation_ft"),
+        }
+    return resolve
+
+
+def run(input_path: str, output_prefix: str, resolve: Callable[[str], Optional[dict]]) -> bool:
+    """Full pipeline: read -> aggregate -> convert -> write 3 files. Returns the READY verdict."""
+    out_dir = os.path.dirname(os.path.abspath(output_prefix))
+    os.makedirs(out_dir, exist_ok=True)
+
+    rows, _ = read_cirium(input_path)
+    route_times, dropped_no_flights = aggregate_route_times(rows)
+    result = convert_routes_to_icao(route_times, resolve)
+
+    write_routes_time(output_prefix + "_routes_time.csv", result["routes"])
+    write_airports(output_prefix + "_airports.csv", result["airports"])
+    report_text, ready = build_report(result, dropped_no_flights, n_rows=len(rows))
+    write_report(output_prefix + "_error.txt", report_text)
+    print(report_text)
+    return ready
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Build routes_time + airports inputs for adsb_historical_routes.py from a Cirium CSV."
+    )
+    parser.add_argument("--input", required=True, help="Raw Cirium CSV file")
+    parser.add_argument("--output", required=True,
+                        help="Output folder+prefix (e.g. input/lan_202606-202607)")
+    parser.add_argument("--airport-lookup-dir", default=DEFAULT_AIRPORT_LOOKUP_DIR,
+                        help="Path to the airport_lookup tool (default: %(default)s)")
+    args = parser.parse_args(argv)
+
+    if not os.path.exists(args.input):
+        print(f"Error: input file not found: {args.input}")
+        return 1
+    resolve = make_resolver(args.airport_lookup_dir)
+    ready = run(args.input, args.output, resolve)
+    return 0 if ready else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

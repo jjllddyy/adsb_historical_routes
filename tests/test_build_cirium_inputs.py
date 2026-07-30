@@ -195,3 +195,43 @@ def test_report_needs_input_when_unmapped(bci):
     text, ready = bci.build_report(result, [], n_rows=2)
     assert ready is False
     assert "NEEDS INPUT" in text and "ZZZ" in text
+
+
+def test_run_end_to_end_with_stub(bci, tmp_path):
+    src = tmp_path / "src.csv"
+    src.write_text(
+        "report_source,Mkt Al,Op Al,Orig,Dest,Manu,Type,Aircraft Family,"
+        "Aircraft Type,Equip,Flights,Seats,ASMs,Block Mins\n"
+        "2026-06,LA,JJ,AEP,GIG,Airbus,Narrow,A320,A320,320,10,1000,1000,1705\n"
+        "2026-07,LA,JJ,AEP,GIG,Airbus,Narrow,A320,A320,320,10,1000,1000,1600\n"
+    )
+    mapping = {
+        "AEP": {"icao": "SABE", "latitude": "-34.55", "longitude": "-58.41", "elevation_ft": "18"},
+        "GIG": {"icao": "SBGL", "latitude": "-22.81", "longitude": "-43.25", "elevation_ft": "28"},
+    }
+    prefix = str(tmp_path / "lan_test")
+    ready = bci.run(str(src), prefix, resolve=lambda i: mapping.get(i))
+    assert ready is True
+    rt = (tmp_path / "lan_test_routes_time.csv").read_text().splitlines()
+    assert rt[1] == "SABE,SBGL,170.5"                       # max month (June 170.5 > July 160.0)
+    assert (tmp_path / "lan_test_airports.csv").exists()
+    assert "READY" in (tmp_path / "lan_test_error.txt").read_text()
+
+
+@al_required
+def test_integration_real_lan_cirium(bci, tmp_path):
+    src = os.path.join(os.path.dirname(__file__), "..", "input", "lan_route_cirium_202606-2020607.csv")
+    if not os.path.exists(src):
+        pytest.skip("LAN Cirium sample not present")
+    resolve = bci.make_resolver(AL_DIR)
+    prefix = str(tmp_path / "lan")
+    bci.run(src, prefix, resolve)
+    rt = (tmp_path / "lan_routes_time.csv").read_text().splitlines()
+    ap = (tmp_path / "lan_airports.csv").read_text().splitlines()
+    assert rt[0] == "origin,destination,avg_enroute_min" and len(rt) > 100
+    assert ap[0] == "airport,latitude,longitude,elevation_ft" and len(ap) > 10
+    # invariant: every route endpoint is in the airports file
+    airports = {ln.split(",")[0] for ln in ap[1:]}
+    for ln in rt[1:]:
+        o, d, _ = ln.split(",")
+        assert o in airports and d in airports
