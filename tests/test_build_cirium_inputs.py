@@ -56,3 +56,55 @@ def test_read_cirium_without_report_source(bci, tmp_path):
     assert has_rs is False
     assert rows[0]["report_source"] == ""
     assert rows[0]["orig"] == "GRU" and rows[0]["flights"] == 100.0
+
+
+def _row(orig, dest, flights, block, rs=""):
+    return {"report_source": rs, "orig": orig, "dest": dest,
+            "flights": flights, "block_mins": block}
+
+
+def test_aggregate_single_group_pools_aircraft(bci):
+    # Two aircraft types, same route/no report month: Σblock/Σflights.
+    rows = [_row("GRU", "SCL", 10, 1000), _row("GRU", "SCL", 10, 1400)]
+    times, dropped = bci.aggregate_route_times(rows)
+    assert times[("GRU", "SCL")] == (1000 + 1400) / (10 + 10)  # 120.0
+    assert dropped == []
+
+
+def test_aggregate_max_across_months(bci):
+    # June avg = 100, July avg = 130 -> take the larger (130).
+    rows = [
+        _row("AEP", "GIG", 10, 1000, rs="2026-06"),
+        _row("AEP", "GIG", 10, 1300, rs="2026-07"),
+    ]
+    times, _ = bci.aggregate_route_times(rows)
+    assert times[("AEP", "GIG")] == 130.0
+
+
+def test_aggregate_pools_within_month_then_maxes(bci):
+    # 2026-06 pooled avg = (1000+500)/(10+10)=75 ; 2026-07 = 2000/20=100 -> 100.
+    rows = [
+        _row("A", "B", 10, 1000, rs="2026-06"),
+        _row("A", "B", 10, 500, rs="2026-06"),
+        _row("A", "B", 20, 2000, rs="2026-07"),
+    ]
+    times, _ = bci.aggregate_route_times(rows)
+    assert times[("A", "B")] == 100.0
+
+
+def test_aggregate_skips_zero_flights_and_self_loops(bci):
+    rows = [
+        _row("A", "B", 0, 500),      # zero flights -> skipped
+        _row("A", "B", 5, 400),      # valid -> 80
+        _row("C", "C", 5, 400),      # self loop -> skipped, not seen as route
+    ]
+    times, dropped = bci.aggregate_route_times(rows)
+    assert times == {("A", "B"): 80.0}
+    assert ("C", "C") not in times
+
+
+def test_aggregate_route_with_no_valid_flights_dropped(bci):
+    rows = [_row("A", "B", 0, 500), _row("A", "B", None, 500)]
+    times, dropped = bci.aggregate_route_times(rows)
+    assert times == {}
+    assert dropped == [("A", "B")]

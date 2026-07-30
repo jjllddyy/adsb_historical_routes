@@ -45,3 +45,34 @@ def read_cirium(path: str) -> Tuple[List[dict], bool]:
                 "block_mins": parse_number(row.get("Block Mins", "")),
             })
     return rows, has_rs
+
+
+def aggregate_route_times(rows: List[dict]) -> Tuple[Dict[Tuple[str, str], float], List[Tuple[str, str]]]:
+    """Per (orig,dest): pool aircraft types per report month (Σblock/Σflights), take max month.
+
+    Rows with flights<=0/None, blank block_mins, or orig==dest are skipped. Routes seen but
+    with no valid flight rows in any month are returned in dropped_no_flights.
+    """
+    # route -> month -> [sum_block, sum_flights]
+    acc: Dict[Tuple[str, str], Dict[str, List[float]]] = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0]))
+    seen = set()
+    for r in rows:
+        o, d = r["orig"], r["dest"]
+        if not o or not d or o == d:
+            continue
+        seen.add((o, d))
+        f, b = r["flights"], r["block_mins"]
+        if f is None or b is None or f <= 0:
+            continue
+        month = r["report_source"] or "_single"
+        bucket = acc[(o, d)][month]
+        bucket[0] += b
+        bucket[1] += f
+
+    route_times: Dict[Tuple[str, str], float] = {}
+    for route, months in acc.items():
+        monthly = [blk / fl for (blk, fl) in months.values() if fl > 0]
+        if monthly:
+            route_times[route] = max(monthly)
+    dropped_no_flights = sorted(seen - set(route_times))
+    return route_times, dropped_no_flights
