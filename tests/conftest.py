@@ -70,3 +70,15 @@ def make_segment(ahr, make_track_point):
 def utc():
     """A baseline UTC datetime."""
     return datetime(2026, 2, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(scope="session")
+def bci():
+    """The build_cirium_inputs module (loaded from repo root)."""
+    spec = importlib.util.spec_from_file_location(
+        "build_cirium_inputs", PROJECT_ROOT / "build_cirium_inputs.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["build_cirium_inputs"] = module
+    spec.loader.exec_module(module)
+    return module
