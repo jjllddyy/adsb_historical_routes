@@ -108,3 +108,47 @@ def test_aggregate_route_with_no_valid_flights_dropped(bci):
     times, dropped = bci.aggregate_route_times(rows)
     assert times == {}
     assert dropped == [("A", "B")]
+
+
+def _fake_resolver(mapping):
+    return lambda iata: mapping.get(iata)
+
+
+def test_convert_maps_and_collects_airports(bci):
+    mapping = {
+        "AEP": {"icao": "SABE", "latitude": "-34.55", "longitude": "-58.41", "elevation_ft": "18"},
+        "GIG": {"icao": "SBGL", "latitude": "-22.81", "longitude": "-43.25", "elevation_ft": "28"},
+    }
+    out = bci.convert_routes_to_icao({("AEP", "GIG"): 170.5}, _fake_resolver(mapping))
+    assert out["routes"] == [("SABE", "SBGL", 170.5)]
+    assert set(out["airports"]) == {"SABE", "SBGL"}
+    assert out["airports"]["SABE"]["elevation_ft"] == "18"
+    assert out["unmapped"] == [] and out["missing_coords"] == []
+
+
+def test_convert_drops_route_with_unmapped_code(bci):
+    mapping = {"AEP": {"icao": "SABE", "latitude": "-34.55", "longitude": "-58.41", "elevation_ft": "18"}}
+    out = bci.convert_routes_to_icao({("AEP", "ZZZ"): 120.0}, _fake_resolver(mapping))
+    assert out["routes"] == []
+    assert out["unmapped"] == ["ZZZ"]
+    assert out["dropped_routes"] and out["dropped_routes"][0][:2] == ("AEP", "ZZZ")
+
+
+def test_convert_defaults_missing_elevation_to_zero(bci):
+    mapping = {
+        "A": {"icao": "AAAA", "latitude": "1.0", "longitude": "2.0", "elevation_ft": ""},
+        "B": {"icao": "BBBB", "latitude": "3.0", "longitude": "4.0", "elevation_ft": "50"},
+    }
+    out = bci.convert_routes_to_icao({("A", "B"): 60.0}, _fake_resolver(mapping))
+    assert out["airports"]["AAAA"]["elevation_ft"] == 0
+    assert out["elev_defaulted"] == ["AAAA"]
+
+
+def test_convert_drops_route_missing_coordinates(bci):
+    mapping = {
+        "A": {"icao": "AAAA", "latitude": "", "longitude": "", "elevation_ft": "10"},
+        "B": {"icao": "BBBB", "latitude": "3.0", "longitude": "4.0", "elevation_ft": "50"},
+    }
+    out = bci.convert_routes_to_icao({("A", "B"): 60.0}, _fake_resolver(mapping))
+    assert out["routes"] == []
+    assert out["missing_coords"] == ["A"]

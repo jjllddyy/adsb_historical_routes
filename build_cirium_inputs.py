@@ -76,3 +76,62 @@ def aggregate_route_times(rows: List[dict]) -> Tuple[Dict[Tuple[str, str], float
             route_times[route] = max(monthly)
     dropped_no_flights = sorted(seen - set(route_times))
     return route_times, dropped_no_flights
+
+
+def convert_routes_to_icao(route_times: Dict[Tuple[str, str], float],
+                           resolve: Callable[[str], Optional[dict]]) -> dict:
+    """Map IATA route endpoints to ICAO (+coords) and assemble output records.
+
+    Routes whose endpoints cannot be mapped to ICAO or lack coordinates are dropped and
+    reported. Missing elevation defaults to 0 (recorded in elev_defaulted).
+    """
+    cache: Dict[str, Optional[dict]] = {}
+
+    def look(iata):
+        if iata not in cache:
+            cache[iata] = resolve(iata)
+        return cache[iata]
+
+    routes: List[Tuple[str, str, float]] = []
+    airports: Dict[str, dict] = {}
+    unmapped, missing_coords, elev_defaulted = set(), set(), set()
+    dropped_routes: List[Tuple[str, str, str]] = []
+
+    for (o, d), minutes in route_times.items():
+        recs = {o: look(o), d: look(d)}
+        bad = []
+        for iata, rec in recs.items():
+            if rec is None or not rec.get("icao"):
+                unmapped.add(iata)
+                bad.append(iata)
+            elif rec.get("latitude") in (None, "") or rec.get("longitude") in (None, ""):
+                missing_coords.add(iata)
+                bad.append(iata)
+        if bad:
+            dropped_routes.append((o, d, "no ICAO/coords for " + ",".join(sorted(set(bad)))))
+            continue
+        for iata in (o, d):
+            rec = recs[iata]
+            icao = rec["icao"]
+            if icao not in airports:
+                elev = rec.get("elevation_ft")
+                if elev in (None, ""):
+                    elev = 0
+                    elev_defaulted.add(icao)
+                airports[icao] = {
+                    "airport": icao,
+                    "latitude": rec["latitude"],
+                    "longitude": rec["longitude"],
+                    "elevation_ft": elev,
+                }
+        routes.append((recs[o]["icao"], recs[d]["icao"], minutes))
+
+    routes.sort(key=lambda t: (t[0], t[1]))
+    return {
+        "routes": routes,
+        "airports": airports,
+        "unmapped": sorted(unmapped),
+        "missing_coords": sorted(missing_coords),
+        "elev_defaulted": sorted(elev_defaulted),
+        "dropped_routes": dropped_routes,
+    }
