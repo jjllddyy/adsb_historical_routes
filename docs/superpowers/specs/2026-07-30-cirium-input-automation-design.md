@@ -38,6 +38,8 @@ Written to `<prefix>_routes_time.csv` and `<prefix>_airports.csv`, where `<prefi
   for deterministic, diff-friendly output.
 - **airports**: `airport,latitude,longitude,elevation_ft` — ICAO, deduped, sorted; the
   union of every origin and destination present in the output routes_time file.
+- **error/report** `<prefix>_error.txt`: the full validation report — always written — so
+  guard hits are a persistent, actionable artifact alongside the data files (details below).
 
 ## Route-time aggregation (per orig–dest route)
 
@@ -105,11 +107,19 @@ After writing, the script verifies the outputs are sufficient to run
 `adsb_historical_routes.py`:
 - Every `origin`/`destination` in routes_time appears in the airports file (invariant).
 - Both output files are non-empty with correct headers.
-- Prints a summary: source rows read, unique routes written, unique airports written,
+- Reports a summary: source rows read, unique routes written, unique airports written,
   dropped routes, and any unmapped IATA codes (enumerated).
-- Prints a final verdict: **READY** (both files complete, invariant holds) or
+- Reports a final verdict: **READY** (both files complete, invariant holds) or
   **NEEDS INPUT** with the specific missing items listed (e.g. IATA codes with no ICAO
   mapping, airports with no coordinates).
+
+**Dual output — the entire validation report (summary, every guard hit, and the verdict)
+is written to both stdout and `<prefix>_error.txt`.** The file is always written (even when
+clean, so its presence/absence is unambiguous): a clean run records the summary plus a
+"No issues — READY" line, and a run with guard hits enumerates each actionable item
+(unmapped IATA codes, dropped routes with reasons, airports missing coordinates, elevations
+defaulted to 0). This makes guard output a durable artifact next to the data files rather
+than something that scrolls past in the terminal.
 
 ## Testing (`tests/test_build_cirium_inputs.py`)
 
