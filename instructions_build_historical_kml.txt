@@ -15,10 +15,7 @@ python3 adsb_historical_routes.py \
     --airports input/aay_routes_202606-202607_airports.csv \
     --routes   input/aay_routes_202606-202607_routes_time.csv \
     --output   ~/Git/kml/adsb_historical_routes/output/aay_routes_2026_0601-0731.kml \
-    --confidence balanced \
-    --width 0.8 \
-    --opacity 80 \
-    --color ff0000
+    --confidence balanced --width 0.8 --opacity 80 --color ff0000
 
 
     
