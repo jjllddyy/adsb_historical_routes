@@ -7,6 +7,7 @@ __pycache__/
 
 # Local data and outputs
 output/
+kml_input
 kml_input/
 *.tar.gz
 *.diagnostics.csv

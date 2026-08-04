@@ -1,0 +1,24 @@
+1) Create input file for route matching
+Uses cirium input (routes, block min - in IATA format, and multiple per route)
+
+Specify Airports file (i.e. /input/Airports_2511.txt)
+
+python3 build_cirium_inputs.py \
+    --input input/aay_route_cirium_202606-202607.csv \
+    --output input/aay_routes_202606-202607.csv.csv
+
+    the output file (aay_routes_202606-202607.csv)
+
+2) Build kml file:
+python3 adsb_historical_routes.py \
+    --kml-folder ~/Git/kml/adsb_kml_downloader/output/aay_2026_jun-jul/ \
+    --airports input/aay_routes_202606-202607_airports.csv \
+    --routes   input/aay_routes_202606-202607_routes_time.csv \
+    --output   ~/Git/kml/adsb_historical_routes/output/aay_routes_2026_0601-0731.kml \
+    --confidence balanced \
+    --width 0.8 \
+    --opacity 80 \
+    --color ff0000
+
+
+    
