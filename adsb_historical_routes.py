@@ -15,6 +15,7 @@ from math import radians, cos, sin, asin, sqrt
 import argparse
 import sys
 import os
+import gc
 import glob
 from collections import defaultdict
 from dataclasses import dataclass, replace
@@ -1425,6 +1426,14 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
 
 
 def main():
+    # This batch tool accumulates millions of TrackPoint objects that all stay live
+    # until the run ends. Python's periodic gen-2 GC would repeatedly scan them, causing
+    # multi-second stalls that grow as the run progresses (observed as ~30-45s freezes
+    # every few thousand files on large folders). No reference cycles are created here,
+    # so plain refcounting frees everything — disabling the cyclic collector is safe and
+    # removes the stalls.
+    gc.disable()
+
     parser = argparse.ArgumentParser(
         description='Enhanced Flight Route Splitter v6 - Improved segment joining and altitude handling',
         formatter_class=argparse.RawDescriptionHelpFormatter
