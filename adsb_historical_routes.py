@@ -1591,6 +1591,14 @@ def main():
     
     print("\nProcessing complete!")
 
+    # All output files are already written and closed above. On large runs the process
+    # otherwise spends tens of seconds freeing the millions of accumulated point objects
+    # during interpreter shutdown — work that produces nothing. Flush our streams and exit
+    # immediately so the OS reclaims the memory at once instead.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
+
 
 if __name__ == '__main__':
     main()
