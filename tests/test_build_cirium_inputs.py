@@ -235,3 +235,33 @@ def test_integration_real_lan_cirium(bci, tmp_path):
     for ln in rt[1:]:
         o, d, _ = ln.split(",")
         assert o in airports and d in airports
+
+
+def test_load_airport_overrides(bci, tmp_path):
+    p = tmp_path / "ov.csv"
+    p.write_text("# a comment\niata,icao,latitude,longitude,elevation_ft\n"
+                 "LIM,SPJC,-12.02,-77.11,113\nlow,KLOW,1.0,2.0,3\n")
+    ov = bci.load_airport_overrides(str(p))
+    assert ov["LIM"]["icao"] == "SPJC" and ov["LIM"]["latitude"] == "-12.02"
+    assert ov["LOW"]["icao"] == "KLOW"  # lowercase iata normalized to upper
+    assert bci.load_airport_overrides("ignore") == {}
+    assert bci.load_airport_overrides(str(tmp_path / "nope.csv")) == {}
+
+
+def test_convert_uses_override_record(bci):
+    # A resolver whose override supplies SPJC must flow through to the output unchanged.
+    mapping = {
+        "GRU": {"icao": "SBGR", "latitude": "-23.4", "longitude": "-46.5", "elevation_ft": "2461"},
+        "LIM": {"icao": "SPJC", "latitude": "-12.02", "longitude": "-77.11", "elevation_ft": "113"},
+    }
+    out = bci.convert_routes_to_icao({("GRU", "LIM"): 200.0}, lambda i: mapping.get(i))
+    assert out["routes"] == [("SBGR", "SPJC", 200.0)]
+    assert "SPJC" in out["airports"]
+
+
+@al_required
+def test_resolver_override_precedence(bci):
+    resolve = bci.make_resolver(AL_DIR, overrides={
+        "LIM": {"icao": "SPJC", "latitude": "-12.02", "longitude": "-77.11", "elevation_ft": "113"}})
+    assert resolve("LIM")["icao"] == "SPJC"   # override wins over OurAirports' retired SPIM
+    assert resolve("GRU")["icao"] == "SBGR"   # non-overridden IATA still from airport_lookup

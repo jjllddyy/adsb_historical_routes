@@ -1,0 +1,10 @@
+# Airport override manifest for build_cirium_inputs.py
+# Overrides the airport_lookup/OurAirports resolution of an IATA code, for airports it
+# resolves wrongly or is missing. Applied automatically when this file is present; disable
+# with --airport-override ignore, or point at another file with --airport-override <path>.
+# Columns: iata,icao,latitude,longitude,elevation_ft   (# lines are comments)
+#
+# LIM: OurAirports still files Lima under the retired ICAO SPIM; current/official is SPJC,
+#      which is what flight records (route_example.json) use.
+iata,icao,latitude,longitude,elevation_ft
+LIM,SPJC,-12.0219,-77.114305,113

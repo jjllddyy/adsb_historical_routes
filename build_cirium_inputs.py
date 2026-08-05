@@ -211,10 +211,44 @@ def write_report(path: str, report_text: str) -> None:
 
 
 DEFAULT_AIRPORT_LOOKUP_DIR = os.path.expanduser("~/Git/conversion_tools/airport_lookup")
+DEFAULT_AIRPORT_OVERRIDE = "airport_overrides.csv"
 
 
-def make_resolver(airport_lookup_dir: str) -> Callable[[str], Optional[dict]]:
-    """Return an iata->record resolver backed by the shared airport_lookup tool (cache pinned)."""
+def load_airport_overrides(path: str) -> Dict[str, dict]:
+    """Load an IATA -> {icao, latitude, longitude, elevation_ft} override manifest.
+
+    A small, hand-curated CSV that takes precedence over the airport_lookup/OurAirports
+    result for airports it resolves wrongly or misses (e.g. IATA ``LIM`` -> current ICAO
+    ``SPJC``, which OurAirports still files under the retired ``SPIM``). Grows as new cases
+    are found, so codes stay consistent across builds. Lines starting with ``#`` are comments.
+
+    Returns ``{}`` for the sentinel ``"ignore"``, an empty/missing path, or a default file
+    that isn't present — so a run works with no manifest at all.
+    """
+    if not path or path.strip().lower() == "ignore" or not os.path.exists(path):
+        return {}
+    overrides: Dict[str, dict] = {}
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        data = [ln for ln in f if not ln.lstrip().startswith("#")]
+    for row in csv.DictReader(data):
+        iata = (row.get("iata") or "").strip().upper()
+        icao = (row.get("icao") or "").strip().upper()
+        if not iata or not icao:
+            continue
+        overrides[iata] = {
+            "icao": icao,
+            "latitude": (row.get("latitude") or "").strip(),
+            "longitude": (row.get("longitude") or "").strip(),
+            "elevation_ft": (row.get("elevation_ft") or "").strip(),
+        }
+    return overrides
+
+
+def make_resolver(airport_lookup_dir: str,
+                  overrides: Optional[Dict[str, dict]] = None) -> Callable[[str], Optional[dict]]:
+    """Return an iata->record resolver: the override manifest first, then the shared
+    airport_lookup tool (cache pinned)."""
+    overrides = overrides or {}
     if airport_lookup_dir not in sys.path:
         sys.path.insert(0, airport_lookup_dir)
     from airport_converter import AirportDatabase  # lazy: only needed for real runs
@@ -225,6 +259,9 @@ def make_resolver(airport_lookup_dir: str) -> Callable[[str], Optional[dict]]:
     db.load_database(min_type="small_airport")
 
     def resolve(iata: str) -> Optional[dict]:
+        key = (iata or "").strip().upper()
+        if key in overrides:
+            return dict(overrides[key])
         rec = db.convert_iata_to_icao(iata)
         if not rec:
             return None
@@ -263,12 +300,23 @@ def main(argv=None) -> int:
                         help="Output folder+prefix (e.g. input/lan_202606-202607)")
     parser.add_argument("--airport-lookup-dir", default=DEFAULT_AIRPORT_LOOKUP_DIR,
                         help="Path to the airport_lookup tool (default: %(default)s)")
+    parser.add_argument("--airport-override", default=DEFAULT_AIRPORT_OVERRIDE,
+                        help="Airport override manifest CSV (iata,icao,latitude,longitude,"
+                             "elevation_ft) applied on top of airport_lookup. Default "
+                             "'%(default)s' when present; pass 'ignore' to disable, or a path "
+                             "to another file.")
     args = parser.parse_args(argv)
 
     if not os.path.exists(args.input):
         print(f"Error: input file not found: {args.input}")
         return 1
-    resolve = make_resolver(args.airport_lookup_dir)
+    overrides = load_airport_overrides(args.airport_override)
+    if overrides:
+        print(f"Airport overrides applied: {len(overrides)} from {args.airport_override} "
+              f"({', '.join(sorted(overrides))})")
+    elif args.airport_override.strip().lower() != "ignore" and not os.path.exists(args.airport_override):
+        print(f"(no airport override manifest at '{args.airport_override}'; using airport_lookup only)")
+    resolve = make_resolver(args.airport_lookup_dir, overrides)
     ready = run(args.input, args.output, resolve)
     return 0 if ready else 1
 
