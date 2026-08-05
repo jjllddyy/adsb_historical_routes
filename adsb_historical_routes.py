@@ -675,12 +675,24 @@ def match_route_by_time_with_bearing(segment: "FlightSegment",
                                       routes_dict: Dict[Tuple[str, str], float],
                                       airports_dict: Dict[str, "Airport"],
                                       tolerance: float = 0.4,
-                                      bearing_tolerance_deg: float = 45.0) -> Optional[str]:
-    """Like match_route_by_time, but also requires the bearing from segment's origin to candidate destination to align with the segment's mean cruise bearing within bearing_tolerance_deg degrees."""
+                                      bearing_tolerance_deg: float = 45.0,
+                                      max_cross_track_km: Optional[float] = None) -> Optional[str]:
+    """Match a missing destination by scheduled enroute time + direction from the origin.
+
+    Requires the origin->candidate bearing to align with the segment's mean cruise bearing.
+    When ``max_cross_track_km`` is given, it ALSO requires the segment's airborne endpoint to
+    lie within that cross-track distance of the origin->candidate great circle. The mean-bearing
+    check alone cannot separate destinations that share a bearing from the origin (SBMO/SBSV/SBIL
+    all lie NE of SBGR); the corridor check uses the endpoint's actual position, so a track
+    truncated ~65 km short of SBMO is not mis-assigned to a same-bearing but far-off Salvador
+    merely because its clipped (short) duration happens to match the shorter route. Rejected
+    candidates fall through to corridor geometry, which infers the endpoint by direction.
+    """
     if not segment.origin or not segment.points:
         return None
 
     seg_brg = mean_bearing(segment.points, window_minutes=15.0)
+    last = segment.points[-1]
     best_match = None
     best_diff = float("inf")
 
@@ -694,10 +706,16 @@ def match_route_by_time_with_bearing(segment: "FlightSegment",
         if relative_diff >= tolerance:
             continue
 
-        cand_brg = bearing(segment.origin.lat, segment.origin.lon,
-                           airports_dict[dest].lat, airports_dict[dest].lon)
+        cand = airports_dict[dest]
+        cand_brg = bearing(segment.origin.lat, segment.origin.lon, cand.lat, cand.lon)
         if angular_diff(cand_brg, seg_brg) > bearing_tolerance_deg:
             continue
+
+        if max_cross_track_km is not None:
+            xt = abs(cross_track_km(last.lat, last.lon,
+                                    segment.origin.lat, segment.origin.lon, cand.lat, cand.lon))
+            if xt > max_cross_track_km:
+                continue
 
         if time_diff < best_diff:
             best_diff = time_diff
@@ -793,7 +811,7 @@ def try_recover_endpoint(segment: "FlightSegment",
                          airports_dict: Dict[str, "Airport"],
                          rt_rescue: bool, geom_rescue: bool,
                          route_tol: float, corridor_xt: float, corridor_slack: float,
-                         dir_aware: bool) -> str:
+                         dir_aware: bool, corridor_gate: bool = False) -> str:
     """Fill a single missing origin/destination on ``segment`` in place, if possible.
 
     Tries the precise signals first and only guesses geometrically as a fallback:
@@ -807,11 +825,18 @@ def try_recover_endpoint(segment: "FlightSegment",
     "geometry_forward" / "geometry_reverse"), or "" if nothing matched. Only ever *fills*
     a missing endpoint; a segment that already has both airports is returned untouched.
     """
+    # Corridor gate for route-time: only trust a time+bearing match if the airborne endpoint
+    # actually lies in the corridor toward that airport. Enabled for the geometry-aware presets
+    # at every rescue stage (including before joining); strict/legacy keep their original
+    # ungated behavior. Independent of geom_rescue so the gate can apply even where geometry
+    # inference is deliberately withheld (top-of-loop, so joins still get first claim).
+    mct = corridor_xt if corridor_gate else None
+
     # Origin known, destination missing
     if segment.origin and not segment.destination:
         if rt_rescue:
             dest_code = match_route_by_time_with_bearing(
-                segment, routes_dict, airports_dict, tolerance=route_tol
+                segment, routes_dict, airports_dict, tolerance=route_tol, max_cross_track_km=mct
             )
             if dest_code and dest_code in airports_dict:
                 segment.destination = airports_dict[dest_code]
@@ -829,19 +854,35 @@ def try_recover_endpoint(segment: "FlightSegment",
     # Destination known, origin missing
     elif segment.destination and not segment.origin:
         if rt_rescue:
+            first = segment.points[0] if segment.points else None
+            seg_brg = mean_bearing(segment.points, window_minutes=15.0) if segment.points else 0.0
+            best_orig, best_xt = None, float("inf")
             for (orig, dest), avg_time in routes_dict.items():
                 if dest != segment.destination.code or orig not in airports_dict:
                     continue
-                if abs(segment.flight_duration - avg_time) < avg_time * route_tol:
-                    if dir_aware:
-                        cand_brg = bearing(airports_dict[orig].lat, airports_dict[orig].lon,
-                                           segment.destination.lat, segment.destination.lon)
-                        seg_brg = mean_bearing(segment.points, window_minutes=15.0)
-                        if angular_diff(cand_brg, seg_brg) > 45.0:
-                            continue
-                    segment.origin = airports_dict[orig]
-                    segment.is_complete = True
-                    return "route_time_reverse"
+                if abs(segment.flight_duration - avg_time) >= avg_time * route_tol:
+                    continue
+                cand = airports_dict[orig]
+                if dir_aware:
+                    cand_brg = bearing(cand.lat, cand.lon,
+                                       segment.destination.lat, segment.destination.lon)
+                    if angular_diff(cand_brg, seg_brg) > 45.0:
+                        continue
+                # Corridor gate + best-fit selection: among time/bearing-consistent origins,
+                # take the one whose corridor the airborne origin-end actually sits in.
+                if mct is not None and first is not None:
+                    xt = abs(cross_track_km(first.lat, first.lon, cand.lat, cand.lon,
+                                            segment.destination.lat, segment.destination.lon))
+                    if xt > mct:
+                        continue
+                    if xt < best_xt:
+                        best_xt, best_orig = xt, orig
+                elif best_orig is None:
+                    best_orig = orig  # legacy: first time+bearing match
+            if best_orig:
+                segment.origin = airports_dict[best_orig]
+                segment.is_complete = True
+                return "route_time_reverse"
         if geom_rescue:
             code, which = infer_endpoint_by_corridor(
                 segment, routes_dict, airports_dict, corridor_xt, corridor_slack
@@ -926,6 +967,7 @@ def combine_segments_intelligently(segments: List["FlightSegment"], airports: Li
             rt_rescue=rt_rescue, geom_rescue=False,
             route_tol=eff_route_tol, corridor_xt=corridor_xt,
             corridor_slack=corridor_slack, dir_aware=dir_aware,
+            corridor_gate=geom_rescue,
         )
         if rm:
             rescue_method = rm
@@ -1027,6 +1069,7 @@ def combine_segments_intelligently(segments: List["FlightSegment"], airports: Li
                     rt_rescue=rt_rescue, geom_rescue=False,
                     route_tol=eff_route_tol, corridor_xt=corridor_xt,
                     corridor_slack=corridor_slack, dir_aware=dir_aware,
+                    corridor_gate=geom_rescue,
                 )
                 if rm2 and rescue_method in ("none", "bearing_join"):
                     rescue_method = rm2
@@ -1051,6 +1094,7 @@ def combine_segments_intelligently(segments: List["FlightSegment"], airports: Li
                 rt_rescue=rt_rescue, geom_rescue=geom_rescue,
                 route_tol=min(eff_route_tol + 0.1, 0.7), corridor_xt=corridor_xt,
                 corridor_slack=corridor_slack, dir_aware=dir_aware,
+                corridor_gate=geom_rescue,
             )
             if rm3 and current.is_valid_flight():
                 print(f"        Rescued segment: {current.origin.code} -> {current.destination.code} via {rm3}")
