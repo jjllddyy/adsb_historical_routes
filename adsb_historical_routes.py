@@ -1227,8 +1227,18 @@ def create_output_kml(flight_segments: List[FlightSegment], output_file: str,
                      override_opacity: Optional[int] = None,
                      show_labels: bool = False,
                      show_icons: bool = False,
-                     extend_to_ground: bool = False):
-    """Create output KML file with organized folder structure"""
+                     extend_to_ground: bool = False,
+                     stitch_gaps: bool = False,
+                     inferred_color: str = "ff888888",
+                     stitch_gap_min: float = 5.0):
+    """Create output KML file with organized folder structure.
+
+    When ``stitch_gaps`` is True, each flight track is split at coverage gaps (an
+    inter-point time delta > ``stitch_gap_min`` minutes) into continuous real-data
+    placemarks (normal color) plus a straight-line connector placemark per gap, drawn in
+    ``inferred_color`` (KML AABBGGRR) to mark the inferred/interpolated portion. Default
+    (False) keeps the original single-track-per-flight output unchanged.
+    """
     
     # Define namespace constants
     KML_NS = 'http://www.opengis.net/kml/2.2'
@@ -1264,7 +1274,69 @@ def create_output_kml(flight_segments: List[FlightSegment], output_file: str,
     total_segments = 0
     total_points_original = 0
     total_points_sampled = 0
-    
+    total_connectors = 0
+
+    def _segment_line_color(seg):
+        if override_opacity is not None:
+            opacity_hex = format(int(override_opacity * 255 / 100), '02x')
+            if override_color:
+                return opacity_hex + override_color[2:] if len(override_color) >= 8 else opacity_hex + override_color
+            return opacity_hex + seg.style_color[2:] if len(seg.style_color) >= 2 else opacity_hex + seg.style_color
+        if override_color:
+            return override_color
+        return seg.style_color
+
+    def _segment_description(seg, sampled):
+        d = (f"Aircraft ID: {seg.aircraft_id}\n"
+             f"Registration: {seg.registration}\n"
+             f"Route: {seg.origin.code} -> {seg.destination.code}\n"
+             f"Date: {seg.takeoff_date_str}\n"
+             f"Duration: {seg.flight_duration:.1f} minutes\n"
+             f"Max altitude: {seg.max_altitude:.0f}m ({seg.max_altitude*3.28084:.0f}ft)\n"
+             f"Distance: {seg.total_distance:.1f} km\n"
+             f"Points: {len(sampled)} (sampled from {len(seg.points)})\n")
+        if seg.has_gaps:
+            d += "Note: Contains data gaps\n"
+        return d
+
+    def _split_runs_and_gaps(pts, gap_min):
+        """Split points into continuous runs plus the (prev, next) pairs bracketing each gap."""
+        runs, connectors = [], []
+        cur = [pts[0]]
+        for prev, p in zip(pts, pts[1:]):
+            if (p.datetime - prev.datetime).total_seconds() / 60.0 > gap_min:
+                runs.append(cur)
+                connectors.append((prev, p))
+                cur = [p]
+            else:
+                cur.append(p)
+        runs.append(cur)
+        return runs, connectors
+
+    def _add_track(parent, pts, color_text, width_text, name, desc_text):
+        pm = ET.SubElement(parent, f'{{{KML_NS}}}Placemark')
+        if name:
+            ET.SubElement(pm, f'{{{KML_NS}}}name').text = name
+        if desc_text:
+            ET.SubElement(pm, f'{{{KML_NS}}}description').text = desc_text
+        style = ET.SubElement(pm, f'{{{KML_NS}}}Style')
+        line_style = ET.SubElement(style, f'{{{KML_NS}}}LineStyle')
+        ET.SubElement(line_style, f'{{{KML_NS}}}color').text = color_text
+        ET.SubElement(line_style, f'{{{KML_NS}}}width').text = width_text
+        icon_style = ET.SubElement(style, f'{{{KML_NS}}}IconStyle')
+        if show_icons:
+            icon = ET.SubElement(icon_style, f'{{{KML_NS}}}Icon')
+            ET.SubElement(icon, f'{{{KML_NS}}}href').text = 'http://maps.google.com/mapfiles/kml/shapes/airports.png'
+        else:
+            ET.SubElement(icon_style, f'{{{KML_NS}}}scale').text = '0'
+        track = ET.SubElement(pm, f'{{{GX_NS}}}Track')
+        ET.SubElement(track, f'{{{KML_NS}}}altitudeMode').text = 'absolute'
+        ET.SubElement(track, f'{{{KML_NS}}}extrude').text = '1' if extend_to_ground else '0'
+        for point in pts:
+            ET.SubElement(track, f'{{{KML_NS}}}when').text = point.timestamp
+        for point in pts:
+            ET.SubElement(track, f'{{{GX_NS}}}coord').text = f"{point.lon} {point.lat} {point.alt}"
+
     for group_code in sorted(routes_by_group.keys()):
         group_folder = ET.SubElement(document, f'{{{KML_NS}}}Folder')
         group_name = ET.SubElement(group_folder, f'{{{KML_NS}}}name')
@@ -1285,72 +1357,26 @@ def create_output_kml(flight_segments: List[FlightSegment], output_file: str,
                 sampled_points = segment.sample_points(sample_minutes)
                 total_points_sampled += len(sampled_points)
                 
-                placemark = ET.SubElement(route_folder, f'{{{KML_NS}}}Placemark')
-                
-                if show_labels:
-                    placemark_name = ET.SubElement(placemark, f'{{{KML_NS}}}name')
-                    placemark_name.text = segment.get_segment_name()
-                
-                description = ET.SubElement(placemark, f'{{{KML_NS}}}description')
-                desc_text = f"Aircraft ID: {segment.aircraft_id}\n"
-                desc_text += f"Registration: {segment.registration}\n"
-                desc_text += f"Route: {segment.origin.code} -> {segment.destination.code}\n"
-                desc_text += f"Date: {segment.takeoff_date_str}\n"
-                desc_text += f"Duration: {segment.flight_duration:.1f} minutes\n"
-                desc_text += f"Max altitude: {segment.max_altitude:.0f}m ({segment.max_altitude*3.28084:.0f}ft)\n"
-                desc_text += f"Distance: {segment.total_distance:.1f} km\n"
-                desc_text += f"Points: {len(sampled_points)} (sampled from {len(segment.points)})\n"
-                if segment.has_gaps:
-                    desc_text += "Note: Contains data gaps\n"
-                description.text = desc_text
-                
-                style = ET.SubElement(placemark, f'{{{KML_NS}}}Style')
-                line_style = ET.SubElement(style, f'{{{KML_NS}}}LineStyle')
-                
-                color_elem = ET.SubElement(line_style, f'{{{KML_NS}}}color')
-                if override_opacity is not None:
-                    # Convert percentage (0-100) to hex (00-ff)
-                    opacity_hex = format(int(override_opacity * 255 / 100), '02x')
-                    if override_color:
-                        # Use override color with opacity
-                        color_elem.text = opacity_hex + override_color[2:] if len(override_color) >= 8 else opacity_hex + override_color
-                    else:
-                        # Use segment color with override opacity
-                        color_elem.text = opacity_hex + segment.style_color[2:] if len(segment.style_color) >= 2 else opacity_hex + segment.style_color
-                elif override_color:
-                    color_elem.text = override_color
+                seg_color = _segment_line_color(segment)
+                seg_width = override_width if override_width else segment.style_width
+                seg_name = segment.get_segment_name() if show_labels else None
+                seg_desc = _segment_description(segment, sampled_points)
+
+                if stitch_gaps and len(sampled_points) >= 2:
+                    # Real data in the segment's colour, split at coverage gaps; each gap
+                    # bridged by a straight-line connector placemark in the inferred colour.
+                    runs, connectors = _split_runs_and_gaps(sampled_points, stitch_gap_min)
+                    for run in runs:
+                        if len(run) >= 2:
+                            _add_track(route_folder, run, seg_color, seg_width, seg_name, seg_desc)
+                    for a, b in connectors:
+                        total_connectors += 1
+                        _add_track(route_folder, [a, b], inferred_color, seg_width,
+                                   (seg_name + " [inferred]") if seg_name else None,
+                                   "Inferred gap connector (straight-line fill across a coverage "
+                                   "gap; interpolated, not measured data)")
                 else:
-                    color_elem.text = segment.style_color
-                
-                width_elem = ET.SubElement(line_style, f'{{{KML_NS}}}width')
-                width_elem.text = override_width if override_width else segment.style_width
-                
-                # Icon style - hide by default unless show_icons is True
-                icon_style = ET.SubElement(style, f'{{{KML_NS}}}IconStyle')
-                if show_icons:
-                    icon = ET.SubElement(icon_style, f'{{{KML_NS}}}Icon')
-                    href = ET.SubElement(icon, f'{{{KML_NS}}}href')
-                    href.text = 'http://maps.google.com/mapfiles/kml/shapes/airports.png'
-                else:
-                    # Hide icon
-                    scale = ET.SubElement(icon_style, f'{{{KML_NS}}}scale')
-                    scale.text = '0'
-                
-                track = ET.SubElement(placemark, f'{{{GX_NS}}}Track')
-                
-                altitude_mode = ET.SubElement(track, f'{{{KML_NS}}}altitudeMode')
-                altitude_mode.text = 'absolute'
-                
-                extrude = ET.SubElement(track, f'{{{KML_NS}}}extrude')
-                extrude.text = '1' if extend_to_ground else '0'
-                
-                for point in sampled_points:
-                    when = ET.SubElement(track, f'{{{KML_NS}}}when')
-                    when.text = point.timestamp
-                
-                for point in sampled_points:
-                    coord = ET.SubElement(track, f'{{{GX_NS}}}coord')
-                    coord.text = f"{point.lon} {point.lat} {point.alt}"
+                    _add_track(route_folder, sampled_points, seg_color, seg_width, seg_name, seg_desc)
     
     tree = ET.ElementTree(kml)
     ET.indent(tree, space='  ')
@@ -1360,7 +1386,9 @@ def create_output_kml(flight_segments: List[FlightSegment], output_file: str,
     print(f"\nOutput written to: {output_file}")
     print(f"Data reduction: {total_points_original} points -> {total_points_sampled} points")
     print(f"Compression ratio: {total_points_sampled/max(total_points_original,1)*100:.1f}%")
-    
+    if stitch_gaps and total_connectors:
+        print(f"Gap stitching: {total_connectors} inferred connector(s) drawn in {inferred_color}")
+
     return total_segments
 
 
@@ -1374,7 +1402,10 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
                      override_opacity: Optional[int] = None,
                      show_labels: bool = False,
                      show_icons: bool = False,
-                     extend_to_ground: bool = False):
+                     extend_to_ground: bool = False,
+                     stitch_gaps: bool = False,
+                     inferred_color: str = "ff888888",
+                     stitch_gap_min: float = 5.0):
     """Main processing pipeline driven by a ConfidencePreset, emitting both KML and a diagnostics CSV."""
     routes_dict = {(r.origin, r.destination): r.avg_time_min for r in routes}
     recorder = DiagnosticsRecorder(output_file, preset_name=preset.name)
@@ -1449,7 +1480,8 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
         final_segments, output_file, group_by,
         sample_minutes,
         override_color, override_width, override_opacity,
-        show_labels, show_icons, extend_to_ground
+        show_labels, show_icons, extend_to_ground,
+        stitch_gaps, inferred_color, stitch_gap_min
     )
 
     recorder.write_csv()
@@ -1523,6 +1555,18 @@ def main():
     parser.add_argument('--ground', choices=['true', 'false'], default='false',
                        help='Extend flight paths to ground (default: false)')
 
+    # Gap stitching (off by default; opting in changes each flight into multiple placemarks)
+    parser.add_argument('--stitch-gaps', choices=['true', 'false'], default='false',
+                       dest='stitch_gaps',
+                       help='Draw straight-line connectors across coverage gaps within a flight, '
+                            'in a distinct colour, to mark inferred/interpolated data (default: false). '
+                            'When true, each flight splits into real-data placemarks + gap connectors.')
+    parser.add_argument('--inferred-color', default='ff888888', dest='inferred_color',
+                       help='KML colour (AABBGGRR) for inferred gap connectors (default: ff888888, gray)')
+    parser.add_argument('--stitch-gap-min', type=float, default=5.0, dest='stitch_gap_min',
+                       help='Minutes between consecutive points above which a gap connector is drawn '
+                            '(default: 5.0)')
+
     # Confidence preset and per-knob overrides
     parser.add_argument('--confidence', choices=['strict', 'balanced', 'permissive'],
                        default='balanced',
@@ -1554,6 +1598,7 @@ def main():
     show_labels = args.labels == 'true'
     show_icons = args.icons == 'true'
     extend_to_ground = args.ground == 'true'
+    stitch_gaps = args.stitch_gaps == 'true'
     
     # Validate opacity if provided
     if args.opacity is not None and (args.opacity < 0 or args.opacity > 100):
@@ -1638,6 +1683,9 @@ def main():
         show_labels=show_labels,
         show_icons=show_icons,
         extend_to_ground=extend_to_ground,
+        stitch_gaps=stitch_gaps,
+        inferred_color=args.inferred_color,
+        stitch_gap_min=args.stitch_gap_min,
     )
     
     print("\nProcessing complete!")
