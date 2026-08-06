@@ -97,6 +97,8 @@ def resolve_preset(args) -> ConfidencePreset:
         overrides["max_join_distance_km"] = args.max_join_distance_km
     if getattr(args, "route_time_tolerance", None) is not None:
         overrides["route_time_tolerance"] = args.route_time_tolerance
+    if getattr(args, "corridor_cross_track_km", None) is not None:
+        overrides["corridor_cross_track_km"] = args.corridor_cross_track_km
     rtr = getattr(args, "route_time_rescue", None)
     if rtr is not None:
         overrides["route_time_rescue"] = (rtr == "on")
@@ -1537,6 +1539,11 @@ def main():
     parser.add_argument('--route-time-tolerance', type=float, default=None,
                        dest='route_time_tolerance',
                        help='Override route-time matching tolerance (e.g., 0.30 = ±30%%)')
+    parser.add_argument('--corridor-cross-track-km', type=float, default=None,
+                       dest='corridor_cross_track_km',
+                       help='Override corridor cross-track gate (km) for endpoint recovery. '
+                            'Lower = stricter (less mis-attribution, fewer recoveries); '
+                            'higher = looser. Preset defaults: balanced 70, permissive 120.')
     parser.add_argument('--route-time-rescue', choices=['on', 'off'], default=None,
                        dest='route_time_rescue',
                        help='Override route-time rescue (on/off)')
