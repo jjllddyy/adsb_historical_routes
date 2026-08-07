@@ -49,6 +49,7 @@ If you don't yet have the two input CSVs, build them from a Cirium export first 
   - [Confidence presets](#confidence-presets)
   - [Colors](#colors)
 - [Gap stitching (inferred data)](#-gap-stitching-inferred-data)
+- [Position-source integration (POS + firehose)](#-position-source-integration-pos--firehose)
 - [Diagnostics & tuning without ground truth](#-diagnostics--tuning-without-ground-truth)
 - [Examples](#-examples)
 - [Input & output formats](#-input--output-formats)
@@ -198,6 +199,17 @@ records use the current `SPJC`. Add rows as new mismatches are found.
 | `--inferred-color` | `ff888888` | KML color (AABBGGRR) for inferred connectors (default gray). |
 | `--stitch-gap-min` | `5.0` | Minutes between consecutive points above which a gap connector is drawn. |
 
+**Position-source integration** (see [Position-source integration](#-position-source-integration-pos--firehose))
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--integrate-pos` | `false` | `true` fills each detected flight's in-flight ADS-B gaps with real ACARS position reports and/or ADS-B firehose fixes. Detection is unchanged — extras only densify flights already found. **Off = output unchanged.** |
+| `--pos-folder` | *(none)* | Folder of ACARS position-report JSON files (keyed to hex via `--tail-icao`). |
+| `--firehose-folder` | *(none)* | Folder of ADS-B firehose position JSON files (carry ICAO hex directly). |
+| `--tail-icao` | *(none)* | CSV mapping `tail_number,icao_hex` — required to key ACARS POS reports to hex. |
+| `--pos-color` | `ff00a5ff` | KML color (AABBGGRR) for ACARS-POS-sourced track portions (default orange). |
+| `--firehose-color` | `ff00ff00` | KML color (AABBGGRR) for firehose-sourced track portions (default green). |
+
 **Styling / display**
 
 | Parameter | Default | Description |
@@ -258,6 +270,54 @@ is a real straight-line inference. `--stitch-gaps true` makes those inferred por
 - **Opt-in and reversible:** with the flag off, output is byte-identical to before. With it on, a
   flight with N gaps becomes N+1 real placemarks + N connectors (a structural change, so enable it
   only when your downstream tooling expects it).
+
+---
+
+## 🛰 Position-source integration (POS + firehose)
+
+Where ADS-B drops out mid-flight, gap stitching draws an *inferred* straight line. If you have
+**real** position data for that window — ACARS position reports (POS) and/or an ADS-B firehose
+feed — `--integrate-pos true` fills those gaps with measured fixes instead of inference.
+
+**How it works (measured, not inferred):**
+
+- Flights are detected from **ADS-B alone**, exactly as without the flag — origin, destination,
+  timing, and route matching are **unchanged**. The extra sources never create or split flights;
+  they only densify flights already found. (Feeding sparse POS *through* the segmenter would
+  shatter tracks into thousands of spurious micro-flights — so integration happens strictly
+  *after* detection.)
+- For each flight, POS/firehose fixes that fall inside its own `[takeoff, landing]` window and
+  land in a gap ≥ `--stitch-gap-min` minutes are merged in. ADS-B is authoritative: an extra fix
+  within 30 s of an ADS-B point is dropped as redundant, so dense stretches aren't fragmented.
+- **Source-marked rendering:** ADS-B keeps the flight color, ACARS-POS portions draw in
+  `--pos-color` (orange), firehose portions in `--firehose-color` (green). Because these are real
+  data, the gray inferred connector is **not** drawn where a source fills the gap.
+
+**Inputs:**
+
+- `--pos-folder` — ACARS files: each an SQS message whose (URL-encoded) `body` is
+  `<Airline>_Position=[{…}]`; each report carries `tail_number`, `created_at`, and a `freetext`
+  encoding `HHMMSS, alt_ft, …, lat/lon` (e.g. `S 33.569 W 060.089`).
+- `--firehose-folder` — ADS-B firehose files: one report each, carrying `icao` (hex),
+  Unix `timestamp`, `latitude`, `longitude`, `altitude` (feet).
+- `--tail-icao` — CSV `tail_number,icao_hex`. POS files key on tail; this maps them to the hex
+  ADS-B/firehose use. (Tails are normalized — punctuation stripped, upper-cased.)
+
+```bash
+python3 adsb_historical_routes.py \
+    --kml-folder ./jat_july \
+    --airports  input/jat_routes_202606-202607_airports.csv \
+    --routes    input/jat_routes_202606-202607_routes_time.csv \
+    --output    jat_july.kml \
+    --confidence permissive --corridor-cross-track-km 50 \
+    --integrate-pos true \
+    --pos-folder ./pos --firehose-folder ./adsbpos \
+    --tail-icao  input/jat_active_tails_icao.csv
+```
+
+**Opt-in and safe:** with the flag off, output is unchanged. With it on, flight *counts* and route
+labels are identical to a plain run (verified on JAT July: 130/130 flights either way); only the
+geometry of gap-affected flights gets richer, with the added portions color-marked by source.
 
 ---
 

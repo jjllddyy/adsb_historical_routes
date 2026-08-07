@@ -17,6 +17,9 @@ import sys
 import os
 import gc
 import glob
+import json
+import bisect
+import urllib.parse
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from typing import List, Tuple, Dict, Optional, Set
@@ -132,7 +135,7 @@ class Route:
 
 class TrackPoint:
     """Represents a single point in a flight track"""
-    def __init__(self, timestamp: str, lon: float, lat: float, alt: float):
+    def __init__(self, timestamp: str, lon: float, lat: float, alt: float, source: str = "ADSB"):
         self.timestamp = timestamp
         self.lon = lon
         self.lat = lat
@@ -140,6 +143,10 @@ class TrackPoint:
         self.datetime = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
         self.groundspeed = None
         self.vertical_speed = None
+        # Origin of this fix: "ADSB" (ADS-B Exchange KML), "POS" (ACARS position report),
+        # or "FIREHOSE" (ADS-B firehose feed). Used to colour the output and to treat
+        # source-filled gaps as real (not inferred).
+        self.source = source
     
     def __repr__(self):
         return f"TrackPoint({self.timestamp}, {self.lat:.4f}, {self.lon:.4f}, {self.alt:.0f}m)"
@@ -538,6 +545,203 @@ def parse_kml_tracks(kml_file: str, aircraft_id: str) -> List[Tuple[List[TrackPo
         find_tracks_recursive(root)
     
     return all_tracks
+
+
+# ---------------------------------------------------------------------------
+# Optional extra position sources: ACARS position reports ("POS") and the
+# ADS-B firehose ("FIREHOSE"). Both are merged into the per-aircraft ADS-B
+# track before detection so real fixes fill coverage gaps.
+# ---------------------------------------------------------------------------
+
+def load_tail_to_hex(path: str) -> Dict[str, str]:
+    """Load a `tail_number,icao_hex` CSV into {normalized_tail: HEX}.
+
+    Tail is normalized to A-Z0-9 (so `CC-DIK` and `CCDIK` both match). ACARS reports carry a
+    tail number; ADS-B/firehose carry the ICAO hex; this bridges them.
+    """
+    mapping: Dict[str, str] = {}
+    if not path or not os.path.exists(path):
+        return mapping
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            tail = re.sub(r"[^A-Z0-9]", "", (row.get("tail_number") or "").upper())
+            hexc = (row.get("icao_hex") or "").strip().upper()
+            if tail and hexc:
+                mapping[tail] = hexc
+    return mapping
+
+
+def _parse_pos_latlon(freetext: str):
+    """Extract (lat, lon) from an ACARS freetext like `S 26.085 W 70.677` (S/W are negative)."""
+    m = re.search(r"([NS])\s*([\d.]+)\s+([EW])\s*([\d.]+)", freetext)
+    if not m:
+        return None
+    lat = float(m.group(2)) * (-1 if m.group(1) == "S" else 1)
+    lon = float(m.group(4)) * (-1 if m.group(3) == "W" else 1)
+    return lat, lon
+
+
+def load_pos_points(folder: str, tail_to_hex: Dict[str, str]) -> Dict[Tuple[str, str], List["TrackPoint"]]:
+    """Parse ACARS POS files into {(hex, 'YYYY-MM-DD'): [TrackPoint(source='POS'), ...]}.
+
+    Each file is an SQS message whose (URL-encoded) `body` is `<Airline>_Position=[{...}]`;
+    each report has `tail_number`, `created_at` (date), and a `freetext` encoding
+    `HHMMSS, alt_ft, ?, heading, lat/lon`. Position time = created_at date + freetext HHMMSS (UTC).
+    """
+    idx: Dict[Tuple[str, str], List["TrackPoint"]] = defaultdict(list)
+    if not folder or not os.path.isdir(folder):
+        return idx
+    for fp in glob.glob(os.path.join(folder, "*.json")):
+        try:
+            body = json.load(open(fp)).get("body", "")
+        except Exception:
+            continue
+        body = urllib.parse.unquote_plus(body)
+        m = re.match(r"^\w+_Position=(\[.*\])\s*$", body, re.S)
+        if not m:
+            continue
+        try:
+            reports = json.loads(m.group(1))
+        except Exception:
+            continue
+        for r in reports:
+            tail = re.sub(r"[^A-Z0-9]", "", (r.get("tail_number") or "").upper())
+            hexc = tail_to_hex.get(tail)
+            if not hexc:
+                continue
+            date = (r.get("created_at") or "")[:10]
+            ft = r.get("freetext") or ""
+            parts = [p.strip() for p in ft.lstrip("-").strip().split(",")]
+            ll = _parse_pos_latlon(ft)
+            if not (re.fullmatch(r"\d{4}-\d{2}-\d{2}", date) and len(parts) >= 2
+                    and re.fullmatch(r"\d{6}", parts[0]) and ll):
+                continue
+            hh, mi, ss = parts[0][:2], parts[0][2:4], parts[0][4:6]
+            try:
+                alt_m = float(parts[1]) * 0.3048
+            except (ValueError, IndexError):
+                alt_m = 0.0
+            try:
+                tp = TrackPoint(f"{date}T{hh}:{mi}:{ss}Z", ll[1], ll[0], alt_m, source="POS")
+            except Exception:
+                continue
+            idx[(hexc, date)].append(tp)
+    return idx
+
+
+def load_firehose_points(folder: str) -> Dict[Tuple[str, str], List["TrackPoint"]]:
+    """Parse ADS-B firehose files into {(hex, 'YYYY-MM-DD'): [TrackPoint(source='FIREHOSE')]}.
+
+    Each file is one report with `icao` (hex), Unix `timestamp`, `latitude`, `longitude`,
+    and `altitude` (feet).
+    """
+    idx: Dict[Tuple[str, str], List["TrackPoint"]] = defaultdict(list)
+    if not folder or not os.path.isdir(folder):
+        return idx
+    for fp in glob.glob(os.path.join(folder, "*.json")):
+        try:
+            d = json.load(open(fp))
+        except Exception:
+            continue
+        hexc = (d.get("icao") or "").strip().upper()
+        ts, lat, lon, alt = d.get("timestamp"), d.get("latitude"), d.get("longitude"), d.get("altitude")
+        if not (hexc and ts is not None and lat is not None and lon is not None):
+            continue
+        try:
+            dt = datetime.utcfromtimestamp(int(ts))
+            alt_m = float(alt) * 0.3048 if alt not in (None, "") else 0.0
+            tp = TrackPoint(dt.strftime("%Y-%m-%dT%H:%M:%SZ"), float(lon), float(lat), alt_m, source="FIREHOSE")
+        except Exception:
+            continue
+        idx[(hexc, dt.strftime("%Y-%m-%d"))].append(tp)
+    return idx
+
+
+def load_position_sources(pos_folder: Optional[str], firehose_folder: Optional[str],
+                          tail_icao_path: Optional[str]) -> Dict[Tuple[str, str], List["TrackPoint"]]:
+    """Load and combine ACARS POS + firehose fixes, keyed by (hex, 'YYYY-MM-DD')."""
+    tail_to_hex = load_tail_to_hex(tail_icao_path) if tail_icao_path else {}
+    combined: Dict[Tuple[str, str], List["TrackPoint"]] = defaultdict(list)
+    if pos_folder:
+        if not tail_to_hex:
+            print("  Warning: POS folder given but no tail<->hex map; ACARS reports cannot be keyed to hex.")
+        for k, v in load_pos_points(pos_folder, tail_to_hex).items():
+            combined[k].extend(v)
+    if firehose_folder:
+        for k, v in load_firehose_points(firehose_folder).items():
+            combined[k].extend(v)
+    return combined
+
+
+def merge_track_with_sources(adsb_points: List["TrackPoint"], extra_points: List["TrackPoint"],
+                             dedup_seconds: float = 30.0,
+                             min_fill_gap_seconds: float = 120.0) -> List["TrackPoint"]:
+    """Merge ADS-B points with extra (POS/firehose) fixes, sorted by time.
+
+    ADS-B is authoritative where present. An extra fix is kept only when it adds real
+    coverage, so dense ADS-B stretches aren't fragmented by redundant POS/firehose points:
+
+    * dropped if within ``dedup_seconds`` of an ADS-B point (already covered);
+    * between two ADS-B points, kept only if that ADS-B gap is >= ``min_fill_gap_seconds``
+      (a genuine gap worth filling, not sub-minute jitter);
+    * beyond either ADS-B track end, kept (extends coverage where ADS-B never saw it).
+    """
+    if not extra_points:
+        return sorted(adsb_points, key=lambda p: p.datetime)
+    adsb_sorted = sorted(adsb_points, key=lambda p: p.datetime)
+    adsb_times = [p.datetime for p in adsb_sorted]
+    kept = []
+    for e in extra_points:
+        i = bisect.bisect_left(adsb_times, e.datetime)
+        prev_t = adsb_times[i - 1] if i - 1 >= 0 else None
+        next_t = adsb_times[i] if i < len(adsb_times) else None
+        d_prev = abs((e.datetime - prev_t).total_seconds()) if prev_t else None
+        d_next = abs((next_t - e.datetime).total_seconds()) if next_t else None
+        if (d_prev is not None and d_prev <= dedup_seconds) or \
+           (d_next is not None and d_next <= dedup_seconds):
+            continue  # redundant with existing ADS-B
+        if prev_t and next_t:
+            if (next_t - prev_t).total_seconds() >= min_fill_gap_seconds:
+                kept.append(e)  # fills a genuine ADS-B gap
+        else:
+            kept.append(e)      # extends beyond an ADS-B track end
+    return sorted(adsb_sorted + kept, key=lambda p: p.datetime)
+
+
+def enrich_segments_with_sources(segments: List["FlightSegment"],
+                                 pos_index: Dict[Tuple[str, str], List["TrackPoint"]],
+                                 min_fill_gap_seconds: float = 300.0) -> Tuple[int, int]:
+    """Fill each detected flight's interior ADS-B gaps with real POS/firehose fixes.
+
+    For every segment, gathers extra fixes for its aircraft (hex) that fall strictly inside
+    the flight's own [takeoff, landing] window and merges them in (ADS-B authoritative;
+    only gaps >= ``min_fill_gap_seconds`` are filled). Because the window is bounded by the
+    flight's own first/last ADS-B fix, origin/destination and timing are unchanged -- this
+    only densifies flights already detected from ADS-B. Mutates segments in place; returns
+    (flights_enriched, fixes_added).
+    """
+    flights_enriched = fixes_added = 0
+    if not pos_index:
+        return (0, 0)
+    for seg in segments:
+        if not seg.points or seg.takeoff_time is None or seg.landing_time is None:
+            continue
+        t0, t1 = seg.takeoff_time, seg.landing_time
+        dates = {t0.strftime("%Y-%m-%d"), t1.strftime("%Y-%m-%d")}  # cover a midnight crossing
+        extras = [e for d in dates for e in pos_index.get((seg.aircraft_id, d), [])
+                  if t0 <= e.datetime <= t1]
+        if not extras:
+            continue
+        merged = merge_track_with_sources(seg.points, extras, min_fill_gap_seconds=min_fill_gap_seconds)
+        added = len(merged) - len(seg.points)
+        if added <= 0:
+            continue
+        seg.points = merged
+        seg.max_altitude = max(p.alt for p in merged)
+        seg.total_distance = seg.calculate_total_distance()
+        flights_enriched += 1
+        fixes_added += added
+    return (flights_enriched, fixes_added)
 
 
 def detect_flight_segments_with_preset(track_points: List["TrackPoint"], airports: List["Airport"],
@@ -1230,14 +1434,23 @@ def create_output_kml(flight_segments: List[FlightSegment], output_file: str,
                      extend_to_ground: bool = False,
                      stitch_gaps: bool = False,
                      inferred_color: str = "ff888888",
-                     stitch_gap_min: float = 5.0):
+                     stitch_gap_min: float = 5.0,
+                     mark_sources: bool = False,
+                     pos_color: str = "ff00a5ff",
+                     firehose_color: str = "ff00ff00"):
     """Create output KML file with organized folder structure.
 
     When ``stitch_gaps`` is True, each flight track is split at coverage gaps (an
     inter-point time delta > ``stitch_gap_min`` minutes) into continuous real-data
     placemarks (normal color) plus a straight-line connector placemark per gap, drawn in
-    ``inferred_color`` (KML AABBGGRR) to mark the inferred/interpolated portion. Default
-    (False) keeps the original single-track-per-flight output unchanged.
+    ``inferred_color`` (KML AABBGGRR) to mark the inferred/interpolated portion.
+
+    When ``mark_sources`` is True (position-source integration), each flight track is also
+    split at source changes and the stretches drawn in distinct colours -- ADS-B in the
+    segment colour, ACARS position reports in ``pos_color``, ADS-B firehose in
+    ``firehose_color`` (all KML AABBGGRR) -- so gap-filling real data is visibly marked and
+    is *not* rendered as an inferred connector. Default (both False) keeps the original
+    single-track-per-flight output unchanged.
     """
     
     # Define namespace constants
@@ -1299,18 +1512,30 @@ def create_output_kml(flight_segments: List[FlightSegment], output_file: str,
             d += "Note: Contains data gaps\n"
         return d
 
-    def _split_runs_and_gaps(pts, gap_min):
-        """Split points into continuous runs plus the (prev, next) pairs bracketing each gap."""
+    def _runs_and_gaps(pts, gap_min, split_gaps):
+        """Split points into runs (each a same-source, contiguous stretch) plus the
+        (prev, next) pairs bracketing each real coverage gap.
+
+        A run break is forced at (a) a source change — so ADS-B / POS / firehose stretches
+        can be drawn in distinct colours — and (b) when ``split_gaps`` is True, an
+        inter-point time delta > ``gap_min`` minutes (a real coverage gap, recorded as a
+        connector). Consecutive non-gap runs share their boundary point so the coloured
+        lines stay visually joined across a source change. Each run is (points, source).
+        """
         runs, connectors = [], []
         cur = [pts[0]]
         for prev, p in zip(pts, pts[1:]):
-            if (p.datetime - prev.datetime).total_seconds() / 60.0 > gap_min:
-                runs.append(cur)
+            is_gap = split_gaps and (p.datetime - prev.datetime).total_seconds() / 60.0 > gap_min
+            if is_gap:
+                runs.append((cur, cur[0].source))
                 connectors.append((prev, p))
+                cur = [p]
+            elif p.source != prev.source:
+                runs.append((cur + [p], cur[0].source))  # overlap by one point -> lines stay joined
                 cur = [p]
             else:
                 cur.append(p)
-        runs.append(cur)
+        runs.append((cur, cur[0].source))
         return runs, connectors
 
     def _add_track(parent, pts, color_text, width_text, name, desc_text):
@@ -1362,13 +1587,20 @@ def create_output_kml(flight_segments: List[FlightSegment], output_file: str,
                 seg_name = segment.get_segment_name() if show_labels else None
                 seg_desc = _segment_description(segment, sampled_points)
 
-                if stitch_gaps and len(sampled_points) >= 2:
-                    # Real data in the segment's colour, split at coverage gaps; each gap
-                    # bridged by a straight-line connector placemark in the inferred colour.
-                    runs, connectors = _split_runs_and_gaps(sampled_points, stitch_gap_min)
-                    for run in runs:
+                if (stitch_gaps or mark_sources) and len(sampled_points) >= 2:
+                    # Split into same-source runs (coloured by data source when mark_sources)
+                    # and, when stitch_gaps, real coverage gaps bridged by an inferred
+                    # straight-line connector. Gaps filled by POS/firehose data are real
+                    # runs in their source colour, not inferred connectors.
+                    src_color = {"ADSB": seg_color, "POS": pos_color, "FIREHOSE": firehose_color}
+                    runs, connectors = _runs_and_gaps(sampled_points, stitch_gap_min, stitch_gaps)
+                    for run, src in runs:
                         if len(run) >= 2:
-                            _add_track(route_folder, run, seg_color, seg_width, seg_name, seg_desc)
+                            col = src_color.get(src, seg_color) if mark_sources else seg_color
+                            nm = seg_name
+                            if seg_name and mark_sources and src != "ADSB":
+                                nm = seg_name + f" [{src.lower()}]"
+                            _add_track(route_folder, run, col, seg_width, nm, seg_desc)
                     for a, b in connectors:
                         total_connectors += 1
                         _add_track(route_folder, [a, b], inferred_color, seg_width,
@@ -1405,7 +1637,13 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
                      extend_to_ground: bool = False,
                      stitch_gaps: bool = False,
                      inferred_color: str = "ff888888",
-                     stitch_gap_min: float = 5.0):
+                     stitch_gap_min: float = 5.0,
+                     integrate_pos: bool = False,
+                     pos_folder: Optional[str] = None,
+                     firehose_folder: Optional[str] = None,
+                     tail_icao_path: Optional[str] = None,
+                     pos_color: str = "ff00a5ff",
+                     firehose_color: str = "ff00ff00"):
     """Main processing pipeline driven by a ConfidencePreset, emitting both KML and a diagnostics CSV."""
     routes_dict = {(r.origin, r.destination): r.avg_time_min for r in routes}
     recorder = DiagnosticsRecorder(output_file, preset_name=preset.name)
@@ -1413,6 +1651,14 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
     all_segments: List[FlightSegment] = []
     raw_idx_by_segment: Dict[int, int] = {}
     next_idx = 0
+
+    # Optional extra position sources (ACARS POS + ADS-B firehose), keyed by (hex, date).
+    pos_index: Dict[Tuple[str, str], List[TrackPoint]] = {}
+    if integrate_pos:
+        print("\nLoading extra position sources (this reads many small files)...")
+        pos_index = load_position_sources(pos_folder, firehose_folder, tail_icao_path)
+        print(f"  Loaded {sum(len(v) for v in pos_index.values())} extra fixes "
+              f"across {len(pos_index)} aircraft-days")
 
     kml_files = sorted(kml_files)
 
@@ -1475,13 +1721,25 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
 
     print(f"\n\nTOTAL VALID COMPLETE FLIGHTS: {len(final_segments)}")
 
+    # Enrich detected flights with real POS/firehose fixes that fall inside each flight's
+    # own time window, filling in-flight ADS-B coverage gaps with measured data (not
+    # straight-line inference). Detection/route-matching above is unchanged -- ADS-B alone
+    # decides the flights; the extra sources only densify the ones already found.
+    if integrate_pos and pos_index:
+        n_flights_enriched, n_fixes_added = enrich_segments_with_sources(
+            final_segments, pos_index, min_fill_gap_seconds=stitch_gap_min * 60.0)
+        print(f"\nPosition-source integration: filled {n_fixes_added} real fix(es) into "
+              f"{n_flights_enriched} of {len(final_segments)} flights "
+              f"(gaps >= {stitch_gap_min:.0f} min, within each flight's own time window)")
+
     print("\nCreating output KML...")
     total_flights = create_output_kml(
         final_segments, output_file, group_by,
         sample_minutes,
         override_color, override_width, override_opacity,
         show_labels, show_icons, extend_to_ground,
-        stitch_gaps, inferred_color, stitch_gap_min
+        stitch_gaps, inferred_color, stitch_gap_min,
+        mark_sources=integrate_pos, pos_color=pos_color, firehose_color=firehose_color
     )
 
     recorder.write_csv()
@@ -1567,6 +1825,23 @@ def main():
                        help='Minutes between consecutive points above which a gap connector is drawn '
                             '(default: 5.0)')
 
+    # Extra position sources: ACARS position reports (POS) and the ADS-B firehose
+    parser.add_argument('--integrate-pos', choices=['true', 'false'], default='false',
+                       dest='integrate_pos',
+                       help='Merge extra position sources (ACARS POS and/or ADS-B firehose) into each '
+                            'aircraft track before detection, so real fixes fill coverage gaps '
+                            '(default: false). Provide --pos-folder / --firehose-folder / --tail-icao.')
+    parser.add_argument('--pos-folder', default=None, dest='pos_folder',
+                       help='Folder of ACARS position-report JSON files (keyed to hex via --tail-icao).')
+    parser.add_argument('--firehose-folder', default=None, dest='firehose_folder',
+                       help='Folder of ADS-B firehose position JSON files (carry ICAO hex directly).')
+    parser.add_argument('--tail-icao', default=None, dest='tail_icao',
+                       help='CSV mapping tail_number,icao_hex (required to key ACARS POS reports to hex).')
+    parser.add_argument('--pos-color', default='ff00a5ff', dest='pos_color',
+                       help='KML AABBGGRR colour for ACARS POS-sourced track portions (default: ff00a5ff, orange).')
+    parser.add_argument('--firehose-color', default='ff00ff00', dest='firehose_color',
+                       help='KML AABBGGRR colour for firehose-sourced track portions (default: ff00ff00, green).')
+
     # Confidence preset and per-knob overrides
     parser.add_argument('--confidence', choices=['strict', 'balanced', 'permissive'],
                        default='balanced',
@@ -1599,6 +1874,7 @@ def main():
     show_icons = args.icons == 'true'
     extend_to_ground = args.ground == 'true'
     stitch_gaps = args.stitch_gaps == 'true'
+    integrate_pos = args.integrate_pos == 'true'
     
     # Validate opacity if provided
     if args.opacity is not None and (args.opacity < 0 or args.opacity > 100):
@@ -1686,6 +1962,12 @@ def main():
         stitch_gaps=stitch_gaps,
         inferred_color=args.inferred_color,
         stitch_gap_min=args.stitch_gap_min,
+        integrate_pos=integrate_pos,
+        pos_folder=args.pos_folder,
+        firehose_folder=args.firehose_folder,
+        tail_icao_path=args.tail_icao,
+        pos_color=args.pos_color,
+        firehose_color=args.firehose_color,
     )
     
     print("\nProcessing complete!")
