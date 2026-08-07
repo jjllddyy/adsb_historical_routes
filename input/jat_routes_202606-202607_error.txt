@@ -1,0 +1,11 @@
+============================================================
+Cirium input build report
+============================================================
+Source rows read:        521
+Routes written:          185
+Airports written:        51
+Routes dropped (no map): 0
+Routes dropped (no flts):0
+
+VERDICT: READY — both files complete; adsb_historical_routes.py can run.
+============================================================
