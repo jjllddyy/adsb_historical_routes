@@ -49,3 +49,38 @@ def test_confine_path_accepts_inside_rejects_outside(tmp_path):
         server.confine_path("/etc/passwd", [root])
     with pytest.raises(PermissionError):
         server.confine_path(os.path.join(root, "..", "escape"), [root])
+
+
+def test_build_argv_folder_and_defaults_omitted():
+    argv = server.build_argv({
+        "kml_folder": "/data/jat", "airports": "/a.csv", "routes": "/r.csv",
+        "output_dir": "/out", "output_name": "j.kml",
+        "confidence": "permissive", "corridor_cross_track_km": 50,
+        "sample": 2, "opacity": 100, "stitch_gaps": False,
+    })
+    assert argv[:3] == ["python3", "-u", server.SCRIPT_PATH_BASENAME] or argv[1] == "-u"
+    assert "--kml-folder" in argv and "/data/jat" in argv
+    assert "--output" in argv and "/out/j.kml" in argv
+    assert "--confidence" in argv and "permissive" in argv
+    assert "--stitch-gaps" not in argv          # false boolean omitted
+    assert "--sample" not in argv               # equals script default -> omitted
+
+
+def test_build_argv_files_and_booleans():
+    argv = server.build_argv({
+        "kml_files": ["/a.kml", "/b.kml"], "airports": "/a.csv", "routes": "/r.csv",
+        "output_dir": "/out", "output_name": "j.kml",
+        "stitch_gaps": True, "integrate_pos": True,
+    })
+    i = argv.index("--kml-files")
+    assert argv[i + 1] == "/a.kml" and argv[i + 2] == "/b.kml"
+    assert "--stitch-gaps" in argv and argv[argv.index("--stitch-gaps") + 1] == "true"
+    assert "--integrate-pos" in argv
+
+
+def test_suggest_name_suffixes():
+    assert server.suggest_name("jat_2026_jun-jul", {}) == "jat_routes_2026_jun-jul.kml"
+    assert server.suggest_name("jat_2026_jun-jul", {"stitch_gaps": True}) \
+        == "jat_routes_2026_jun-jul_stitched.kml"
+    n = server.suggest_name("jat_2026_jun-jul", {"integrate_pos": True, "color_mode": "altitude"})
+    assert n.endswith("_pos_altcolor.kml")
