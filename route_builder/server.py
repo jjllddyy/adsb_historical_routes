@@ -32,3 +32,13 @@ def save_manifest(app_dir, manifest):
     """Persist the runtime manifest.json (used by preset add/delete)."""
     with open(os.path.join(app_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
+
+
+def confine_path(path, allowed_roots):
+    """Return realpath(path) if it lives inside one of allowed_roots, else PermissionError."""
+    rp = os.path.realpath(os.path.expanduser(path))
+    for root in allowed_roots:
+        rr = os.path.realpath(root)
+        if rp == rr or rp.startswith(rr + os.sep):
+            return rp
+    raise PermissionError(f"path outside allowed roots: {path}")

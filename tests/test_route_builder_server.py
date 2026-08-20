@@ -37,3 +37,15 @@ def test_load_manifest_copies_seed_and_resolves_roots(tmp_path):
     assert os.path.exists(os.path.join(d, "manifest.json"))          # seed copied to runtime
     assert os.path.isabs(man["roots"]["input_default"])              # ~ expanded, absolute
     assert any(p["builtin"] for p in man["presets"])
+
+
+def test_confine_path_accepts_inside_rejects_outside(tmp_path):
+    root = str(tmp_path)
+    inside = os.path.join(root, "sub", "f.kml")
+    os.makedirs(os.path.dirname(inside)); open(inside, "w").close()
+    assert server.confine_path(inside, [root]) == os.path.realpath(inside)
+    import pytest
+    with pytest.raises(PermissionError):
+        server.confine_path("/etc/passwd", [root])
+    with pytest.raises(PermissionError):
+        server.confine_path(os.path.join(root, "..", "escape"), [root])
