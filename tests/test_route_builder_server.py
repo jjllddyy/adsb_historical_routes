@@ -156,6 +156,47 @@ def test_validate_counts_and_errors(tmp_path):
     assert any("airport" in e.lower() for e in v2["errors"])
 
 
+def test_validate_rejects_kml_files_outside_allowed_roots(tmp_path):
+    root = str(tmp_path)
+    ap = os.path.join(root, "ap.csv"); _csv(ap, "airport,latitude,longitude,elevation_ft",
+                                             ["AAA,0,0,0", "BBB,1,1,1"])
+    rt = os.path.join(root, "rt.csv"); _csv(rt, "origin,destination,avg_enroute_min",
+                                             ["AAA,BBB,60"])
+    outside_dir = tempfile.mkdtemp()
+    try:
+        outside_kml = os.path.join(outside_dir, "sneaky.kml")
+        open(outside_kml, "w").close()
+        params = {"kml_files": [outside_kml], "airports": ap, "routes": rt,
+                  "output_dir": root, "output_name": "o.kml"}
+        v = server.validate(params, [root])
+        assert v["errors"]
+        assert any("outside the allowed folders" in e for e in v["errors"])
+    finally:
+        shutil.rmtree(outside_dir, ignore_errors=True)
+
+
+def test_validate_rejects_output_dir_outside_allowed_roots(tmp_path):
+    root = str(tmp_path)
+    kdir = os.path.join(root, "kml"); os.makedirs(kdir)
+    open(os.path.join(kdir, "a.kml"), "w").close()
+    ap = os.path.join(root, "ap.csv"); _csv(ap, "airport,latitude,longitude,elevation_ft",
+                                             ["AAA,0,0,0", "BBB,1,1,1"])
+    rt = os.path.join(root, "rt.csv"); _csv(rt, "origin,destination,avg_enroute_min",
+                                             ["AAA,BBB,60"])
+    outside_dir = tempfile.mkdtemp()
+    try:
+        # a not-yet-created subdirectory: confine_path must reject on containment alone,
+        # not because the path doesn't exist yet.
+        nonexistent_output_dir = os.path.join(outside_dir, "not_created_yet")
+        params = {"kml_folder": kdir, "airports": ap, "routes": rt,
+                  "output_dir": nonexistent_output_dir, "output_name": "o.kml"}
+        v = server.validate(params, [root])
+        assert v["errors"]
+        assert any("output folder is outside" in e.lower() for e in v["errors"])
+    finally:
+        shutil.rmtree(outside_dir, ignore_errors=True)
+
+
 def test_runmanager_streams_and_parses(tmp_path):
     fake = os.path.join(str(tmp_path), "fake.py")
     with open(fake, "w") as f:

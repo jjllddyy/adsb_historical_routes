@@ -194,6 +194,13 @@ def validate(params: Dict[str, Any], allowed_roots: List[str]) -> Dict[str, Any]
     kml_count = 0
     if params.get("kml_files"):
         kml_count = len(params["kml_files"])
+        for f in params["kml_files"]:
+            try:
+                rp = confine_path(f, allowed_roots)
+            except PermissionError:
+                errors.append("A selected KML file is outside the allowed folders"); break
+            if not os.path.exists(rp):
+                errors.append(f"KML file not found: {f}"); break
     else:
         kf = ok(params.get("kml_folder"), "Input KML folder")
         if kf:
@@ -211,6 +218,13 @@ def validate(params: Dict[str, Any], allowed_roots: List[str]) -> Dict[str, Any]
             errors.append("Integrate positions is on but no POS or firehose folder is set")
         ti = ok(params.get("tail_icao"), "Tail<->ICAO CSV") if params.get("tail_icao") else None
         tail_count = _count_csv_rows(ti) if ti else 0
+
+    od = params.get("output_dir", "")
+    if od:
+        try:
+            confine_path(od, allowed_roots)
+        except PermissionError:
+            errors.append("Output folder is outside the allowed folders")
 
     out_path = os.path.join(params.get("output_dir", ""), params.get("output_name", ""))
     if not params.get("output_name"):
@@ -365,6 +379,7 @@ def make_server(port: int, app_dir: str = APP_DIR,
             pass
 
         def _send(self, code: int, obj: Any = None, ctype: str = "application/json") -> None:
+            """Write a full JSON (or raw bytes) HTTP response with the right headers."""
             body = b"" if obj is None else (obj if isinstance(obj, bytes)
                                             else json.dumps(obj).encode())
             self.send_response(code)
@@ -375,10 +390,12 @@ def make_server(port: int, app_dir: str = APP_DIR,
                 self.wfile.write(body)
 
         def _body(self) -> Any:
+            """Read and JSON-decode the request body (empty body decodes to {})."""
             n = int(self.headers.get("Content-Length", 0))
             return json.loads(self.rfile.read(n) or b"{}")
 
         def do_GET(self) -> None:
+            """Route GET requests: static assets, config/browse/outputs reads, and SSE stream."""
             u = urlparse(self.path)
             q = parse_qs(u.query)
             try:
@@ -405,6 +422,7 @@ def make_server(port: int, app_dir: str = APP_DIR,
                 return self._send(400, {"error": str(e)})
 
         def do_POST(self) -> None:
+            """Route POST requests: validate, preset add, run start/cancel/reveal."""
             u = urlparse(self.path)
             try:
                 if u.path == "/api/validate":
@@ -416,8 +434,6 @@ def make_server(port: int, app_dir: str = APP_DIR,
                     v = validate(params, roots)
                     if v["errors"]:
                         return self._send(400, {"error": "; ".join(v["errors"])})
-                    for p in params.get("kml_folder", "") and [params["kml_folder"]] or []:
-                        confine_path(p, roots)
                     jid = runs.start(build_argv(params), total_files=v["kml_count"])
                     return self._send(200, {"job_id": jid})
                 if u.path.startswith("/api/run/") and u.path.endswith("/cancel"):
@@ -431,6 +447,7 @@ def make_server(port: int, app_dir: str = APP_DIR,
                 return self._send(400, {"error": str(e)})
 
         def do_DELETE(self) -> None:
+            """Route DELETE requests: remove a user preset (409 if it's a built-in)."""
             u = urlparse(self.path)
             q = parse_qs(u.query)
             if u.path == "/api/presets":
@@ -443,6 +460,7 @@ def make_server(port: int, app_dir: str = APP_DIR,
             return self._send(404, {"error": "not found"})
 
         def _add_preset(self, body: Dict[str, Any]) -> Dict[str, Any]:
+            """Add (or reject an overwrite of) a named preset; persist and return the list."""
             man = load_manifest(app_dir)
             name = body.get("name", "").strip()
             if not name:
@@ -463,10 +481,15 @@ def make_server(port: int, app_dir: str = APP_DIR,
             return {"presets": man["presets"]}
 
         def _stream(self, jid: str) -> None:
+            """Serve Server-Sent Events for a run until its 'done' event, once headers are sent."""
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
+            # Headers are already on the wire once we get here, so no matter what goes wrong
+            # below (client disconnect or any other error), we must never attempt a second
+            # response -- swallow everything instead of letting it propagate to do_GET's
+            # outer except, which would try to _send() again onto the same connection.
             try:
                 for name, payload in runs.events(jid):
                     chunk = f"event: {name}\ndata: {json.dumps(payload)}\n\n".encode()
@@ -474,8 +497,11 @@ def make_server(port: int, app_dir: str = APP_DIR,
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except Exception:
+                pass
 
         def _reveal(self, jid: str) -> None:
+            """Reveal a finished job's output file in Finder (macOS 'open -R'), if available."""
             job = runs.get(jid)
             out = (job or {}).get("summary", {}).get("output")
             if out and os.path.exists(out) and shutil.which("open"):
@@ -492,7 +518,7 @@ def main() -> None:
     ap.add_argument("--open", action="store_true")
     args = ap.parse_args()
     manifest = load_manifest(APP_DIR)
-    port = args.port or manifest.get("server", {}).get("port", 8765)
+    port = args.port if args.port is not None else manifest.get("server", {}).get("port", 8765)
     try:
         srv = make_server(port, APP_DIR)
     except OSError as e:
