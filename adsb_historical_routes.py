@@ -1511,6 +1511,14 @@ def create_output_kml(flight_segments: List[FlightSegment], output_file: str,
     ``firehose_color`` (all KML AABBGGRR) -- so gap-filling real data is visibly marked and
     is *not* rendered as an inferred connector. Default (both False) keeps the original
     single-track-per-flight output unchanged.
+
+    ``color_mode`` selects the line-colouring scheme: ``"source"`` (default) uses the
+    behaviour above; ``"altitude"`` instead splits each track into ``altitude_bands`` bands
+    over the ADS-B Exchange altitude gradient (see ``ADSBEX_ALT_STOPS``/``alt_band_color``)
+    and colours each run by its band. ``color_mode="altitude"`` takes precedence over
+    source-based coloring and labeling -- when active, ``mark_sources``-style source
+    colours/labels (e.g. ``" [pos]"``) are not applied, even if ``mark_sources`` is True.
+    ``altitude_bands`` (default 24) sets the number of bands and must be >= 1.
     """
     
     # Define namespace constants
@@ -1948,7 +1956,13 @@ def main():
     if args.opacity is not None and (args.opacity < 0 or args.opacity > 100):
         print("Error: Opacity must be between 0 and 100")
         sys.exit(1)
-    
+
+    # Validate altitude-bands (guards against ZeroDivisionError / nonsensical bands in
+    # alt_band_color, which divides by `bands`)
+    if args.altitude_bands < 1:
+        print("Error: --altitude-bands must be >= 1")
+        sys.exit(1)
+
     kml_files = []
     if args.kml_files:
         for f in args.kml_files:

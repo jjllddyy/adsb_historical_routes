@@ -1,5 +1,7 @@
 # tests/test_altitude_coloring.py
 import os, sys
+from datetime import datetime, timedelta, timezone
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import adsb_historical_routes as m
 
@@ -32,9 +34,6 @@ def test_alt_band_color_low_is_warm_high_is_cool():
     assert hb > hr or hr > hg  # high altitude cool/magenta (blue or magenta dominant)
 
 
-from datetime import datetime, timedelta, timezone
-
-
 def _climb_segment(m):
     base = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
     pts = []
@@ -62,3 +61,23 @@ def test_source_mode_default_single_track(tmp_path):
     m.create_output_kml([seg], out, sample_minutes=0)   # color_mode defaults to source
     txt = open(out).read()
     assert txt.count("<Placemark") == 1   # unchanged single-track behavior
+
+
+def test_alt_band_helpers_support_bands_equal_one():
+    # bands=1 is the minimum valid value (guards against the ZeroDivisionError that
+    # bands=0 would cause in alt_band_color's `(band + 0.5) / bands * top_ft`).
+    idx = m.alt_band_index(20000 * 0.3048, 1)
+    assert idx == 0
+    color = m.alt_band_color(idx, 1)
+    assert len(color) == 8
+    int(color, 16)  # valid hex
+
+
+def test_altitude_mode_renders_with_bands_equal_one(tmp_path):
+    seg = _climb_segment(m)
+    out = str(tmp_path / "alt_one_band.kml")
+    m.create_output_kml([seg], out, sample_minutes=0, color_mode="altitude", altitude_bands=1)
+    txt = open(out).read()
+    import re
+    colors = set(re.findall(r"<color>([0-9a-f]{8})</color>", txt))
+    assert len(colors) == 1           # a single band -> a single color for the whole track
