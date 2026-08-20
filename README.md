@@ -37,8 +37,52 @@ If you don't yet have the two input CSVs, build them from a Cirium export first 
 
 ---
 
+## 🖥 GUI: ADSB Historical Route Builder
+
+Prefer a form over a terminal? `route_builder/` ships a local, browser-based GUI that drives
+this exact script — every field in it maps directly to an `adsb_historical_routes.py` flag
+documented below, so the CLI reference doubles as the GUI's field reference.
+
+**Launch it:**
+- Double-click `route_builder/Route Builder.command` in Finder, **or**
+- `python3 route_builder/server.py --open` from a terminal (`--open` opens your browser
+  automatically once the server is up).
+- Add `--port <N>` to either form to use a port other than the default `8765`, e.g.
+  `python3 route_builder/server.py --open --port 8080`.
+
+**How it works:** the server binds to `127.0.0.1` only — nothing is exposed on the network
+and nothing is uploaded anywhere. It just shells out to `adsb_historical_routes.py` as a
+subprocess (with the argv built from your form values) and streams its stdout back to the
+browser live; it has no processing logic of its own.
+
+**Run workflow:**
+1. Pick the input KML folder (or explicit files), the Airports CSV, and the Routes CSV
+   through the folder/file browse modal (or type a path directly).
+2. Pick an output folder and filename — a sensible filename is suggested automatically from
+   the input batch name and whichever options (stitching, position integration, altitude
+   coloring, …) are turned on.
+3. Tune detection/recovery, styling, gap-stitching, and position-source-integration —
+   the same knobs as the [full parameter reference](#full-parameter-reference) below, grouped
+   into sections with inline help text and an example for every field.
+4. Review the pre-flight card: input file/row counts, the exact command line that will run,
+   and any validation errors or warnings (e.g. "output already exists").
+5. Click **Run** — see per-file progress, phase updates, and the final summary stream in
+   live; cancel a run in progress if needed.
+6. When it finishes, reveal the output KML in Finder directly from the run console.
+
+**Presets:** the presets bar has one-click built-ins mirroring the
+[recommended settings by scenario](#-recommended-settings-by-scenario) — *Recommended —
+clean & complete*, *Stitched — mark inferred gaps*, *Positions integrated (POS + firehose)*,
+*Altitude-colored*, and *Strict — proximity only* — and you can save your own current form
+values as a named preset. Presets and other local settings live in `route_builder/manifest.json`
+(seeded on first run from `manifest.default.json`); it's git-ignored, so it's local-only and
+safe to edit or delete to reset to defaults.
+
+---
+
 ## 📋 Table of contents
 
+- [GUI: ADSB Historical Route Builder](#-gui-adsb-historical-route-builder)
 - [Recommended starting point](#-recommended-starting-point-run-this)
 - [Recommended settings by scenario](#-recommended-settings-by-scenario)
 - [Installation](#-installation)
@@ -48,6 +92,7 @@ If you don't yet have the two input CSVs, build them from a Cirium export first 
   - [Full parameter reference](#full-parameter-reference)
   - [Confidence presets](#confidence-presets)
   - [Colors](#colors)
+  - [Altitude coloring](#altitude-coloring)
 - [Gap stitching (inferred data)](#-gap-stitching-inferred-data)
 - [Position-source integration (POS + firehose)](#-position-source-integration-pos--firehose)
 - [Diagnostics & tuning without ground truth](#-diagnostics--tuning-without-ground-truth)
@@ -214,12 +259,15 @@ records use the current `SPJC`. Add rows as new mismatches are found.
 
 | Parameter | Default | Description |
 |---|---|---|
-| `--color` | *(from source)* | Override line color, **KML AABBGGRR** (see [Colors](#colors)). |
+| `--color` | *(from source)* | Override line color, **KML AABBGGRR** (see [Colors](#colors)). Ignored when `--color-mode altitude`. |
 | `--width` | *(from source)* | Override line width (e.g. `0.8`). |
 | `--opacity` | *(from source)* | Override opacity as a percentage `0–100` (100 = opaque). |
 | `--labels` | `false` | `true` shows per-flight names. |
 | `--icons` | `false` | `true` shows airport icons. |
 | `--ground` | `false` | `true` extrudes flight paths to the ground. |
+| `--color-mode` | `source` | `source` colors lines by data source (ADS-B/POS/firehose, default); `altitude` instead colors by the ADS-B Exchange altitude gradient (see [Altitude coloring](#altitude-coloring)) and takes precedence over `--color`/source labeling. |
+| `--altitude-palette` | `adsbex` | Altitude palette used when `--color-mode altitude`. Currently only `adsbex` (ADS-B Exchange hue ramp) is implemented; the flag is reserved for future palettes. |
+| `--altitude-bands` | `24` | Number of discrete altitude color bands when `--color-mode altitude` (more = smoother gradient, larger file). Must be `>= 1`. |
 
 ### Confidence presets
 
@@ -253,6 +301,24 @@ KML colors are **`AABBGGRR`** (alpha, blue, green, red) — **not** RGB. Example
 | Blue, 80% opaque | `0000FF` | `--color ff0000 --opacity 80` | `ccff0000` |
 | Red, opaque | `FF0000` | `--color 0000ff` | `0000ff` |
 | Gray connector | `888888` | `--inferred-color ff888888` | `ff888888` |
+
+### Altitude coloring
+
+`--color-mode altitude` colors each track by height instead of by data source, using the same
+hue ramp as **ADS-B Exchange**: near ground level renders **orange**, climbing through
+yellow → green → cyan as altitude increases, cruise altitudes render **blue**, and the highest
+bands (35,000–40,000+ ft) render **violet/magenta**. Each track is split into
+`--altitude-bands` (default `24`) discrete color steps rather than a continuous gradient, so
+file size stays similar to source-mode output.
+
+```bash
+python3 adsb_historical_routes.py ... --color-mode altitude --altitude-bands 24
+```
+
+`--color-mode altitude` takes precedence over source-based coloring/labeling — `--color` and
+any per-source (POS/firehose) coloring are ignored while it's active (the GUI's pre-flight
+card warns if `--color` is also set). `--altitude-palette` selects the palette; currently only
+`adsbex` is implemented.
 
 ---
 
