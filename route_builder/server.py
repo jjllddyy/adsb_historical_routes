@@ -238,6 +238,7 @@ class RunManager:
         self._lock = threading.Lock()
 
     def start(self, argv: List[str], total_files: int = 0, cwd: str = REPO_ROOT) -> str:
+        """Spawn argv as a subprocess and start streaming its stdout; return the new job id."""
         jid = uuid.uuid4().hex[:12]
         job = {"q": queue.Queue(), "proc": None, "status": "running",
                "total": total_files, "processed": 0, "start": time.time(),
@@ -250,41 +251,50 @@ class RunManager:
         except OSError as e:
             job["status"] = "error"
             job["q"].put(("error", {"message": str(e)}))
-            job["q"].put(("done", {"exit_code": -1, "success": False, "summary": {}}))
+            job["q"].put(("done", {"exit_code": -1, "success": False, "summary": {},
+                                   "output_size": None}))
             return jid
         job["proc"] = proc
         threading.Thread(target=self._pump, args=(jid, job), daemon=True).start()
         return jid
 
     def _pump(self, jid: str, job: dict) -> None:
-        proc = job["proc"]
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            job["buf"].append(line)
-            job["q"].put(("line", {"text": line}))
-            kind, payload = classify_line(line)
-            if kind == "progress":
-                job["processed"] += 1
-                elapsed = time.time() - job["start"]
-                done_n = job["processed"]
-                eta = (elapsed / done_n) * (job["total"] - done_n) if done_n and job["total"] else None
-                pct = (done_n / job["total"] * 100) if job["total"] else None
-                job["q"].put(("progress", {"processed": done_n, "total": job["total"],
-                                           "percent": pct, "eta_sec": eta, "phase": None}))
-            elif kind == "phase":
-                job["q"].put(("phase", {"phase": payload}))
-        code = proc.wait()
-        text = "\n".join(job["buf"])
-        summary = parse_summary(text)
-        job["summary"] = summary
-        out = summary.get("output")
-        size = os.path.getsize(out) if out and os.path.exists(out) else None
-        success = (code == 0 and "output" in summary)
-        job["status"] = "done" if success else "error"
-        job["q"].put(("done", {"exit_code": code, "success": success,
-                               "summary": summary, "output_size": size}))
+        """Read the subprocess's stdout line-by-line, pushing events until it exits."""
+        try:
+            proc = job["proc"]
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                job["buf"].append(line)
+                job["q"].put(("line", {"text": line}))
+                kind, payload = classify_line(line)
+                if kind == "progress":
+                    job["processed"] += 1
+                    elapsed = time.time() - job["start"]
+                    done_n = job["processed"]
+                    eta = (elapsed / done_n) * (job["total"] - done_n) if done_n and job["total"] else None
+                    pct = (done_n / job["total"] * 100) if job["total"] else None
+                    job["q"].put(("progress", {"processed": done_n, "total": job["total"],
+                                               "percent": pct, "eta_sec": eta, "phase": None}))
+                elif kind == "phase":
+                    job["q"].put(("phase", {"phase": payload}))
+            code = proc.wait()
+            text = "\n".join(job["buf"])
+            summary = parse_summary(text)
+            job["summary"] = summary
+            out = summary.get("output")
+            size = os.path.getsize(out) if out and os.path.exists(out) else None
+            success = (code == 0 and "output" in summary)
+            job["status"] = "done" if success else "error"
+            job["q"].put(("done", {"exit_code": code, "success": success,
+                                   "summary": summary, "output_size": size}))
+        except Exception as e:
+            job["status"] = "error"
+            job["q"].put(("error", {"message": str(e)}))
+            job["q"].put(("done", {"exit_code": -1, "success": False, "summary": {},
+                                   "output_size": None}))
 
     def events(self, jid: str):
+        """Yield (event_name, payload) tuples for a job until its 'done' event, then stop."""
         job = self._jobs.get(jid)
         if not job:
             return
@@ -295,9 +305,11 @@ class RunManager:
                 break
 
     def cancel(self, jid: str) -> None:
+        """Terminate a still-running job's subprocess."""
         job = self._jobs.get(jid)
         if job and job.get("proc") and job["status"] == "running":
             job["proc"].terminate()
 
     def get(self, jid: str) -> Optional[dict]:
+        """Return the raw job dict for jid, or None if it doesn't exist."""
         return self._jobs.get(jid)

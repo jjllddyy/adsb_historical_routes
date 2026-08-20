@@ -174,3 +174,16 @@ def test_runmanager_streams_and_parses(tmp_path):
     assert "progress" in kinds and "done" in kinds
     assert done["success"] is True
     assert done["summary"]["total_flights"] == 2
+
+
+def test_runmanager_spawn_failure_emits_error_and_done_without_hanging():
+    rm = server.RunManager()
+    jid = rm.start(["/nonexistent/definitely_not_a_binary_xyz123"], total_files=0)
+    kinds, done = [], None
+    for name, payload in rm.events(jid):          # would hang forever if events() never ends
+        kinds.append(name)
+        if name == "done":
+            done = payload
+    assert "error" in kinds and "done" in kinds
+    assert "output_size" in done and done["output_size"] is None
+    assert done["success"] is False
