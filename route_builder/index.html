@@ -512,7 +512,9 @@ function updateDeletePresetBtn() {
   el('deletePresetBtn').style.display = (preset && !preset.builtin) ? '' : 'none';
 }
 function applyPreset(preset) {
-  PARAMS = buildInitialParams();
+  // Overlay the preset's knobs onto the CURRENT params (not a freshly-rebuilt default set) so
+  // applying a preset only changes the few keys it names and preserves everything else the user
+  // has already picked or hand-tuned (input/output paths, sample interval, toggles, ...).
   for (var k in preset.params) if (preset.params.hasOwnProperty(k)) PARAMS[k] = preset.params[k];
   CONFIG.parameters.forEach(function (p) { refreshFieldDisplay(p.key); });
   refreshFieldDisplay('kml_folder');
