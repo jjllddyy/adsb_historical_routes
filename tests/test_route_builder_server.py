@@ -151,3 +151,26 @@ def test_validate_counts_and_errors(tmp_path):
     # missing airports -> error
     v2 = server.validate({**params, "airports": os.path.join(root, "nope.csv")}, [root])
     assert any("airport" in e.lower() for e in v2["errors"])
+
+
+def test_runmanager_streams_and_parses(tmp_path):
+    fake = os.path.join(str(tmp_path), "fake.py")
+    with open(fake, "w") as f:
+        f.write(
+            "print('Processing: a.kml (Aircraft: E1)')\n"
+            "print('Processing: b.kml (Aircraft: E2)')\n"
+            "print('Creating output KML...')\n"
+            "print('TOTAL VALID COMPLETE FLIGHTS: 2')\n"
+            "print('Output written to: %s')\n" % os.path.join(str(tmp_path), "o.kml")
+        )
+    open(os.path.join(str(tmp_path), "o.kml"), "w").close()
+    rm = server.RunManager()
+    jid = rm.start(["python3", "-u", fake], total_files=2)
+    kinds, done = [], None
+    for name, payload in rm.events(jid):
+        kinds.append(name)
+        if name == "done":
+            done = payload
+    assert "progress" in kinds and "done" in kinds
+    assert done["success"] is True
+    assert done["summary"]["total_flights"] == 2

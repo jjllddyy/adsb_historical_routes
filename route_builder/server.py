@@ -2,8 +2,13 @@
 """ADSB Historical Route Builder — stdlib-only local server. See EXTENSION_SPEC.md."""
 import json
 import os
+import queue
 import re
 import shutil
+import subprocess
+import threading
+import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -223,3 +228,76 @@ def validate(params: Dict[str, Any], allowed_roots: List[str]) -> Dict[str, Any]
         "warnings": warnings,
         "errors": errors,
     }
+
+
+class RunManager:
+    """Runs the flight-route script as a subprocess, streaming stdout as progress events."""
+
+    def __init__(self) -> None:
+        self._jobs: Dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def start(self, argv: List[str], total_files: int = 0, cwd: str = REPO_ROOT) -> str:
+        jid = uuid.uuid4().hex[:12]
+        job = {"q": queue.Queue(), "proc": None, "status": "running",
+               "total": total_files, "processed": 0, "start": time.time(),
+               "buf": [], "summary": {}, "output": None}
+        with self._lock:
+            self._jobs[jid] = job
+        try:
+            proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, bufsize=1)
+        except OSError as e:
+            job["status"] = "error"
+            job["q"].put(("error", {"message": str(e)}))
+            job["q"].put(("done", {"exit_code": -1, "success": False, "summary": {}}))
+            return jid
+        job["proc"] = proc
+        threading.Thread(target=self._pump, args=(jid, job), daemon=True).start()
+        return jid
+
+    def _pump(self, jid: str, job: dict) -> None:
+        proc = job["proc"]
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            job["buf"].append(line)
+            job["q"].put(("line", {"text": line}))
+            kind, payload = classify_line(line)
+            if kind == "progress":
+                job["processed"] += 1
+                elapsed = time.time() - job["start"]
+                done_n = job["processed"]
+                eta = (elapsed / done_n) * (job["total"] - done_n) if done_n and job["total"] else None
+                pct = (done_n / job["total"] * 100) if job["total"] else None
+                job["q"].put(("progress", {"processed": done_n, "total": job["total"],
+                                           "percent": pct, "eta_sec": eta, "phase": None}))
+            elif kind == "phase":
+                job["q"].put(("phase", {"phase": payload}))
+        code = proc.wait()
+        text = "\n".join(job["buf"])
+        summary = parse_summary(text)
+        job["summary"] = summary
+        out = summary.get("output")
+        size = os.path.getsize(out) if out and os.path.exists(out) else None
+        success = (code == 0 and "output" in summary)
+        job["status"] = "done" if success else "error"
+        job["q"].put(("done", {"exit_code": code, "success": success,
+                               "summary": summary, "output_size": size}))
+
+    def events(self, jid: str):
+        job = self._jobs.get(jid)
+        if not job:
+            return
+        while True:
+            name, payload = job["q"].get()
+            yield name, payload
+            if name == "done":
+                break
+
+    def cancel(self, jid: str) -> None:
+        job = self._jobs.get(jid)
+        if job and job.get("proc") and job["status"] == "running":
+            job["proc"].terminate()
+
+    def get(self, jid: str) -> Optional[dict]:
+        return self._jobs.get(jid)
