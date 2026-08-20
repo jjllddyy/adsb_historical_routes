@@ -86,6 +86,22 @@ def test_suggest_name_suffixes():
     assert n.endswith("_pos_altcolor.kml")
 
 
+def test_build_argv_opacity_has_no_default_and_is_always_emitted_when_set():
+    # adsb_historical_routes.py's --opacity has no argparse default (real default is None,
+    # "use original"), so *any* explicit opacity value -- including 100 -- must be emitted.
+    argv = server.build_argv({
+        "kml_folder": "/data/jat", "airports": "/a.csv", "routes": "/r.csv",
+        "output_dir": "/out", "output_name": "j.kml", "opacity": 100,
+    })
+    assert "--opacity" in argv and argv[argv.index("--opacity") + 1] == "100"
+
+    argv_omitted = server.build_argv({
+        "kml_folder": "/data/jat", "airports": "/a.csv", "routes": "/r.csv",
+        "output_dir": "/out", "output_name": "j.kml",
+    })
+    assert "--opacity" not in argv_omitted             # opacity not in params -> flag omitted
+
+
 SAMPLE_STDOUT = """Processing: e80600_2026-07-01_baro_avg.kml (Aircraft: E80600)
 Loading extra position sources (this reads many small files)...
 Combining segments by aircraft...

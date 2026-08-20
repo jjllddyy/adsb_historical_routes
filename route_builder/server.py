@@ -4,23 +4,25 @@ import json
 import os
 import re
 import shutil
+from typing import Any, Dict, List, Optional, Tuple
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _resolve(path, base=REPO_ROOT):
+def _resolve(path: str, base: str = REPO_ROOT) -> str:
     """Expand ~ and make absolute (relative paths resolve against the repo root)."""
     p = os.path.expanduser(path)
     return p if os.path.isabs(p) else os.path.normpath(os.path.join(base, p))
 
 
-def load_manifest(app_dir):
+def load_manifest(app_dir: str) -> dict:
     """Copy manifest.default.json -> manifest.json on first run; return resolved manifest."""
     runtime = os.path.join(app_dir, "manifest.json")
     seed = os.path.join(app_dir, "manifest.default.json")
     if not os.path.exists(runtime):
         shutil.copy(seed, runtime)
-    man = json.load(open(runtime))
+    with open(runtime) as f:
+        man = json.load(f)
     roots = man.setdefault("roots", {})
     for k in ("input_default", "airports_dir", "routes_dir", "output_default"):
         if roots.get(k):
@@ -29,13 +31,13 @@ def load_manifest(app_dir):
     return man
 
 
-def save_manifest(app_dir, manifest):
+def save_manifest(app_dir: str, manifest: dict) -> None:
     """Persist the runtime manifest.json (used by preset add/delete)."""
     with open(os.path.join(app_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
 
 
-def confine_path(path, allowed_roots):
+def confine_path(path: str, allowed_roots: List[str]) -> str:
     """Return realpath(path) if it lives inside one of allowed_roots, else PermissionError."""
     rp = os.path.realpath(os.path.expanduser(path))
     for root in allowed_roots:
@@ -58,7 +60,7 @@ _ARGV_MAP = [
     ("route_time_tolerance", "--route-time-tolerance", None),
     ("corridor_cross_track_km", "--corridor-cross-track-km", None),
     ("route_time_rescue", "--route-time-rescue", ""),
-    ("color", "--color", ""), ("width", "--width", ""), ("opacity", "--opacity", 100),
+    ("color", "--color", ""), ("width", "--width", ""), ("opacity", "--opacity", None),
     ("color_mode", "--color-mode", "source"), ("altitude_bands", "--altitude-bands", 24),
     ("inferred_color", "--inferred-color", "ff888888"),
     ("stitch_gap_min", "--stitch-gap-min", 5),
@@ -70,7 +72,7 @@ _BOOL_FLAGS = [("labels", "--labels"), ("icons", "--icons"), ("ground", "--groun
                ("stitch_gaps", "--stitch-gaps"), ("integrate_pos", "--integrate-pos")]
 
 
-def build_argv(params, script=None):
+def build_argv(params: Dict[str, Any], script: Optional[str] = None) -> List[str]:
     """Map a params dict -> a `python3 -u adsb_historical_routes.py …` argv list."""
     argv = ["python3", "-u", script or SCRIPT_PATH]
     if params.get("kml_files"):
@@ -94,9 +96,9 @@ def build_argv(params, script=None):
     return argv
 
 
-def suggest_name(batch_stem, params):
+def suggest_name(batch_stem: str, params: Dict[str, Any]) -> str:
     """Suggest an output filename from an input batch folder name + enabled features."""
-    m = __import__("re").match(r"([a-z]+)_(.+)", batch_stem)
+    m = re.match(r"([a-z]+)_(.+)", batch_stem)
     airline, period = (m.group(1), m.group(2)) if m else (batch_stem, "")
     stem = f"{airline}_routes_{period}" if period else f"{batch_stem}_routes"
     if params.get("confidence") == "strict":
@@ -114,7 +116,7 @@ _PHASE_PREFIXES = ("Loading extra position sources", "Combining segments by airc
                    "Creating output KML", "Position-source integration:")
 
 
-def classify_line(line):
+def classify_line(line: str) -> Tuple[str, str]:
     s = line.strip()
     if s.startswith("Processing:"):
         return ("progress", s)
@@ -124,8 +126,8 @@ def classify_line(line):
     return ("raw", s)
 
 
-def parse_summary(text):
-    out = {}
+def parse_summary(text: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
     def grab(pat, cast=str):
         mm = re.search(pat, text)
         return cast(mm.group(1).replace(",", "")) if mm else None
@@ -148,14 +150,14 @@ def parse_summary(text):
     return out
 
 
-def _count_kml(folder):
+def _count_kml(folder: str) -> int:
     try:
         return sum(1 for e in os.scandir(folder) if e.is_file() and e.name.endswith(".kml"))
     except OSError:
         return 0
 
 
-def _count_csv_rows(path):
+def _count_csv_rows(path: str) -> int:
     try:
         with open(path) as f:
             return max(0, sum(1 for _ in f) - 1)   # minus header
@@ -163,7 +165,7 @@ def _count_csv_rows(path):
         return 0
 
 
-def validate(params, allowed_roots):
+def validate(params: Dict[str, Any], allowed_roots: List[str]) -> Dict[str, Any]:
     errors, warnings = [], []
 
     def ok(path, label):
