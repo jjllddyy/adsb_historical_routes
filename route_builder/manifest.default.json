@@ -1,0 +1,32 @@
+{
+  "version": "1.0.0",
+  "roots": {
+    "input_default": "~/Git/kml/adsb_kml_downloader/output",
+    "airports_dir": "input",
+    "routes_dir": "input",
+    "output_default": "output",
+    "allowed_roots": ["~/Git/kml", "."]
+  },
+  "server": { "port": 8765 },
+  "defaults": {
+    "confidence": "permissive", "corridor_cross_track_km": 50,
+    "sample": 2, "maxgap": 20, "group": "destination",
+    "color_mode": "source", "color": "", "width": "", "opacity": 100,
+    "labels": false, "icons": false, "ground": false,
+    "stitch_gaps": false, "inferred_color": "ff888888", "stitch_gap_min": 5,
+    "integrate_pos": false, "pos_color": "ff00a5ff", "firehose_color": "ff00ff00",
+    "altitude_palette": "adsbex", "altitude_bands": 24
+  },
+  "presets": [
+    {"name": "Recommended — clean & complete", "builtin": true,
+     "params": {"confidence": "permissive", "corridor_cross_track_km": 50}},
+    {"name": "Stitched — mark inferred gaps", "builtin": true,
+     "params": {"confidence": "permissive", "corridor_cross_track_km": 50, "stitch_gaps": true}},
+    {"name": "Positions integrated (POS + firehose)", "builtin": true,
+     "params": {"confidence": "permissive", "corridor_cross_track_km": 50, "integrate_pos": true}},
+    {"name": "Altitude-colored", "builtin": true,
+     "params": {"confidence": "permissive", "corridor_cross_track_km": 50, "color_mode": "altitude"}},
+    {"name": "Strict — proximity only", "builtin": true,
+     "params": {"confidence": "strict"}}
+  ]
+}
