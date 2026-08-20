@@ -1,0 +1,1399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ADSB Historical Route Builder</title>
+<script>
+// Set theme before first paint to avoid a flash of the wrong theme.
+(function () {
+  try {
+    var t = localStorage.getItem('rb-theme');
+    if (t === 'dark' || t === 'light') document.documentElement.setAttribute('data-theme', t);
+  } catch (e) {}
+})();
+</script>
+<style>
+/* ════════════════════════════════════════════════════════════════
+   Step 1: Shell, tokens, theme  (ft-system tokens, reused verbatim)
+   ════════════════════════════════════════════════════════════════ */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --ink:#16202B; --ink-soft:#3A4759; --muted:#5C6775; --line:#E3E8EF; --line2:#EEF1F5;
+  --panel:#fff; --bg:#EEF1F5;
+  --accent:#5B4DE0; --accent-ink:#4131C0; --accent-soft:#ECE9FB; --accent-soft2:#F4F2FD;
+  --red:#E5352B; --red-ink:#C42D24; --red-soft:#FBE9E7;
+  --green:#1A9D6A; --green-ink:#147A52; --green-soft:#E3F4EC;
+  --amber:#8C5D06; --amber-soft:#F8EFD9;
+  --font:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ink:#e6edf3; --ink-soft:#c7d0da; --muted:#8b949e; --line:#2a313b; --line2:#1c222b;
+    --panel:#161b22; --bg:#0d1117;
+    --accent:#8b7cf0; --accent-ink:#b6abf7; --accent-soft:rgba(139,124,240,.16); --accent-soft2:rgba(139,124,240,.10);
+    --red:#f85149; --red-ink:#ff7b72; --red-soft:rgba(248,81,73,.15);
+    --green:#3fb950; --green-ink:#56d364; --green-soft:rgba(63,185,80,.15);
+    --amber:#d29922; --amber-soft:rgba(210,153,34,.15);
+  }
+}
+:root[data-theme="dark"] {
+  --ink:#e6edf3; --ink-soft:#c7d0da; --muted:#8b949e; --line:#2a313b; --line2:#1c222b;
+  --panel:#161b22; --bg:#0d1117;
+  --accent:#8b7cf0; --accent-ink:#b6abf7; --accent-soft:rgba(139,124,240,.16); --accent-soft2:rgba(139,124,240,.10);
+  --red:#f85149; --red-ink:#ff7b72; --red-soft:rgba(248,81,73,.15);
+  --green:#3fb950; --green-ink:#56d364; --green-soft:rgba(63,185,80,.15);
+  --amber:#d29922; --amber-soft:rgba(210,153,34,.15);
+}
+
+html, body { height: 100%; }
+body {
+  background: var(--bg); color: var(--ink); font-family: var(--font); font-size: 13px;
+  font-variant-numeric: tabular-nums; -webkit-font-smoothing: antialiased;
+}
+button, input, select { font-family: inherit; font-size: inherit; color: inherit; }
+a { color: var(--accent-ink); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+/* topbar */
+.topbar {
+  height: 48px; display: flex; align-items: center; gap: 14px; padding: 0 16px;
+  background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 40;
+}
+.wordmark { color: var(--accent); font-weight: 700; font-size: 13px; letter-spacing: .05em; text-transform: uppercase; white-space: nowrap; }
+.status-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700; letter-spacing: .03em; text-transform: uppercase; padding: 4px 10px; border-radius: 20px; background: var(--line2); color: var(--muted); }
+.status-chip .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.status-chip[data-state="running"] { background: var(--accent-soft); color: var(--accent-ink); }
+.status-chip[data-state="running"] .dot { animation: rb-pulse 1.1s ease-in-out infinite; }
+.status-chip[data-state="success"] { background: var(--green-soft); color: var(--green-ink); }
+.status-chip[data-state="failed"] { background: var(--red-soft); color: var(--red-ink); }
+@keyframes rb-pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+.topbar-spacer { flex: 1 1 auto; }
+.theme-btn {
+  width: 30px; height: 30px; border-radius: 7px; border: 1px solid var(--line); background: var(--panel);
+  color: var(--ink-soft); cursor: pointer; display: grid; place-items: center; font-size: 14px;
+}
+.theme-btn:hover { background: var(--line2); }
+
+/* presets strip */
+.presetsbar {
+  display: flex; align-items: center; gap: 10px; padding: 8px 16px; background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+.presetsbar label { font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.presetsbar-spacer { flex: 1 1 auto; }
+
+/* layout */
+.layout { display: grid; grid-template-columns: minmax(380px, 620px) 1fr; gap: 16px; padding: 16px; max-width: 1560px; margin: 0 auto; align-items: start; }
+@media (max-width: 900px) { .layout { grid-template-columns: 1fr; } .run-col { position: static !important; } }
+.form-col, .run-col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.run-col { position: sticky; top: 64px; }
+
+/* panels */
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: visible; }
+.panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+.panel-title { font-size: 13.5px; font-weight: 700; letter-spacing: -.01em; color: var(--ink); }
+.panel-desc { font-size: 11.5px; color: var(--muted); margin-top: 1px; }
+.panel-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 12px; }
+
+details.adv { border-top: 1px solid var(--line2); margin-top: 2px; padding-top: 10px; }
+details.adv summary { cursor: pointer; font-size: 11.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); list-style: none; display: flex; align-items: center; gap: 6px; }
+details.adv summary::-webkit-details-marker { display: none; }
+details.adv summary::before { content: '▸'; display: inline-block; transition: transform .15s; color: var(--muted); }
+details.adv[open] summary::before { transform: rotate(90deg); }
+details.adv .panel-body { padding: 10px 0 0; }
+
+/* field rows */
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field-label-row { display: flex; align-items: center; gap: 5px; }
+.field-label { font-size: 12px; font-weight: 600; color: var(--ink-soft); }
+.info-btn {
+  width: 15px; height: 15px; border-radius: 50%; border: 1px solid var(--line); background: var(--line2);
+  color: var(--muted); font-size: 10px; line-height: 1; cursor: default; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto;
+}
+.field input[type="text"], .field input[type="number"], .field select {
+  width: 100%; background: var(--panel); border: 1px solid var(--line); color: var(--ink);
+  padding: 7px 9px; border-radius: 6px; font-size: 12.5px; transition: border-color .12s;
+}
+.field input[readonly] { background: var(--line2); color: var(--ink-soft); cursor: default; }
+.field input:hover:not([readonly]) { border-color: #CBD4DE; }
+.field input:focus { border-color: var(--accent); }
+.path-row { display: flex; gap: 6px; }
+.path-row input { flex: 1 1 auto; min-width: 0; }
+
+.rb-btn { font: inherit; font-weight: 600; font-size: 12.5px; border-radius: 6px; padding: 7px 13px; cursor: pointer; white-space: nowrap; border: 1px solid transparent; }
+.rb-btn-solid { background: var(--accent); color: #fff; }
+.rb-btn-solid:hover { background: var(--accent-ink); }
+.rb-btn-solid:disabled { background: var(--line); color: var(--muted); cursor: not-allowed; }
+.rb-btn-ghost { background: var(--line2); border-color: var(--line); color: var(--ink-soft); }
+.rb-btn-ghost:hover { background: #E4E9EF; }
+.rb-btn-ghost:disabled { opacity: .45; cursor: not-allowed; }
+.rb-btn-danger { background: var(--red-soft); color: var(--red-ink); border-color: transparent; }
+.rb-btn-danger:hover { background: var(--red); color: #fff; }
+.rb-btn-sm { padding: 5px 10px; font-size: 11.5px; }
+
+/* toggle switch */
+.rb-switch { width: 38px; height: 22px; border-radius: 20px; background: #CBD4DE; position: relative; cursor: pointer; transition: background .15s; border: 0; flex: 0 0 auto; }
+.rb-switch .knob { position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.3); transition: left .15s cubic-bezier(.3,.7,.3,1); }
+.rb-switch.is-on { background: var(--accent); }
+.rb-switch.is-on .knob { left: 18px; }
+.field-inline { display: flex; align-items: center; gap: 9px; }
+
+/* segmented control */
+.rb-seg { display: inline-flex; background: var(--line2); border: 1px solid var(--line); border-radius: 8px; padding: 2px; gap: 2px; flex-wrap: wrap; }
+.rb-seg button { border: 0; background: transparent; font: inherit; font-size: 12px; font-weight: 600; color: var(--ink-soft); padding: 6px 11px; border-radius: 6px; cursor: pointer; }
+.rb-seg button:hover:not(.is-active) { color: var(--ink); }
+.rb-seg button.is-active { background: var(--panel); color: var(--accent-ink); box-shadow: 0 1px 2px rgba(16,32,48,.14); }
+.rb-seg--mini button { padding: 4px 8px; font-size: 11px; }
+
+/* slider */
+.rb-slider-row { display: flex; align-items: center; gap: 10px; }
+.rb-slider-row input[type="range"] { flex: 1 1 auto; accent-color: var(--accent); }
+.rb-slider-readout { font-family: var(--mono); font-size: 12px; color: var(--ink-soft); min-width: 34px; text-align: right; }
+
+/* color field */
+.rb-color-row { display: flex; align-items: center; gap: 8px; }
+.rb-color-row input[type="color"] { width: 30px; height: 26px; padding: 0; border: 1px solid var(--line); border-radius: 5px; background: none; cursor: pointer; }
+.rb-color-row input[type="range"] { width: 70px; accent-color: var(--accent); }
+.rb-color-row .rb-hex { width: 88px; font-family: var(--mono); text-transform: lowercase; }
+.rb-opacity-label { font-size: 10.5px; color: var(--muted); min-width: 30px; text-align: right; font-family: var(--mono); }
+
+/* altitude legend */
+.rb-legend { margin-top: 4px; }
+.rb-legend-bar { height: 14px; border-radius: 4px; border: 1px solid var(--line); }
+.rb-legend-ticks { position: relative; height: 16px; margin-top: 3px; }
+.rb-alt-tick { position: absolute; top: 0; transform: translateX(-50%); font-size: 9.5px; color: var(--muted); font-family: var(--mono); white-space: nowrap; }
+
+/* preflight card */
+.pf-counts { font-size: 13.5px; font-weight: 700; color: var(--ink); font-family: var(--mono); }
+.pf-line { font-size: 12px; color: var(--ink-soft); display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.pf-badge { font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 20px; }
+.pf-badge--warn { background: var(--amber-soft); color: var(--amber); }
+.pf-badge--ok { background: var(--green-soft); color: var(--green-ink); }
+.pf-errors { display: flex; flex-direction: column; gap: 3px; }
+.pf-error { font-size: 12px; color: var(--red-ink); background: var(--red-soft); border-radius: 6px; padding: 6px 9px; }
+.pf-argv { font-family: var(--mono); font-size: 11px; color: var(--ink-soft); background: var(--line2); border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; white-space: pre-wrap; word-break: break-all; max-height: 130px; overflow-y: auto; }
+.pf-argv-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.pf-argv-row .rb-btn { flex: 0 0 auto; }
+
+/* outputs list */
+.rb-outputs { font-size: 11.5px; color: var(--muted); display: flex; flex-direction: column; gap: 2px; max-height: 90px; overflow-y: auto; }
+.rb-outputs .row { display: flex; justify-content: space-between; gap: 8px; }
+.rb-outputs .row.is-collision { color: var(--amber); font-weight: 600; }
+
+/* run controls */
+.run-actions { display: flex; align-items: center; gap: 8px; }
+.run-actions .rb-btn-solid { flex: 1 1 auto; }
+
+/* progress + console */
+.rb-progress { position: relative; height: 8px; border-radius: 4px; background: var(--line2); overflow: hidden; }
+.rb-progress-fill { position: absolute; top: 0; left: 0; bottom: 0; width: 0%; background: var(--accent); border-radius: 4px; transition: width .25s ease; }
+.rb-progress.indeterminate .rb-progress-fill { width: 34%; animation: rb-indet 1.15s ease-in-out infinite; }
+@keyframes rb-indet { 0% { left: -34%; } 100% { left: 100%; } }
+.rb-progress-meta { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); font-family: var(--mono); }
+.rb-phase { font-size: 12px; color: var(--accent-ink); font-weight: 600; min-height: 16px; }
+.console-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.console { height: 230px; overflow-y: auto; background: var(--line2); border: 1px solid var(--line); border-radius: 6px; padding: 6px 0; font-family: var(--mono); font-size: 11px; line-height: 1.5; }
+.console .line { padding: 0 9px; white-space: pre-wrap; word-break: break-word; color: var(--ink-soft); }
+.console .line[data-kind="error"] { color: var(--red-ink); }
+.console .line[data-kind="warn"] { color: var(--amber); }
+.console.errors-only .line:not([data-kind="error"]) { display: none; }
+.console-empty { color: var(--muted); padding: 8px 9px; }
+
+/* result panel */
+.result { text-align: center; padding: 6px 0 4px; }
+.result-glyph { font-size: 42px; line-height: 1; margin-bottom: 6px; }
+.result-glyph--ok { color: var(--green); }
+.result-glyph--fail { color: var(--red); }
+.result-title { font-size: 15px; font-weight: 700; margin-bottom: 10px; }
+.result-stats { text-align: left; display: flex; flex-direction: column; gap: 5px; margin: 0 auto 12px; max-width: 320px; }
+.result-stat { display: flex; justify-content: space-between; font-size: 12.5px; gap: 12px; }
+.result-stat b { color: var(--ink); font-family: var(--mono); }
+.result-actions { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+.result-tail { text-align: left; font-family: var(--mono); font-size: 11px; color: var(--red-ink); background: var(--red-soft); border-radius: 6px; padding: 8px 10px; margin: 0 0 12px; max-height: 110px; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }
+
+/* tooltip */
+.rb-tooltip { position: fixed; z-index: 200; max-width: 260px; background: var(--ink); color: var(--panel); font-size: 11.5px; line-height: 1.45; padding: 8px 10px; border-radius: 7px; box-shadow: 0 8px 24px rgba(0,0,0,.25); display: none; }
+.rb-tooltip em { display: block; margin-top: 5px; opacity: .75; font-style: normal; }
+
+/* browse modal */
+.modal-overlay { position: fixed; inset: 0; background: rgba(10,14,20,.45); display: none; align-items: center; justify-content: center; z-index: 100; }
+.modal-overlay.open { display: flex; }
+.modal { width: min(560px, 92vw); max-height: 78vh; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 20px 60px rgba(0,0,0,.3); display: flex; flex-direction: column; overflow: hidden; }
+.modal-head { padding: 12px 14px; border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; }
+.modal-title { font-size: 13px; font-weight: 700; }
+.crumbs { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; font-size: 11.5px; }
+.crumbs button { border: 0; background: transparent; color: var(--accent-ink); cursor: pointer; padding: 2px 4px; border-radius: 4px; font: inherit; }
+.crumbs button:hover { background: var(--line2); }
+.crumbs .sep { color: var(--muted); }
+.modal-error { font-size: 11.5px; color: var(--red-ink); background: var(--red-soft); border-radius: 6px; padding: 6px 9px; }
+.modal-list { flex: 1 1 auto; overflow-y: auto; padding: 4px; }
+.modal-row { display: flex; align-items: center; gap: 8px; padding: 7px 9px; border-radius: 7px; cursor: pointer; font-size: 12.5px; }
+.modal-row:hover { background: var(--line2); }
+.modal-row .glyph { flex: 0 0 auto; width: 16px; text-align: center; color: var(--muted); }
+.modal-row .name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal-row .meta { flex: 0 0 auto; font-size: 10.5px; color: var(--muted); font-family: var(--mono); }
+.modal-row.is-file-noninteractive { cursor: default; opacity: .7; }
+.modal-row.is-file-noninteractive:hover { background: transparent; }
+.modal-row input[type="checkbox"] { accent-color: var(--accent); }
+.modal-foot { padding: 10px 14px; border-top: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.modal-foot .path { font-size: 10.5px; color: var(--muted); font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+footer.hint { text-align: center; font-size: 11px; color: var(--muted); padding: 4px 0 18px; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="wordmark">ADSB Historical Route Builder</div>
+  <span class="status-chip" id="statusChip" data-state="idle"><span class="dot"></span><span id="statusText">Idle</span></span>
+  <div class="topbar-spacer"></div>
+  <button class="theme-btn" id="themeBtn" title="Toggle theme" type="button">&#9789;</button>
+</header>
+
+<div class="presetsbar">
+  <label for="presetSelect">Preset</label>
+  <select id="presetSelect" style="min-width:220px;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:6px 8px;"></select>
+  <button class="rb-btn rb-btn-ghost rb-btn-sm" id="savePresetBtn" type="button">Save as preset&hellip;</button>
+  <button class="rb-btn rb-btn-danger rb-btn-sm" id="deletePresetBtn" type="button" style="display:none;">Delete</button>
+  <div class="presetsbar-spacer"></div>
+</div>
+
+<div class="layout">
+  <div class="form-col" id="formCol"><!-- Step 3 populates this --></div>
+
+  <div class="run-col">
+    <div class="panel">
+      <div class="panel-head"><div class="panel-title">Pre-flight</div></div>
+      <div class="panel-body" id="preflightBody">
+        <div class="pf-line" style="color:var(--muted)">Fill in the input, airports and routes to validate.</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-body">
+        <div class="run-actions">
+          <button class="rb-btn rb-btn-solid" id="runBtn" type="button" disabled>Run</button>
+          <button class="rb-btn rb-btn-ghost" id="cancelBtn" type="button" style="display:none;">Cancel</button>
+        </div>
+        <div class="rb-progress" id="progressBar"><div class="rb-progress-fill" id="progressFill"></div></div>
+        <div class="rb-progress-meta"><span id="progressText">&mdash;</span><span id="etaText"></span></div>
+        <div class="rb-phase" id="phaseText"></div>
+
+        <div class="console-head">
+          <div style="font-size:11.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);">Console</div>
+          <div class="rb-seg rb-seg--mini" id="consoleFilterSeg">
+            <button type="button" class="is-active" data-val="all">All</button>
+            <button type="button" data-val="errors">Errors only</button>
+          </div>
+        </div>
+        <div class="console" id="consoleBox"><div class="console-empty">Nothing has run yet.</div></div>
+      </div>
+    </div>
+
+    <div class="panel" id="resultPanel" style="display:none;">
+      <div class="panel-body"><div class="result" id="resultBody"></div></div>
+    </div>
+  </div>
+</div>
+
+<footer class="hint">Runs <code>adsb_historical_routes.py</code> locally &mdash; nothing leaves this machine.</footer>
+
+<div class="rb-tooltip" id="rbTooltip"></div>
+
+<div class="modal-overlay" id="modalOverlay">
+  <div class="modal">
+    <div class="modal-head">
+      <div class="modal-title" id="modalTitle">Choose a location</div>
+      <div class="crumbs" id="modalCrumbs"></div>
+      <div class="modal-error" id="modalError" style="display:none;"></div>
+    </div>
+    <div class="modal-list" id="modalList"></div>
+    <div class="modal-foot">
+      <div class="path" id="modalPath"></div>
+      <div style="display:flex;gap:8px;flex:0 0 auto;">
+        <button class="rb-btn rb-btn-ghost" id="modalCancelBtn" type="button">Cancel</button>
+        <button class="rb-btn rb-btn-solid" id="modalConfirmBtn" type="button" style="display:none;">Use this folder</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+/* ════════════════════════════════════════════════════════════════
+   Pure helpers: color conversion + altitude palette (Step 3 / 9)
+   ════════════════════════════════════════════════════════════════ */
+function kmlToRgba(aabbggrr) {
+  var s = String(aabbggrr || '').replace('#', '').trim().toLowerCase();
+  if (!/^[0-9a-f]{8}$/.test(s)) return { hex: '#ff0000', alpha: 1, valid: false };
+  var aa = s.slice(0, 2), bb = s.slice(2, 4), gg = s.slice(4, 6), rr = s.slice(6, 8);
+  return { hex: '#' + rr + gg + bb, alpha: parseInt(aa, 16) / 255, valid: true };
+}
+function rgbaToKml(hex, opacityPct) {
+  var h = String(hex || '#000000').replace('#', '');
+  if (h.length === 3) h = h.split('').map(function (c) { return c + c; }).join('');
+  var rr = h.slice(0, 2), gg = h.slice(2, 4), bb = h.slice(4, 6);
+  var a = Math.max(0, Math.min(100, Number(opacityPct)));
+  var aa = Math.round(a / 100 * 255).toString(16).padStart(2, '0');
+  return (aa + bb + gg + rr).toLowerCase();
+}
+function hslToHex(h, s, l) {
+  h = ((h % 360) + 360) % 360; s /= 100; l /= 100;
+  var c = (1 - Math.abs(2 * l - 1)) * s;
+  var x = c * (1 - Math.abs((h / 60) % 2 - 1));
+  var m = l - c / 2, r = 0, g = 0, b = 0;
+  if (h < 60) { r = c; g = x; b = 0; }
+  else if (h < 120) { r = x; g = c; b = 0; }
+  else if (h < 180) { r = 0; g = c; b = x; }
+  else if (h < 240) { r = 0; g = x; b = c; }
+  else if (h < 300) { r = x; g = 0; b = c; }
+  else { r = c; g = 0; b = x; }
+  function toHex(v) { return Math.round((v + m) * 255).toString(16).padStart(2, '0'); }
+  return '#' + toHex(r) + toHex(g) + toHex(b);
+}
+var ADSBEX_ALT_STOPS = [[0, 20], [2000, 40], [4000, 55], [6000, 70], [8000, 100],
+  [10000, 140], [20000, 190], [30000, 240], [35000, 275], [40000, 300]];
+function altHue(altFt) {
+  var stops = ADSBEX_ALT_STOPS;
+  if (altFt <= stops[0][0]) return stops[0][1];
+  if (altFt >= stops[stops.length - 1][0]) return stops[stops.length - 1][1];
+  for (var i = 0; i < stops.length - 1; i++) {
+    var a0 = stops[i][0], h0 = stops[i][1], a1 = stops[i + 1][0], h1 = stops[i + 1][1];
+    if (altFt >= a0 && altFt <= a1) {
+      var t = a1 > a0 ? (altFt - a0) / (a1 - a0) : 0;
+      return h0 + t * (h1 - h0);
+    }
+  }
+  return stops[stops.length - 1][1];
+}
+function suggestName(batchStem, params) {
+  batchStem = batchStem || 'output';
+  var m = /^([a-z]+)_(.+)/.exec(batchStem);
+  var airline = m ? m[1] : batchStem, period = m ? m[2] : '';
+  var stem = period ? (airline + '_routes_' + period) : (batchStem + '_routes');
+  if (params.confidence === 'strict') stem += '_strict';
+  if (params.stitch_gaps) stem += '_stitched';
+  if (params.integrate_pos) stem += '_pos';
+  if (params.color_mode === 'altitude') stem += '_altcolor';
+  return stem + '.kml';
+}
+function debounce(fn, ms) {
+  var t = null;
+  return function () {
+    var args = arguments, ctx = this;
+    clearTimeout(t);
+    t = setTimeout(function () { fn.apply(ctx, args); }, ms);
+  };
+}
+function humanizeBytes(n) {
+  if (n === null || n === undefined) return '';
+  var units = ['B', 'KB', 'MB', 'GB'], v = n, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(1)) + ' ' + units[i];
+}
+function fmtEta(sec) {
+  if (sec === null || sec === undefined || !isFinite(sec) || sec < 0) return '—';
+  sec = Math.round(sec);
+  var m = Math.floor(sec / 60), s = sec % 60;
+  return m + ':' + String(s).padStart(2, '0');
+}
+function joinPath(base, name) { return base.replace(/\/+$/, '') + '/' + name; }
+function dirOf(path) { var i = path.lastIndexOf('/'); return i > 0 ? path.slice(0, i) : path; }
+function baseOf(path) { var parts = path.replace(/\/+$/, '').split('/'); return parts[parts.length - 1] || path; }
+function quoteArg(a) { return /\s/.test(a) ? '"' + String(a).replace(/"/g, '\\"') + '"' : String(a); }
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Step 2: Boot + state
+   ════════════════════════════════════════════════════════════════ */
+var CONFIG = null;
+var PARAMS = {};
+var FIELD_ELS = {};        // key -> {type, ...element refs} for programmatic refresh
+var CURRENT_JOB = null;    // job id while a run is in flight
+var LAST_JOB_ID = null;    // sticks around after done() for Reveal
+var ES = null;             // active EventSource
+var lastBatchBasename = null;
+var lastValidate = null;
+var browseRootCache = {};  // key -> last browsed path
+
+function el(id) { return document.getElementById(id); }
+
+document.addEventListener('DOMContentLoaded', boot);
+
+function boot() {
+  initTheme();
+  fetch('/api/config').then(function (r) { return r.json(); }).then(function (cfg) {
+    CONFIG = cfg;
+    PARAMS = buildInitialParams();
+    renderPresetsBar();
+    renderForm();
+    updateConditionalSections();
+    wireRunPanel();
+    wireModal();
+    scheduleValidate();
+  }).catch(function (err) {
+    el('formCol').innerHTML = '<div class="panel"><div class="panel-body">Could not load /api/config: ' +
+      escapeHtml(String(err)) + '</div></div>';
+  });
+}
+
+function buildInitialParams() {
+  var p = {};
+  CONFIG.parameters.forEach(function (param) {
+    p[param.key] = CONFIG.defaults.hasOwnProperty(param.key) ? CONFIG.defaults[param.key] : param.default;
+  });
+  p.kml_files = [];
+  return p;
+}
+
+function buildParamsForApi() {
+  var out = {};
+  for (var k in PARAMS) if (PARAMS.hasOwnProperty(k)) out[k] = PARAMS[k];
+  return out;
+}
+
+function setParam(key, value) {
+  PARAMS[key] = value;
+  if (key === 'color_mode' || key === 'integrate_pos') updateConditionalSections();
+  scheduleValidate();
+}
+
+/* ---- theme ---- */
+function initTheme() {
+  el('themeBtn').addEventListener('click', toggleTheme);
+  updateThemeBtnGlyph();
+}
+function toggleTheme() {
+  var cur = document.documentElement.getAttribute('data-theme');
+  if (!cur) {
+    cur = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+  var next = cur === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  try { localStorage.setItem('rb-theme', next); } catch (e) {}
+  updateThemeBtnGlyph();
+}
+function updateThemeBtnGlyph() {
+  var t = document.documentElement.getAttribute('data-theme');
+  if (!t) t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+  el('themeBtn').textContent = t === 'dark' ? '☀' : '☾';
+}
+
+/* ---- presets ---- */
+function renderPresetsBar() {
+  var sel = el('presetSelect');
+  var html = '<option value="">— choose a preset —</option>';
+  CONFIG.presets.forEach(function (p) {
+    html += '<option value="' + escapeHtml(p.name) + '">' + escapeHtml(p.name) + (p.builtin ? '' : ' (custom)') + '</option>';
+  });
+  sel.innerHTML = html;
+  sel.onchange = function () {
+    var name = sel.value;
+    if (!name) return;
+    var preset = CONFIG.presets.filter(function (p) { return p.name === name; })[0];
+    if (preset) applyPreset(preset);
+    updateDeletePresetBtn();
+  };
+  el('savePresetBtn').onclick = savePreset;
+  el('deletePresetBtn').onclick = deletePreset;
+  updateDeletePresetBtn();
+}
+function updateDeletePresetBtn() {
+  var name = el('presetSelect').value;
+  var preset = CONFIG.presets.filter(function (p) { return p.name === name; })[0];
+  el('deletePresetBtn').style.display = (preset && !preset.builtin) ? '' : 'none';
+}
+function applyPreset(preset) {
+  PARAMS = buildInitialParams();
+  for (var k in preset.params) if (preset.params.hasOwnProperty(k)) PARAMS[k] = preset.params[k];
+  CONFIG.parameters.forEach(function (p) { refreshFieldDisplay(p.key); });
+  refreshFieldDisplay('kml_folder');
+  updateConditionalSections();
+  fetchOutputsList();
+  scheduleValidate();
+}
+function savePreset() {
+  var name = prompt('Save current settings as a preset named:');
+  if (!name) return;
+  fetch('/api/presets', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: name, params: buildParamsForApi() })
+  }).then(function (r) {
+    if (!r.ok) return r.json().then(function (e) { throw new Error(e.error || 'Could not save preset'); });
+    return r.json();
+  }).then(function (data) {
+    CONFIG.presets = data.presets;
+    renderPresetsBar();
+    el('presetSelect').value = name;
+    updateDeletePresetBtn();
+  }).catch(function (err) { alert(err.message); });
+}
+function deletePreset() {
+  var name = el('presetSelect').value;
+  if (!name) return;
+  if (!confirm('Delete preset "' + name + '"?')) return;
+  fetch('/api/presets?name=' + encodeURIComponent(name), { method: 'DELETE' }).then(function (r) {
+    if (!r.ok) return r.json().then(function (e) { throw new Error(e.error || 'Could not delete preset'); });
+    return r.json();
+  }).then(function (data) {
+    CONFIG.presets = data.presets;
+    renderPresetsBar();
+  }).catch(function (err) { alert(err.message); });
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Step 3: Form generation
+   ════════════════════════════════════════════════════════════════ */
+var SECTION_ORDER = ['input', 'output', 'detection', 'styling', 'stitching', 'positions'];
+var GROUP_META = {
+  input: { title: 'Input', desc: 'ADS-B KML tracks and reference CSVs.' },
+  output: { title: 'Output', desc: 'Where the organized route KML is written.' },
+  detection: { title: 'Detection', desc: 'How tracks are split into flights and matched to airports.' },
+  styling: { title: 'Styling', desc: 'Line color, width and embellishments in the output KML.' },
+  stitching: { title: 'Gap Stitching', desc: 'Mark inferred connectors across coverage gaps.' },
+  positions: { title: 'Position Sources', desc: 'Fill ADS-B gaps with real ACARS POS / firehose fixes.' },
+};
+var SEGMENTED_OPTIONS = {
+  group: [['origin', 'Origin'], ['destination', 'Destination']],
+  confidence: [['strict', 'Strict'], ['balanced', 'Balanced'], ['permissive', 'Permissive']],
+  color_mode: [['source', 'Source'], ['altitude', 'Altitude']],
+  route_time_rescue: [['', 'Preset'], ['on', 'On'], ['off', 'Off']],
+};
+// Fields whose value only ever changes as a consequence of integrate_pos / color_mode.
+var POSITIONS_SUBFIELDS = ['pos_folder', 'firehose_folder', 'tail_icao', 'pos_color', 'firehose_color'];
+
+function paramsByGroup(group) {
+  return CONFIG.parameters.filter(function (p) { return p.group === group; });
+}
+
+function renderForm() {
+  var col = el('formCol');
+  col.innerHTML = '';
+  SECTION_ORDER.forEach(function (group) {
+    var meta = GROUP_META[group];
+    var panel = document.createElement('div');
+    panel.className = 'panel';
+    panel.dataset.group = group;
+    var head = document.createElement('div');
+    head.className = 'panel-head';
+    head.innerHTML = '<div><div class="panel-title">' + meta.title + '</div>' +
+      '<div class="panel-desc">' + meta.desc + '</div></div>';
+    panel.appendChild(head);
+    var body = document.createElement('div');
+    body.className = 'panel-body';
+    paramsByGroup(group).forEach(function (param) { body.appendChild(buildField(param)); });
+
+    if (group === 'detection') {
+      var adv = document.createElement('details');
+      adv.className = 'adv';
+      var advBody = document.createElement('div');
+      advBody.className = 'panel-body';
+      paramsByGroup('detection_advanced').forEach(function (param) { advBody.appendChild(buildField(param)); });
+      adv.innerHTML = '<summary>Advanced overrides</summary>';
+      adv.appendChild(advBody);
+      body.appendChild(adv);
+    }
+    if (group === 'styling') {
+      var altWrap = document.createElement('div');
+      altWrap.id = 'styling-altitude-block';
+      paramsByGroup('styling_altitude').forEach(function (param) { altWrap.appendChild(buildField(param)); });
+      altWrap.appendChild(buildAltitudeLegend());
+      body.appendChild(altWrap);
+    }
+    if (group === 'positions') {
+      // Wrap the non-toggle position fields so they can be shown/hidden together.
+      Array.prototype.slice.call(body.children).forEach(function (child) {
+        if (child.dataset && POSITIONS_SUBFIELDS.indexOf(child.dataset.key) !== -1) {
+          child.classList.add('positions-subfield');
+        }
+      });
+    }
+    panel.appendChild(body);
+    col.appendChild(panel);
+  });
+}
+
+function buildField(param) {
+  var row = document.createElement('div');
+  row.className = 'field';
+  row.dataset.key = param.key;
+  var labelRow = document.createElement('div');
+  labelRow.className = 'field-label-row';
+  var label = document.createElement('span');
+  label.className = 'field-label';
+  label.textContent = param.label;
+  var info = document.createElement('span');
+  info.className = 'info-btn';
+  info.textContent = 'i';
+  info.tabIndex = 0;
+  wireTooltip(info, param.help, param.example);
+  labelRow.appendChild(label);
+  labelRow.appendChild(info);
+  row.appendChild(labelRow);
+
+  var control;
+  if (param.key === 'kml_folder') control = buildKmlInputControl(param);
+  else if (param.type === 'folder' || param.type === 'file') control = buildPathControl(param);
+  else if (param.type === 'text') control = buildTextControl(param);
+  else if (param.type === 'number') control = buildNumberControl(param);
+  else if (param.type === 'slider') control = buildSliderControl(param);
+  else if (param.type === 'toggle') control = buildToggleControl(param);
+  else if (param.type === 'segmented') control = buildSegmentedControl(param);
+  else if (param.type === 'color') control = buildColorControl(param);
+  else { control = document.createElement('div'); control.textContent = '(unsupported type ' + param.type + ')'; }
+  row.appendChild(control);
+  return row;
+}
+
+function wireTooltip(target, help, example) {
+  var show = function () { showTooltip(target, help, example); };
+  target.addEventListener('mouseenter', show);
+  target.addEventListener('focus', show);
+  target.addEventListener('mouseleave', hideTooltip);
+  target.addEventListener('blur', hideTooltip);
+}
+function showTooltip(anchorEl, help, example) {
+  var tip = el('rbTooltip');
+  tip.innerHTML = escapeHtml(help || '') + (example ? '<em>Example: ' + escapeHtml(example) + '</em>' : '');
+  tip.style.display = 'block';
+  tip.style.left = '0px'; tip.style.top = '0px';
+  var r = anchorEl.getBoundingClientRect();
+  var tw = tip.offsetWidth, th = tip.offsetHeight;
+  var left = Math.max(8, Math.min(r.left + r.width / 2 - tw / 2, window.innerWidth - tw - 8));
+  var top = r.bottom + 8;
+  if (top + th > window.innerHeight - 8) top = r.top - th - 8;
+  tip.style.left = left + 'px';
+  tip.style.top = top + 'px';
+}
+function hideTooltip() { el('rbTooltip').style.display = 'none'; }
+
+/* -- text / number -- */
+function buildTextControl(param) {
+  var wrap = document.createElement('div');
+  var input = document.createElement('input');
+  input.type = 'text';
+  input.value = PARAMS[param.key] || '';
+  input.addEventListener('input', function () { setParam(param.key, input.value); });
+  wrap.appendChild(input);
+  FIELD_ELS[param.key] = { type: 'text', input: input };
+  return wrap;
+}
+function buildNumberControl(param) {
+  var wrap = document.createElement('div');
+  var input = document.createElement('input');
+  input.type = 'number';
+  input.step = 'any';
+  var v = PARAMS[param.key];
+  input.value = (v === null || v === undefined || v === '') ? '' : v;
+  input.placeholder = (param.default === null || param.default === '') ? 'auto (preset default)' : String(param.default);
+  input.addEventListener('input', function () {
+    setParam(param.key, input.value === '' ? '' : Number(input.value));
+  });
+  wrap.appendChild(input);
+  FIELD_ELS[param.key] = { type: 'number', input: input };
+  return wrap;
+}
+
+/* -- slider -- */
+function buildSliderControl(param) {
+  var wrap = document.createElement('div');
+  wrap.className = 'rb-slider-row';
+  var range = document.createElement('input');
+  range.type = 'range'; range.min = 0; range.max = 100;
+  range.value = PARAMS[param.key];
+  var readout = document.createElement('span');
+  readout.className = 'rb-slider-readout';
+  readout.textContent = PARAMS[param.key] + '%';
+  range.addEventListener('input', function () {
+    readout.textContent = range.value + '%';
+    setParam(param.key, Number(range.value));
+  });
+  wrap.appendChild(range); wrap.appendChild(readout);
+  FIELD_ELS[param.key] = { type: 'slider', range: range, readout: readout };
+  return wrap;
+}
+
+/* -- toggle -- */
+function buildToggleControl(param) {
+  var wrap = document.createElement('div');
+  wrap.className = 'field-inline';
+  var sw = document.createElement('button');
+  sw.type = 'button';
+  sw.className = 'rb-switch' + (PARAMS[param.key] ? ' is-on' : '');
+  sw.setAttribute('aria-pressed', !!PARAMS[param.key]);
+  sw.innerHTML = '<span class="knob"></span>';
+  sw.addEventListener('click', function () {
+    var next = !PARAMS[param.key];
+    sw.classList.toggle('is-on', next);
+    sw.setAttribute('aria-pressed', next);
+    setParam(param.key, next);
+  });
+  wrap.appendChild(sw);
+  FIELD_ELS[param.key] = { type: 'toggle', el: sw };
+  return wrap;
+}
+
+/* -- segmented -- */
+function buildSegmentedControl(param) {
+  var wrap = document.createElement('div');
+  wrap.className = 'rb-seg';
+  var opts = SEGMENTED_OPTIONS[param.key] || [[param.default, String(param.default)]];
+  var buttons = opts.map(function (opt) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.dataset.val = opt[0];
+    b.textContent = opt[1];
+    if ((PARAMS[param.key] || '') === opt[0]) b.classList.add('is-active');
+    b.addEventListener('click', function () {
+      buttons.forEach(function (bb) { bb.classList.toggle('is-active', bb === b); });
+      setParam(param.key, opt[0]);
+    });
+    wrap.appendChild(b);
+    return b;
+  });
+  FIELD_ELS[param.key] = { type: 'segmented', buttons: buttons };
+  return wrap;
+}
+
+/* -- color -- */
+function buildColorControl(param) {
+  var wrap = document.createElement('div');
+  wrap.className = 'rb-color-row';
+  var current = PARAMS[param.key] || param.default || 'ff000000';
+  var rc = kmlToRgba(current || '00000000');
+  var colorInput = document.createElement('input'); colorInput.type = 'color'; colorInput.value = rc.valid ? rc.hex : '#888888';
+  var opacity = document.createElement('input'); opacity.type = 'range'; opacity.min = 0; opacity.max = 100;
+  opacity.value = rc.valid ? Math.round(rc.alpha * 100) : 100;
+  var opLabel = document.createElement('span'); opLabel.className = 'rb-opacity-label'; opLabel.textContent = opacity.value + '%';
+  var hex = document.createElement('input'); hex.type = 'text'; hex.className = 'rb-hex'; hex.maxLength = 8;
+  hex.value = PARAMS[param.key] || '';
+  hex.placeholder = param.default || '(mode default)';
+
+  function pushFromPicker() {
+    var kml = rgbaToKml(colorInput.value, opacity.value);
+    hex.value = kml;
+    opLabel.textContent = opacity.value + '%';
+    setParam(param.key, kml);
+  }
+  colorInput.addEventListener('input', pushFromPicker);
+  opacity.addEventListener('input', pushFromPicker);
+  hex.addEventListener('change', function () {
+    var v = hex.value.trim().toLowerCase();
+    if (v === '' && param.default === '') { setParam(param.key, ''); return; }
+    if (/^[0-9a-f]{8}$/.test(v)) {
+      var parsed = kmlToRgba(v);
+      colorInput.value = parsed.hex;
+      opacity.value = Math.round(parsed.alpha * 100);
+      opLabel.textContent = opacity.value + '%';
+      setParam(param.key, v);
+    } else {
+      hex.value = PARAMS[param.key] || '';
+    }
+  });
+
+  wrap.appendChild(colorInput); wrap.appendChild(opacity); wrap.appendChild(opLabel); wrap.appendChild(hex);
+  FIELD_ELS[param.key] = { type: 'color', colorInput: colorInput, opacityInput: opacity, opLabel: opLabel, hexInput: hex, fallback: param.default };
+  return wrap;
+}
+
+/* -- folder / file (Browse button; Step 4 modal) -- */
+function fieldRoot(key) {
+  var map = { airports: 'airports_dir', routes: 'routes_dir', tail_icao: 'airports_dir', output_dir: 'output_default' };
+  var rk = map[key] || 'input_default';
+  return (CONFIG.roots[rk] || CONFIG.roots.input_default);
+}
+function fieldKind(key) {
+  if (key === 'airports' || key === 'routes' || key === 'tail_icao') return 'csv';
+  if (key === 'output_dir') return null;
+  return null;
+}
+function buildPathControl(param) {
+  var wrap = document.createElement('div');
+  wrap.className = 'path-row';
+  var input = document.createElement('input');
+  input.type = 'text'; input.readOnly = true;
+  input.value = PARAMS[param.key] || '';
+  input.placeholder = param.type === 'folder' ? 'No folder chosen' : 'No file chosen';
+  var btn = document.createElement('button');
+  btn.type = 'button'; btn.className = 'rb-btn rb-btn-ghost'; btn.textContent = 'Browse…';
+  btn.addEventListener('click', function () {
+    openBrowse(param.key, param.type === 'folder' ? 'folder' : 'file', fieldKind(param.key));
+  });
+  wrap.appendChild(input); wrap.appendChild(btn);
+  FIELD_ELS[param.key] = { type: param.type, input: input };
+  return wrap;
+}
+
+/* -- kml_folder: whole-folder vs multi-file selector -- */
+function kmlFieldDisplayText() {
+  if (PARAMS.kml_files && PARAMS.kml_files.length) {
+    return PARAMS.kml_files.length + ' file(s) selected — ' + dirOf(PARAMS.kml_files[0]);
+  }
+  return PARAMS.kml_folder || '';
+}
+function buildKmlInputControl(param) {
+  var wrap = document.createElement('div');
+  var modeRow = document.createElement('div');
+  modeRow.className = 'rb-seg rb-seg--mini';
+  modeRow.style.marginBottom = '6px';
+  var folderBtn = document.createElement('button'); folderBtn.type = 'button'; folderBtn.textContent = 'Whole folder';
+  var filesBtn = document.createElement('button'); filesBtn.type = 'button'; filesBtn.textContent = 'Select files';
+  var filesMode = !!(PARAMS.kml_files && PARAMS.kml_files.length);
+  folderBtn.classList.toggle('is-active', !filesMode);
+  filesBtn.classList.toggle('is-active', filesMode);
+  folderBtn.addEventListener('click', function () {
+    setParam('kml_files', []);
+    folderBtn.classList.add('is-active'); filesBtn.classList.remove('is-active');
+    refreshFieldDisplay('kml_folder');
+  });
+  filesBtn.addEventListener('click', function () {
+    setParam('kml_folder', '');
+    filesBtn.classList.add('is-active'); folderBtn.classList.remove('is-active');
+    refreshFieldDisplay('kml_folder');
+  });
+  modeRow.appendChild(folderBtn); modeRow.appendChild(filesBtn);
+
+  var pathRow = document.createElement('div');
+  pathRow.className = 'path-row';
+  var input = document.createElement('input');
+  input.type = 'text'; input.readOnly = true;
+  input.value = kmlFieldDisplayText();
+  input.placeholder = 'No input chosen';
+  var btn = document.createElement('button');
+  btn.type = 'button'; btn.className = 'rb-btn rb-btn-ghost'; btn.textContent = 'Browse…';
+  btn.addEventListener('click', function () {
+    var mode = filesBtn.classList.contains('is-active') ? 'files' : 'folder';
+    openBrowse('kml_folder', mode, 'kml');
+  });
+  pathRow.appendChild(input); pathRow.appendChild(btn);
+
+  wrap.appendChild(modeRow); wrap.appendChild(pathRow);
+  FIELD_ELS.kml_folder = { type: 'kmlpath', input: input, folderBtn: folderBtn, filesBtn: filesBtn };
+  return wrap;
+}
+
+/* -- altitude legend (Step 9) -- */
+var ALT_TICKS = [0, 500, 1000, 2000, 4000, 6000, 8000, 10000, 20000, 30000, 40000];
+function altPos(ft) { return Math.sqrt(Math.max(0, ft) / 40000) * 100; }
+function buildAltGradientCss() {
+  var stops = [], steps = 40;
+  for (var i = 0; i <= steps; i++) {
+    var altFt = (i / steps) * 40000;
+    var pos = altPos(altFt);
+    var hex = hslToHex(altHue(altFt), 85, 50);
+    stops.push(hex + ' ' + pos.toFixed(2) + '%');
+  }
+  return 'linear-gradient(to right, ' + stops.join(', ') + ')';
+}
+function buildAltitudeLegend() {
+  var wrap = document.createElement('div');
+  wrap.className = 'rb-legend field';
+  wrap.innerHTML = '<div class="field-label">Altitude legend (ADS-B Exchange)</div>';
+  var bar = document.createElement('div');
+  bar.className = 'rb-legend-bar';
+  bar.style.background = buildAltGradientCss();
+  var ticks = document.createElement('div');
+  ticks.className = 'rb-legend-ticks';
+  ALT_TICKS.forEach(function (v, i) {
+    var t = document.createElement('span');
+    t.className = 'rb-alt-tick';
+    t.style.left = altPos(v) + '%';
+    t.textContent = (i === ALT_TICKS.length - 1) ? '40000+' : String(v);
+    ticks.appendChild(t);
+  });
+  wrap.appendChild(bar); wrap.appendChild(ticks);
+  return wrap;
+}
+
+/* -- generic programmatic refresh (presets, smart defaults, reset) -- */
+function refreshFieldDisplay(key) {
+  var F = FIELD_ELS[key];
+  if (!F) return;
+  var val = PARAMS[key];
+  if (F.type === 'text' || F.type === 'folder' || F.type === 'file') {
+    F.input.value = val || '';
+  } else if (F.type === 'number') {
+    F.input.value = (val === null || val === undefined || val === '') ? '' : val;
+  } else if (F.type === 'slider') {
+    F.range.value = val; F.readout.textContent = val + '%';
+  } else if (F.type === 'toggle') {
+    F.el.classList.toggle('is-on', !!val); F.el.setAttribute('aria-pressed', !!val);
+  } else if (F.type === 'segmented') {
+    F.buttons.forEach(function (b) { b.classList.toggle('is-active', b.dataset.val === (val || '')); });
+  } else if (F.type === 'color') {
+    var rc = kmlToRgba(val || F.fallback || '00000000');
+    F.colorInput.value = rc.valid ? rc.hex : '#888888';
+    F.opacityInput.value = rc.valid ? Math.round(rc.alpha * 100) : 100;
+    F.opLabel.textContent = F.opacityInput.value + '%';
+    F.hexInput.value = val || '';
+  } else if (F.type === 'kmlpath') {
+    F.input.value = kmlFieldDisplayText();
+    var filesMode = !!(PARAMS.kml_files && PARAMS.kml_files.length);
+    F.folderBtn.classList.toggle('is-active', !filesMode);
+    F.filesBtn.classList.toggle('is-active', filesMode);
+  }
+}
+
+/* -- conditional sections: integrate_pos, color_mode==altitude -- */
+function updateConditionalSections() {
+  var showAlt = PARAMS.color_mode === 'altitude';
+  var altBlock = el('styling-altitude-block');
+  if (altBlock) altBlock.style.display = showAlt ? '' : 'none';
+
+  var showPos = !!PARAMS.integrate_pos;
+  document.querySelectorAll('.positions-subfield').forEach(function (elm) {
+    elm.style.display = showPos ? '' : 'none';
+  });
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Step 5: Smart defaults
+   ════════════════════════════════════════════════════════════════ */
+function maybeApplySmartDefaults(folderPath) {
+  if (!folderPath) return;
+  var basename = baseOf(folderPath);
+  lastBatchBasename = basename;
+  var airportsDir = CONFIG.roots.airports_dir, routesDir = CONFIG.roots.routes_dir;
+
+  var lookups = [browseDir(airportsDir)];
+  if (routesDir !== airportsDir) lookups.push(browseDir(routesDir)); else lookups.push(lookups[0]);
+
+  Promise.all(lookups).then(function (results) {
+    var airportEntries = (results[0] && results[0].entries) || [];
+    var routeEntries = (results[1] && results[1].entries) || [];
+    var prefix = basename.replace(/^([a-z]+)_.*/, '$1') + '_';
+    var lowerPrefix = prefix.toLowerCase();
+
+    var apMatch = airportEntries.filter(function (e) {
+      return e.type === 'file' && e.kind === 'csv' && e.name.toLowerCase().indexOf(lowerPrefix) === 0 &&
+        e.name.toLowerCase().indexOf('airport') !== -1;
+    })[0];
+    var rtMatch = routeEntries.filter(function (e) {
+      return e.type === 'file' && e.kind === 'csv' && e.name.toLowerCase().indexOf(lowerPrefix) === 0 &&
+        e.name.toLowerCase().indexOf('routes_time') !== -1;
+    })[0];
+
+    if (apMatch) { PARAMS.airports = joinPath(airportsDir, apMatch.name); refreshFieldDisplay('airports'); }
+    if (rtMatch) { PARAMS.routes = joinPath(routesDir, rtMatch.name); refreshFieldDisplay('routes'); }
+
+    PARAMS.output_dir = CONFIG.roots.output_default;
+    PARAMS.output_name = suggestName(basename, PARAMS);
+    refreshFieldDisplay('output_dir');
+    refreshFieldDisplay('output_name');
+    fetchOutputsList();
+    scheduleValidate();
+  }).catch(function () { /* smart defaults are best-effort; ignore failures */ });
+}
+function browseDir(path) {
+  return fetch('/api/browse?path=' + encodeURIComponent(path)).then(function (r) {
+    if (!r.ok) throw new Error('browse failed');
+    return r.json();
+  });
+}
+function fetchOutputsList() {
+  if (!PARAMS.output_dir) return;
+  fetch('/api/outputs?dir=' + encodeURIComponent(PARAMS.output_dir)).then(function (r) { return r.json(); })
+    .then(renderOutputsList).catch(function () {});
+}
+function renderOutputsList(data) {
+  var box = el('preflightBody');
+  var listEl = box.querySelector('.rb-outputs');
+  if (!listEl) return; // preflight not rendered yet; validate() will call this again once it is
+  if (!data.files || !data.files.length) { listEl.innerHTML = '<div class="row" style="opacity:.6">(no existing output files)</div>'; return; }
+  listEl.innerHTML = data.files.map(function (f) {
+    var collide = f.name === PARAMS.output_name;
+    return '<div class="row' + (collide ? ' is-collision' : '') + '"><span>' + escapeHtml(f.name) + '</span><span>' +
+      humanizeBytes(f.size) + (collide ? ' — will overwrite' : '') + '</span></div>';
+  }).join('');
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Step 6: Pre-flight card
+   ════════════════════════════════════════════════════════════════ */
+var scheduleValidate = debounce(runValidate, 300);
+function runValidate() {
+  if (!CONFIG) return;
+  fetch('/api/validate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(buildParamsForApi())
+  }).then(function (r) { return r.json(); }).then(renderPreflight).catch(function (err) {
+    el('preflightBody').innerHTML = '<div class="pf-error">Could not reach the server: ' + escapeHtml(String(err)) + '</div>';
+  });
+}
+function renderPreflight(data) {
+  lastValidate = data;
+  var body = el('preflightBody');
+  var counts = data.kml_count + ' KML · ' + data.airports_count + ' airports · ' + data.routes_count + ' routes';
+  if (PARAMS.integrate_pos) counts += ' · ' + data.tail_icao_count + ' tails';
+
+  var outLine = '<span class="pf-line">' + escapeHtml(data.output_path || '(no output path)') + '</span>';
+  var badges = '';
+  if (data.output_exists) badges += '<span class="pf-badge pf-badge--warn">will overwrite</span>';
+  else if (data.output_path) badges += '<span class="pf-badge pf-badge--ok">new file</span>';
+
+  var warnHtml = (data.warnings || []).map(function (w) {
+    return '<div class="pf-line" style="color:var(--amber)">⚠ ' + escapeHtml(w) + '</div>';
+  }).join('');
+  var errHtml = (data.errors || []).length
+    ? '<div class="pf-errors">' + data.errors.map(function (e) { return '<div class="pf-error">' + escapeHtml(e) + '</div>'; }).join('') + '</div>'
+    : '';
+
+  var argvStr = (data.argv || []).map(quoteArg).join(' ');
+
+  body.innerHTML =
+    '<div class="pf-counts">' + counts + '</div>' +
+    '<div>' + outLine + ' ' + badges + '</div>' +
+    warnHtml + errHtml +
+    '<div class="field-label" style="margin-top:2px;">Existing outputs in this folder</div>' +
+    '<div class="rb-outputs"></div>' +
+    '<div class="field-label" style="margin-top:4px;">Command</div>' +
+    '<div class="pf-argv-row"><div class="pf-argv" id="argvPre"></div>' +
+    '<button class="rb-btn rb-btn-ghost rb-btn-sm" id="copyArgvBtn" type="button">Copy</button></div>';
+  el('argvPre').textContent = argvStr;
+  el('copyArgvBtn').onclick = function () {
+    if (navigator.clipboard) navigator.clipboard.writeText(argvStr).catch(function () {});
+  };
+
+  el('runBtn').disabled = !!(data.errors && data.errors.length) || !!CURRENT_JOB;
+  fetchOutputsList();
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Step 4: Browse modal
+   ════════════════════════════════════════════════════════════════ */
+var BROWSE = { key: null, selectable: null, kind: null, path: null, parent: null, selected: null };
+
+function openBrowse(key, selectable, kind) {
+  BROWSE.key = key; BROWSE.selectable = selectable; BROWSE.kind = kind; BROWSE.selected = new Set();
+  el('modalTitle').textContent = selectable === 'folder' ? 'Choose a folder'
+    : selectable === 'files' ? 'Choose KML files' : 'Choose a file';
+  el('modalOverlay').classList.add('open');
+  var start = browseRootCache[key] || fieldRoot(key);
+  navigateBrowse(start);
+}
+function closeBrowse() { el('modalOverlay').classList.remove('open'); }
+function navigateBrowse(path) {
+  el('modalError').style.display = 'none';
+  browseDir(path).then(function (data) {
+    BROWSE.path = data.path; BROWSE.parent = data.parent;
+    browseRootCache[BROWSE.key] = data.path;
+    renderBrowse(data);
+  }).catch(function () {
+    el('modalError').style.display = '';
+    el('modalError').textContent = "Can't open that folder (outside the allowed roots, or it no longer exists).";
+  });
+}
+function renderBrowse(data) {
+  // breadcrumb
+  var parts = data.path.split('/').filter(function (s) { return s !== ''; });
+  var crumbHtml = '<button type="button" data-p="/">/</button>';
+  var acc = '';
+  parts.forEach(function (part) {
+    acc += '/' + part;
+    crumbHtml += '<span class="sep">/</span><button type="button" data-p="' + escapeHtml(acc) + '">' + escapeHtml(part) + '</button>';
+  });
+  var crumbs = el('modalCrumbs');
+  crumbs.innerHTML = crumbHtml;
+  crumbs.querySelectorAll('button').forEach(function (b) {
+    b.addEventListener('click', function () { navigateBrowse(b.dataset.p); });
+  });
+
+  var list = el('modalList');
+  list.innerHTML = '';
+  if (data.parent) {
+    var up = document.createElement('div');
+    up.className = 'modal-row';
+    up.innerHTML = '<span class="glyph">↑</span><span class="name">.. (up)</span>';
+    up.addEventListener('click', function () { navigateBrowse(data.parent); });
+    list.appendChild(up);
+  }
+  data.entries.forEach(function (e) {
+    if (e.type === 'dir') {
+      var row = document.createElement('div');
+      row.className = 'modal-row';
+      row.innerHTML = '<span class="glyph">📁</span><span class="name">' + escapeHtml(e.name) + '</span>' +
+        (e.kml_count ? '<span class="meta">' + e.kml_count + ' kml</span>' : '');
+      row.addEventListener('click', function () { navigateBrowse(joinPath(data.path, e.name)); });
+      list.appendChild(row);
+    } else {
+      var kindOk = BROWSE.kind === null || BROWSE.kind === undefined || e.kind === BROWSE.kind;
+      if (!kindOk) return;
+      var frow = document.createElement('div');
+      var interactive = BROWSE.selectable === 'file' || BROWSE.selectable === 'files';
+      frow.className = 'modal-row' + (interactive ? '' : ' is-file-noninteractive');
+      var full = joinPath(data.path, e.name);
+      var metaHtml = '<span class="meta">' + humanizeBytes(e.size) + '</span>';
+      if (BROWSE.selectable === 'files') {
+        var checked = BROWSE.selected.has(full);
+        frow.innerHTML = '<input type="checkbox"' + (checked ? ' checked' : '') + '><span class="glyph">📄</span>' +
+          '<span class="name">' + escapeHtml(e.name) + '</span>' + metaHtml;
+        var cb = frow.querySelector('input');
+        var toggle = function () {
+          if (BROWSE.selected.has(full)) BROWSE.selected.delete(full); else BROWSE.selected.add(full);
+          cb.checked = BROWSE.selected.has(full);
+          updateModalFoot();
+        };
+        cb.addEventListener('click', function (ev) { ev.stopPropagation(); toggle(); });
+        frow.addEventListener('click', toggle);
+      } else {
+        frow.innerHTML = '<span class="glyph">📄</span><span class="name">' + escapeHtml(e.name) + '</span>' + metaHtml;
+        if (BROWSE.selectable === 'file') {
+          frow.addEventListener('click', function () { confirmBrowse([full], false, false); });
+        }
+      }
+      list.appendChild(frow);
+    }
+  });
+  el('modalPath').textContent = data.path;
+  updateModalFoot();
+}
+function updateModalFoot() {
+  var btn = el('modalConfirmBtn');
+  if (BROWSE.selectable === 'folder') {
+    btn.style.display = '';
+    btn.textContent = 'Use this folder';
+    btn.disabled = false;
+    btn.onclick = function () { confirmBrowse([BROWSE.path], true, false); };
+  } else if (BROWSE.selectable === 'files') {
+    btn.style.display = '';
+    btn.textContent = 'Use ' + BROWSE.selected.size + ' selected file(s)';
+    btn.disabled = BROWSE.selected.size === 0;
+    btn.onclick = function () { confirmBrowse(Array.from(BROWSE.selected), false, true); };
+  } else {
+    btn.style.display = 'none';
+  }
+}
+function confirmBrowse(paths, isFolder, isMulti) {
+  closeBrowse();
+  if (isFolder) {
+    if (BROWSE.key === 'kml_folder') {
+      setParam('kml_folder', paths[0]);
+      setParam('kml_files', []);
+      refreshFieldDisplay('kml_folder');
+      maybeApplySmartDefaults(paths[0]);
+    } else {
+      setParam(BROWSE.key, paths[0]);
+      refreshFieldDisplay(BROWSE.key);
+      if (BROWSE.key === 'output_dir') fetchOutputsList();
+    }
+  } else if (isMulti) {
+    setParam('kml_files', paths);
+    setParam('kml_folder', '');
+    refreshFieldDisplay('kml_folder');
+    maybeApplySmartDefaults(dirOf(paths[0]));
+  } else {
+    setParam(BROWSE.key, paths[0]);
+    refreshFieldDisplay(BROWSE.key);
+  }
+}
+function wireModal() {
+  el('modalCancelBtn').addEventListener('click', closeBrowse);
+  el('modalOverlay').addEventListener('click', function (ev) { if (ev.target === el('modalOverlay')) closeBrowse(); });
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Step 7: Run + live console
+   ════════════════════════════════════════════════════════════════ */
+function wireRunPanel() {
+  el('runBtn').addEventListener('click', startRun);
+  el('cancelBtn').addEventListener('click', cancelRun);
+  el('consoleFilterSeg').querySelectorAll('button').forEach(function (b) {
+    b.addEventListener('click', function () {
+      el('consoleFilterSeg').querySelectorAll('button').forEach(function (x) { x.classList.toggle('is-active', x === b); });
+      el('consoleBox').classList.toggle('errors-only', b.dataset.val === 'errors');
+    });
+  });
+}
+
+function setStatus(state) {
+  var chip = el('statusChip');
+  chip.dataset.state = state;
+  el('statusText').textContent = { idle: 'Idle', running: 'Running', success: 'Success', failed: 'Failed' }[state] || state;
+}
+
+function clearConsole() {
+  el('consoleBox').innerHTML = '';
+}
+function appendLine(text, kind) {
+  var box = el('consoleBox');
+  var empty = box.querySelector('.console-empty');
+  if (empty) empty.remove();
+  var div = document.createElement('div');
+  div.className = 'line';
+  div.dataset.kind = kind;
+  div.textContent = text;
+  var nearBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+  box.appendChild(div);
+  if (nearBottom) box.scrollTop = box.scrollHeight;
+}
+function classifyClient(text) {
+  if (/error|exception|traceback/i.test(text)) return 'error';
+  if (/warning/i.test(text)) return 'warn';
+  return 'raw';
+}
+
+function setProgressIndeterminate(on) {
+  el('progressBar').classList.toggle('indeterminate', on);
+  if (on) el('progressFill').style.width = '';
+}
+function setProgressPercent(pct) {
+  el('progressBar').classList.remove('indeterminate');
+  el('progressFill').style.width = (pct === null || pct === undefined ? 0 : pct) + '%';
+}
+
+function startRun() {
+  if (CURRENT_JOB) return;
+  el('runBtn').disabled = true;
+  el('cancelBtn').style.display = '';
+  el('resultPanel').style.display = 'none';
+  setStatus('running');
+  clearConsole();
+  el('phaseText').textContent = '';
+  el('progressText').textContent = '0 / ' + (lastValidate ? lastValidate.kml_count : 0);
+  el('etaText').textContent = '';
+  setProgressPercent(0);
+
+  fetch('/api/run', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(buildParamsForApi())
+  }).then(function (r) {
+    if (!r.ok) return r.json().then(function (e) { throw new Error(e.error || 'Run failed to start'); });
+    return r.json();
+  }).then(function (data) {
+    CURRENT_JOB = data.job_id;
+    LAST_JOB_ID = data.job_id;
+    openStream(data.job_id);
+  }).catch(function (err) {
+    setStatus('failed');
+    el('cancelBtn').style.display = 'none';
+    el('runBtn').disabled = false;
+    appendLine('[error] ' + err.message, 'error');
+  });
+}
+
+function openStream(jobId) {
+  ES = new EventSource('/api/run/' + jobId + '/stream');
+  ES.addEventListener('line', function (e) {
+    var p = JSON.parse(e.data);
+    appendLine(p.text, classifyClient(p.text));
+  });
+  ES.addEventListener('progress', function (e) {
+    var p = JSON.parse(e.data);
+    el('progressText').textContent = p.processed + ' / ' + (p.total || '?');
+    el('etaText').textContent = p.eta_sec != null ? ('ETA ' + fmtEta(p.eta_sec)) : '';
+    if (p.percent != null) setProgressPercent(p.percent); else setProgressIndeterminate(true);
+  });
+  ES.addEventListener('phase', function (e) {
+    var p = JSON.parse(e.data);
+    el('phaseText').textContent = p.phase + '…';
+    setProgressIndeterminate(true);
+  });
+  ES.addEventListener('error', function (e) {
+    try { var p = JSON.parse(e.data); if (p && p.message) appendLine('[error] ' + p.message, 'error'); } catch (err) {}
+  });
+  ES.addEventListener('done', function (e) {
+    var p = JSON.parse(e.data);
+    onDone(p);
+  });
+}
+
+function cancelRun() {
+  if (!CURRENT_JOB) return;
+  el('cancelBtn').disabled = true;
+  el('phaseText').textContent = 'Cancelling…';
+  fetch('/api/run/' + CURRENT_JOB + '/cancel', { method: 'POST' }).catch(function () {});
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Step 8: Result + reset
+   ════════════════════════════════════════════════════════════════ */
+function onDone(payload) {
+  if (ES) { ES.close(); ES = null; }
+  CURRENT_JOB = null;
+  el('cancelBtn').style.display = 'none';
+  el('cancelBtn').disabled = false;
+  el('runBtn').disabled = false;
+  setProgressIndeterminate(false);
+  setProgressPercent(payload.success ? 100 : (el('progressFill').style.width || '0%').replace('%', ''));
+  el('phaseText').textContent = '';
+
+  if (payload.success) { setStatus('success'); renderResultSuccess(payload); }
+  else { setStatus('failed'); renderResultFailure(payload); }
+}
+
+function renderResultSuccess(payload) {
+  var s = payload.summary || {};
+  var stats = [];
+  if (s.total_flights !== undefined) stats.push(['Valid flights', s.total_flights]);
+  if (s.filled_fixes !== undefined) stats.push(['Filled fixes', s.filled_fixes + ' into ' + s.filled_flights + ' flight(s)']);
+  if (s.points_in !== undefined && s.points_out !== undefined) {
+    stats.push(['Data reduction', s.points_in + ' → ' + s.points_out + ' pts' + (s.compression !== undefined ? ' (' + s.compression + '%)' : '')]);
+  }
+  if (s.connectors !== undefined) stats.push(['Inferred connectors', s.connectors]);
+  var outName = s.output ? baseOf(s.output) : (PARAMS.output_name || '');
+  stats.push(['Output', outName + (payload.output_size != null ? ' · ' + humanizeBytes(payload.output_size) : '')]);
+
+  el('resultPanel').style.display = '';
+  el('resultBody').innerHTML =
+    '<div class="result-glyph result-glyph--ok">✓</div>' +
+    '<div class="result-title">Run complete</div>' +
+    '<div class="result-stats">' + stats.map(function (r) {
+      return '<div class="result-stat"><span>' + escapeHtml(r[0]) + '</span><b>' + escapeHtml(String(r[1])) + '</b></div>';
+    }).join('') + '</div>' +
+    '<div class="result-actions">' +
+    '<button class="rb-btn rb-btn-ghost" id="revealBtn" type="button">Reveal in Finder</button>' +
+    '<button class="rb-btn rb-btn-solid" id="runAnotherBtn" type="button">Run another batch</button>' +
+    '</div>';
+  el('revealBtn').onclick = revealOutput;
+  el('runAnotherBtn').onclick = resetRunPanel;
+}
+function renderResultFailure(payload) {
+  var lines = el('consoleBox').querySelectorAll('.line');
+  var tail = Array.prototype.slice.call(lines).slice(-20).map(function (l) { return l.textContent; }).join('\n');
+  el('resultPanel').style.display = '';
+  el('resultBody').innerHTML =
+    '<div class="result-glyph result-glyph--fail">✗</div>' +
+    '<div class="result-title">Run failed' + (payload.exit_code != null ? ' (exit ' + payload.exit_code + ')' : '') + '</div>' +
+    (tail ? '<div class="result-tail">' + escapeHtml(tail) + '</div>' : '') +
+    '<div class="result-actions">' +
+    '<button class="rb-btn rb-btn-ghost" id="backBtn" type="button">Back to form</button>' +
+    '</div>';
+  el('backBtn').onclick = function () {
+    el('resultPanel').style.display = 'none';
+    setStatus('idle');
+  };
+}
+function revealOutput() {
+  if (!LAST_JOB_ID) return;
+  fetch('/api/run/' + LAST_JOB_ID + '/reveal', { method: 'POST' }).then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (data.status !== 'revealed') alert('Could not reveal the output' + (data.path ? ' (' + data.path + ')' : '') + '.');
+    }).catch(function () {});
+}
+function resetRunPanel() {
+  LAST_JOB_ID = null;
+  clearConsole();
+  el('consoleBox').innerHTML = '<div class="console-empty">Nothing has run yet.</div>';
+  el('resultPanel').style.display = 'none';
+  el('progressText').textContent = '—';
+  el('etaText').textContent = '';
+  setProgressPercent(0);
+  setStatus('idle');
+  if (lastBatchBasename) {
+    PARAMS.output_name = suggestName(lastBatchBasename, PARAMS);
+  } else {
+    PARAMS.output_name = '';
+  }
+  refreshFieldDisplay('output_name');
+  fetchOutputsList();
+  scheduleValidate();
+}
+</script>
+</body>
+</html>
