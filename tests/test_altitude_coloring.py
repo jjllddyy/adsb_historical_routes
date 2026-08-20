@@ -30,3 +30,35 @@ def test_alt_band_color_low_is_warm_high_is_cool():
     hr, hg, hb = int(high[6:8], 16), int(high[4:6], 16), int(high[2:4], 16)
     assert lr > lb          # low altitude reddish/warm
     assert hb > hr or hr > hg  # high altitude cool/magenta (blue or magenta dominant)
+
+
+from datetime import datetime, timedelta, timezone
+
+
+def _climb_segment(m):
+    base = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
+    pts = []
+    for i in range(12):
+        ts = (base + timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        pts.append(m.TrackPoint(ts, -80.0 + i * 0.1, 0.0 + i * 0.1, i * 1000.0))  # climb 0->11000m
+    return m.FlightSegment("AC1", "AC1", pts,
+                           m.Airport("A", 0.0, -80.0, 0), m.Airport("B", 1.1, -78.9, 0),
+                           "ff0000ff", "2", "ff", "t.kml")
+
+
+def test_altitude_mode_emits_multiple_band_colors(tmp_path):
+    seg = _climb_segment(m)
+    out = str(tmp_path / "alt.kml")
+    m.create_output_kml([seg], out, sample_minutes=0, color_mode="altitude", altitude_bands=24)
+    txt = open(out).read()
+    import re
+    colors = set(re.findall(r"<color>([0-9a-f]{8})</color>", txt))
+    assert len(colors) >= 3           # a climbing track spans several bands
+
+
+def test_source_mode_default_single_track(tmp_path):
+    seg = _climb_segment(m)
+    out = str(tmp_path / "src.kml")
+    m.create_output_kml([seg], out, sample_minutes=0)   # color_mode defaults to source
+    txt = open(out).read()
+    assert txt.count("<Placemark") == 1   # unchanged single-track behavior

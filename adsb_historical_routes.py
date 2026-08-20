@@ -1495,7 +1495,9 @@ def create_output_kml(flight_segments: List[FlightSegment], output_file: str,
                      stitch_gap_min: float = 5.0,
                      mark_sources: bool = False,
                      pos_color: str = "ff00a5ff",
-                     firehose_color: str = "ff00ff00"):
+                     firehose_color: str = "ff00ff00",
+                     color_mode: str = "source",
+                     altitude_bands: int = 24):
     """Create output KML file with organized folder structure.
 
     When ``stitch_gaps`` is True, each flight track is split at coverage gaps (an
@@ -1570,30 +1572,23 @@ def create_output_kml(flight_segments: List[FlightSegment], output_file: str,
             d += "Note: Contains data gaps\n"
         return d
 
-    def _runs_and_gaps(pts, gap_min, split_gaps):
-        """Split points into runs (each a same-source, contiguous stretch) plus the
-        (prev, next) pairs bracketing each real coverage gap.
-
-        A run break is forced at (a) a source change — so ADS-B / POS / firehose stretches
-        can be drawn in distinct colours — and (b) when ``split_gaps`` is True, an
-        inter-point time delta > ``gap_min`` minutes (a real coverage gap, recorded as a
-        connector). Consecutive non-gap runs share their boundary point so the coloured
-        lines stay visually joined across a source change. Each run is (points, source).
-        """
+    def _runs_and_gaps(pts, gap_min, split_gaps, key=lambda p: p.source):
+        """Split into runs (each a same-key contiguous stretch) plus real coverage gaps.
+        `key(point)` decides the grouping — data source (default) or altitude band."""
         runs, connectors = [], []
         cur = [pts[0]]
         for prev, p in zip(pts, pts[1:]):
             is_gap = split_gaps and (p.datetime - prev.datetime).total_seconds() / 60.0 > gap_min
             if is_gap:
-                runs.append((cur, cur[0].source))
+                runs.append((cur, key(cur[0])))
                 connectors.append((prev, p))
                 cur = [p]
-            elif p.source != prev.source:
-                runs.append((cur + [p], cur[0].source))  # overlap by one point -> lines stay joined
+            elif key(p) != key(prev):
+                runs.append((cur + [p], key(cur[0])))
                 cur = [p]
             else:
                 cur.append(p)
-        runs.append((cur, cur[0].source))
+        runs.append((cur, key(cur[0])))
         return runs, connectors
 
     def _add_track(parent, pts, color_text, width_text, name, desc_text):
@@ -1645,20 +1640,22 @@ def create_output_kml(flight_segments: List[FlightSegment], output_file: str,
                 seg_name = segment.get_segment_name() if show_labels else None
                 seg_desc = _segment_description(segment, sampled_points)
 
-                if (stitch_gaps or mark_sources) and len(sampled_points) >= 2:
-                    # Split into same-source runs (coloured by data source when mark_sources)
-                    # and, when stitch_gaps, real coverage gaps bridged by an inferred
-                    # straight-line connector. Gaps filled by POS/firehose data are real
-                    # runs in their source colour, not inferred connectors.
-                    src_color = {"ADSB": seg_color, "POS": pos_color, "FIREHOSE": firehose_color}
-                    runs, connectors = _runs_and_gaps(sampled_points, stitch_gap_min, stitch_gaps)
-                    for run, src in runs:
+                alt_mode = (color_mode == "altitude")
+                if (stitch_gaps or mark_sources or alt_mode) and len(sampled_points) >= 2:
+                    if alt_mode:
+                        keyf = lambda p: alt_band_index(p.alt, altitude_bands)
+                        colorf = lambda k: alt_band_color(k, altitude_bands)
+                    else:
+                        src_color = {"ADSB": seg_color, "POS": pos_color, "FIREHOSE": firehose_color}
+                        keyf = lambda p: p.source
+                        colorf = lambda k: (src_color.get(k, seg_color) if mark_sources else seg_color)
+                    runs, connectors = _runs_and_gaps(sampled_points, stitch_gap_min, stitch_gaps, key=keyf)
+                    for run, k in runs:
                         if len(run) >= 2:
-                            col = src_color.get(src, seg_color) if mark_sources else seg_color
                             nm = seg_name
-                            if seg_name and mark_sources and src != "ADSB":
-                                nm = seg_name + f" [{src.lower()}]"
-                            _add_track(route_folder, run, col, seg_width, nm, seg_desc)
+                            if seg_name and mark_sources and not alt_mode and k != "ADSB":
+                                nm = seg_name + f" [{str(k).lower()}]"
+                            _add_track(route_folder, run, colorf(k), seg_width, nm, seg_desc)
                     for a, b in connectors:
                         total_connectors += 1
                         _add_track(route_folder, [a, b], inferred_color, seg_width,
@@ -1701,7 +1698,9 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
                      firehose_folder: Optional[str] = None,
                      tail_icao_path: Optional[str] = None,
                      pos_color: str = "ff00a5ff",
-                     firehose_color: str = "ff00ff00"):
+                     firehose_color: str = "ff00ff00",
+                     color_mode: str = "source",
+                     altitude_bands: int = 24):
     """Main processing pipeline driven by a ConfidencePreset, emitting both KML and a diagnostics CSV."""
     routes_dict = {(r.origin, r.destination): r.avg_time_min for r in routes}
     recorder = DiagnosticsRecorder(output_file, preset_name=preset.name)
@@ -1797,7 +1796,8 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
         override_color, override_width, override_opacity,
         show_labels, show_icons, extend_to_ground,
         stitch_gaps, inferred_color, stitch_gap_min,
-        mark_sources=integrate_pos, pos_color=pos_color, firehose_color=firehose_color
+        mark_sources=integrate_pos, pos_color=pos_color, firehose_color=firehose_color,
+        color_mode=color_mode, altitude_bands=altitude_bands
     )
 
     recorder.write_csv()
@@ -1899,6 +1899,16 @@ def main():
                        help='KML AABBGGRR colour for ACARS POS-sourced track portions (default: ff00a5ff, orange).')
     parser.add_argument('--firehose-color', default='ff00ff00', dest='firehose_color',
                        help='KML AABBGGRR colour for firehose-sourced track portions (default: ff00ff00, green).')
+
+    parser.add_argument('--color-mode', choices=['source', 'altitude'], default='source',
+                        dest='color_mode',
+                        help='Line coloring: source (per data source, default) or altitude '
+                             '(ADS-B Exchange altitude gradient).')
+    parser.add_argument('--altitude-palette', choices=['adsbex'], default='adsbex',
+                        dest='altitude_palette',
+                        help='Altitude palette (default adsbex: ADS-B Exchange hue ramp).')
+    parser.add_argument('--altitude-bands', type=int, default=24, dest='altitude_bands',
+                        help='Number of altitude color bands (default 24).')
 
     # Confidence preset and per-knob overrides
     parser.add_argument('--confidence', choices=['strict', 'balanced', 'permissive'],
@@ -2026,6 +2036,8 @@ def main():
         tail_icao_path=args.tail_icao,
         pos_color=args.pos_color,
         firehose_color=args.firehose_color,
+        color_mode=args.color_mode,
+        altitude_bands=args.altitude_bands,
     )
     
     print("\nProcessing complete!")
