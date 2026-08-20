@@ -1,4 +1,7 @@
 import json, os, sys, shutil, tempfile
+import threading as _th
+import urllib.error as _err
+import urllib.request as _rq
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "route_builder"))
 import server  # noqa: E402
 
@@ -187,3 +190,73 @@ def test_runmanager_spawn_failure_emits_error_and_done_without_hanging():
     assert "error" in kinds and "done" in kinds
     assert "output_size" in done and done["output_size"] is None
     assert done["success"] is False
+
+
+def _start(tmp_path):
+    d = str(tmp_path)
+    shutil.copy(os.path.join(APPDIR, "manifest.default.json"),
+                os.path.join(d, "manifest.default.json"))
+    shutil.copy(os.path.join(APPDIR, "parameters.json"), os.path.join(d, "parameters.json"))
+    # index.html may not exist yet in this task; a stub keeps GET / happy
+    if not os.path.exists(os.path.join(d, "index.html")):
+        open(os.path.join(d, "index.html"), "w").write("<!doctype html><title>rb</title>")
+    srv = server.make_server(0, d, allowed_roots=[d])
+    port = srv.server_address[1]
+    t = _th.Thread(target=srv.serve_forever, daemon=True); t.start()
+    return srv, f"http://127.0.0.1:{port}"
+
+
+def _get(base, path):
+    return json.loads(_rq.urlopen(base + path).read())
+
+
+def test_http_config_browse_and_presets(tmp_path):
+    srv, base = _start(tmp_path)
+    try:
+        cfg = _get(base, "/api/config")
+        assert "presets" in cfg and "parameters" in cfg
+        # browse the temp dir
+        sub = os.path.join(str(tmp_path), "kml"); os.makedirs(sub)
+        open(os.path.join(sub, "x.kml"), "w").close()
+        br = _get(base, "/api/browse?path=" + _rq.quote(str(tmp_path)))
+        assert any(e["name"] == "kml" and e["type"] == "dir" for e in br["entries"])
+        # add a preset
+        req = _rq.Request(base + "/api/presets", method="POST",
+                          data=json.dumps({"name": "Mine", "params": {"sample": 3}}).encode(),
+                          headers={"Content-Type": "application/json"})
+        res = json.loads(_rq.urlopen(req).read())
+        assert any(p["name"] == "Mine" for p in res["presets"])
+    finally:
+        srv.shutdown()
+
+
+def test_http_delete_preset_user_ok_builtin_returns_409(tmp_path):
+    srv, base = _start(tmp_path)
+    try:
+        # add a user (non-builtin) preset, then delete it -> 200, removed
+        add_req = _rq.Request(base + "/api/presets", method="POST",
+                              data=json.dumps({"name": "Mine2", "params": {"sample": 4}}).encode(),
+                              headers={"Content-Type": "application/json"})
+        added = json.loads(_rq.urlopen(add_req).read())
+        assert any(p["name"] == "Mine2" for p in added["presets"])
+
+        del_req = _rq.Request(base + "/api/presets?name=" + _rq.quote("Mine2"), method="DELETE")
+        with _rq.urlopen(del_req) as resp:
+            assert resp.status == 200
+            body = json.loads(resp.read())
+        assert not any(p["name"] == "Mine2" for p in body["presets"])
+
+        # attempting to delete a built-in preset -> HTTP 409, preset still present
+        cfg = _get(base, "/api/config")
+        builtin_name = next(p["name"] for p in cfg["presets"] if p.get("builtin"))
+        bad_req = _rq.Request(base + "/api/presets?name=" + _rq.quote(builtin_name), method="DELETE")
+        try:
+            _rq.urlopen(bad_req)
+            assert False, "expected HTTPError with code 409"
+        except _err.HTTPError as e:
+            assert e.code == 409
+
+        cfg2 = _get(base, "/api/config")
+        assert any(p["name"] == builtin_name for p in cfg2["presets"])
+    finally:
+        srv.shutdown()

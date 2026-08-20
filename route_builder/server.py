@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """ADSB Historical Route Builder — stdlib-only local server. See EXTENSION_SPEC.md."""
+import argparse
 import json
 import os
 import queue
@@ -9,7 +10,10 @@ import subprocess
 import threading
 import time
 import uuid
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse, parse_qs, unquote
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -313,3 +317,195 @@ class RunManager:
     def get(self, jid: str) -> Optional[dict]:
         """Return the raw job dict for jid, or None if it doesn't exist."""
         return self._jobs.get(jid)
+
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def browse(path: str, allowed_roots: List[str]) -> Dict[str, Any]:
+    """List one directory's contents (confined to allowed_roots) for the folder picker."""
+    rp = confine_path(path, allowed_roots)
+    entries = []
+    for e in sorted(os.scandir(rp), key=lambda x: (x.is_file(), x.name.lower())):
+        if e.name.startswith("."):
+            continue
+        if e.is_dir():
+            entries.append({"name": e.name, "type": "dir", "kml_count": _count_kml(e.path)})
+        else:
+            ext = e.name.rsplit(".", 1)[-1].lower() if "." in e.name else ""
+            kind = {"kml": "kml", "csv": "csv", "json": "json"}.get(ext, "other")
+            entries.append({"name": e.name, "type": "file", "kind": kind,
+                            "size": e.stat().st_size})
+    parent = os.path.dirname(rp)
+    return {"path": rp, "parent": parent if parent != rp else None, "entries": entries}
+
+
+def list_outputs(dir_path: str, allowed_roots: List[str]) -> Dict[str, Any]:
+    """List .kml files in a completed-run's output directory."""
+    rp = confine_path(dir_path, allowed_roots)
+    files = [{"name": e.name, "size": e.stat().st_size}
+             for e in os.scandir(rp) if e.is_file() and e.name.endswith(".kml")]
+    return {"files": sorted(files, key=lambda f: f["name"])}
+
+
+def make_server(port: int, app_dir: str = APP_DIR,
+                 allowed_roots: Optional[List[str]] = None) -> ThreadingHTTPServer:
+    """Build a configured (not-yet-serving) ThreadingHTTPServer bound to 127.0.0.1:port."""
+    manifest = load_manifest(app_dir)
+    roots = allowed_roots or manifest["roots"]["allowed_roots"]
+    with open(os.path.join(app_dir, "parameters.json")) as f:
+        params_catalog = json.load(f)
+    runs = RunManager()
+
+    def man_input(_dir: str) -> str:
+        return load_manifest(_dir)["roots"]["input_default"]
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a: Any) -> None:
+            pass
+
+        def _send(self, code: int, obj: Any = None, ctype: str = "application/json") -> None:
+            body = b"" if obj is None else (obj if isinstance(obj, bytes)
+                                            else json.dumps(obj).encode())
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def _body(self) -> Any:
+            n = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(n) or b"{}")
+
+        def do_GET(self) -> None:
+            u = urlparse(self.path)
+            q = parse_qs(u.query)
+            try:
+                if u.path == "/":
+                    with open(os.path.join(app_dir, "index.html"), "rb") as f:
+                        return self._send(200, f.read(), "text/html; charset=utf-8")
+                if u.path == "/parameters.json":
+                    return self._send(200, params_catalog)
+                if u.path == "/api/config":
+                    man = load_manifest(app_dir)
+                    return self._send(200, {"roots": man["roots"], "defaults": man["defaults"],
+                                            "presets": man["presets"], "parameters": params_catalog})
+                if u.path == "/api/browse":
+                    path = unquote(q.get("path", [man_input(app_dir)])[0])
+                    return self._send(200, browse(path, roots))
+                if u.path == "/api/outputs":
+                    return self._send(200, list_outputs(unquote(q["dir"][0]), roots))
+                if u.path.startswith("/api/run/") and u.path.endswith("/stream"):
+                    return self._stream(u.path.split("/")[3])
+                return self._send(404, {"error": "not found"})
+            except PermissionError as e:
+                return self._send(403, {"error": str(e)})
+            except Exception as e:
+                return self._send(400, {"error": str(e)})
+
+        def do_POST(self) -> None:
+            u = urlparse(self.path)
+            try:
+                if u.path == "/api/validate":
+                    return self._send(200, validate(self._body(), roots))
+                if u.path == "/api/presets":
+                    return self._send(200, self._add_preset(self._body()))
+                if u.path == "/api/run":
+                    params = self._body()
+                    v = validate(params, roots)
+                    if v["errors"]:
+                        return self._send(400, {"error": "; ".join(v["errors"])})
+                    for p in params.get("kml_folder", "") and [params["kml_folder"]] or []:
+                        confine_path(p, roots)
+                    jid = runs.start(build_argv(params), total_files=v["kml_count"])
+                    return self._send(200, {"job_id": jid})
+                if u.path.startswith("/api/run/") and u.path.endswith("/cancel"):
+                    runs.cancel(u.path.split("/")[3]); return self._send(200, {"status": "cancelled"})
+                if u.path.startswith("/api/run/") and u.path.endswith("/reveal"):
+                    return self._reveal(u.path.split("/")[3])
+                return self._send(404, {"error": "not found"})
+            except PermissionError as e:
+                return self._send(403, {"error": str(e)})
+            except Exception as e:
+                return self._send(400, {"error": str(e)})
+
+        def do_DELETE(self) -> None:
+            u = urlparse(self.path)
+            q = parse_qs(u.query)
+            if u.path == "/api/presets":
+                name = unquote(q.get("name", [""])[0])
+                man = load_manifest(app_dir)
+                tgt = [p for p in man["presets"] if p["name"] == name]
+                if tgt and tgt[0].get("builtin"):
+                    return self._send(409, {"error": "cannot delete a built-in preset"})
+                return self._send(200, self._del_preset(name))
+            return self._send(404, {"error": "not found"})
+
+        def _add_preset(self, body: Dict[str, Any]) -> Dict[str, Any]:
+            man = load_manifest(app_dir)
+            name = body.get("name", "").strip()
+            if not name:
+                raise ValueError("preset name required")
+            man["presets"] = [p for p in man["presets"] if p["name"] != name or p.get("builtin")]
+            if any(p["name"] == name and p.get("builtin") for p in man["presets"]):
+                raise ValueError("cannot overwrite a built-in preset")
+            man["presets"].append({"name": name, "params": body.get("params", {})})
+            save_manifest(app_dir, man)
+            return {"presets": man["presets"]}
+
+        def _del_preset(self, name: str) -> Dict[str, Any]:
+            # Callers (do_DELETE) must already have rejected built-in presets with a 409;
+            # this only mutates + saves + returns, so exactly one HTTP response is ever sent.
+            man = load_manifest(app_dir)
+            man["presets"] = [p for p in man["presets"] if p["name"] != name]
+            save_manifest(app_dir, man)
+            return {"presets": man["presets"]}
+
+        def _stream(self, jid: str) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            try:
+                for name, payload in runs.events(jid):
+                    chunk = f"event: {name}\ndata: {json.dumps(payload)}\n\n".encode()
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def _reveal(self, jid: str) -> None:
+            job = runs.get(jid)
+            out = (job or {}).get("summary", {}).get("output")
+            if out and os.path.exists(out) and shutil.which("open"):
+                subprocess.Popen(["open", "-R", out], shell=False)
+                return self._send(200, {"status": "revealed"})
+            return self._send(200, {"status": "unavailable", "path": out})
+
+    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="ADSB Historical Route Builder server")
+    ap.add_argument("--port", type=int, default=None)
+    ap.add_argument("--open", action="store_true")
+    args = ap.parse_args()
+    manifest = load_manifest(APP_DIR)
+    port = args.port or manifest.get("server", {}).get("port", 8765)
+    try:
+        srv = make_server(port, APP_DIR)
+    except OSError as e:
+        raise SystemExit(f"Could not bind 127.0.0.1:{port} ({e}). Try --port <other>.")
+    url = f"http://127.0.0.1:{port}"
+    print(f"ADSB Historical Route Builder → {url}  (Ctrl-C to stop)")
+    if args.open:
+        webbrowser.open(url)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping.")
+
+
+if __name__ == "__main__":
+    main()
