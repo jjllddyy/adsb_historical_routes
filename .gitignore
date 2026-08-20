@@ -27,3 +27,6 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Route Builder runtime state (seeded from manifest.default.json on first run)
+route_builder/manifest.json
