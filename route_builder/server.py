@@ -2,6 +2,7 @@
 """ADSB Historical Route Builder — stdlib-only local server. See EXTENSION_SPEC.md."""
 import json
 import os
+import re
 import shutil
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -107,3 +108,41 @@ def suggest_name(batch_stem, params):
     if params.get("color_mode") == "altitude":
         stem += "_altcolor"
     return stem + ".kml"
+
+
+_PHASE_PREFIXES = ("Loading extra position sources", "Combining segments by aircraft",
+                   "Creating output KML", "Position-source integration:")
+
+
+def classify_line(line):
+    s = line.strip()
+    if s.startswith("Processing:"):
+        return ("progress", s)
+    for p in _PHASE_PREFIXES:
+        if s.startswith(p):
+            return ("phase", p.rstrip(":. "))
+    return ("raw", s)
+
+
+def parse_summary(text):
+    out = {}
+    def grab(pat, cast=str):
+        mm = re.search(pat, text)
+        return cast(mm.group(1).replace(",", "")) if mm else None
+    for key, pat, cast in [
+        ("total_flights", r"TOTAL VALID COMPLETE FLIGHTS:\s*(\d+)", int),
+        ("output", r"Output written to:\s*(.+)", str),
+        ("points_in", r"Data reduction:\s*(\d+) points", int),
+        ("points_out", r"Data reduction:\s*\d+ points -> (\d+) points", int),
+        ("compression", r"Compression ratio:\s*([\d.]+)%", float),
+        ("connectors", r"Gap stitching:\s*(\d+) inferred connector", int),
+    ]:
+        v = grab(pat, cast)
+        if v is not None:
+            out[key] = v.strip() if isinstance(v, str) else v
+    mm = re.search(r"filled ([\d,]+) real fix\(es\) into (\d+) of (\d+) flights", text)
+    if mm:
+        out["filled_fixes"] = int(mm.group(1).replace(",", ""))
+        out["filled_flights"] = int(mm.group(2))
+        out["total_flights"] = int(mm.group(3))
+    return out

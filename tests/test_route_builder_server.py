@@ -84,3 +84,30 @@ def test_suggest_name_suffixes():
         == "jat_routes_2026_jun-jul_stitched.kml"
     n = server.suggest_name("jat_2026_jun-jul", {"integrate_pos": True, "color_mode": "altitude"})
     assert n.endswith("_pos_altcolor.kml")
+
+
+SAMPLE_STDOUT = """Processing: e80600_2026-07-01_baro_avg.kml (Aircraft: E80600)
+Loading extra position sources (this reads many small files)...
+Combining segments by aircraft...
+Creating output KML...
+TOTAL VALID COMPLETE FLIGHTS: 5607
+Position-source integration: filled 340,298 real fix(es) into 3356 of 5607 flights
+Output written to: output/jat.kml
+Data reduction: 2059367 points -> 183302 points
+Compression ratio: 8.9%
+"""
+
+
+def test_parse_summary_extracts_fields():
+    s = server.parse_summary(SAMPLE_STDOUT)
+    assert s["total_flights"] == 5607
+    assert s["filled_fixes"] == 340298 and s["filled_flights"] == 3356
+    assert s["output"].endswith("jat.kml")
+    assert s["points_in"] == 2059367 and s["points_out"] == 183302
+    assert s["compression"] == 8.9
+
+
+def test_classify_line():
+    assert server.classify_line("Processing: x.kml (Aircraft: E1)")[0] == "progress"
+    assert server.classify_line("Creating output KML...")[0] == "phase"
+    assert server.classify_line("random noise")[0] == "raw"
