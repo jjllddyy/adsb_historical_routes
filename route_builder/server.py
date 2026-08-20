@@ -146,3 +146,78 @@ def parse_summary(text):
         out["filled_flights"] = int(mm.group(2))
         out["total_flights"] = int(mm.group(3))
     return out
+
+
+def _count_kml(folder):
+    try:
+        return sum(1 for e in os.scandir(folder) if e.is_file() and e.name.endswith(".kml"))
+    except OSError:
+        return 0
+
+
+def _count_csv_rows(path):
+    try:
+        with open(path) as f:
+            return max(0, sum(1 for _ in f) - 1)   # minus header
+    except OSError:
+        return 0
+
+
+def validate(params, allowed_roots):
+    errors, warnings = [], []
+
+    def ok(path, label):
+        if not path:
+            errors.append(f"{label} not selected")
+            return None
+        try:
+            rp = confine_path(path, allowed_roots)
+        except PermissionError:
+            errors.append(f"{label} is outside the allowed folders")
+            return None
+        if not os.path.exists(rp):
+            errors.append(f"{label} not found: {path}")
+            return None
+        return rp
+
+    kml_count = 0
+    if params.get("kml_files"):
+        kml_count = len(params["kml_files"])
+    else:
+        kf = ok(params.get("kml_folder"), "Input KML folder")
+        if kf:
+            kml_count = _count_kml(kf)
+            if kml_count == 0:
+                errors.append("Input folder contains no .kml files")
+    ap = ok(params.get("airports"), "Airports CSV")
+    rt = ok(params.get("routes"), "Routes CSV")
+
+    tail_count = 0
+    if params.get("integrate_pos"):
+        if not params.get("tail_icao"):
+            errors.append("Integrate positions is on but no tail<->icao CSV is set")
+        if not (params.get("pos_folder") or params.get("firehose_folder")):
+            errors.append("Integrate positions is on but no POS or firehose folder is set")
+        ti = ok(params.get("tail_icao"), "Tail<->ICAO CSV") if params.get("tail_icao") else None
+        tail_count = _count_csv_rows(ti) if ti else 0
+
+    out_path = os.path.join(params.get("output_dir", ""), params.get("output_name", ""))
+    if not params.get("output_name"):
+        errors.append("Output filename not set")
+    output_exists = bool(out_path) and os.path.exists(out_path)
+    if output_exists:
+        warnings.append("Output file already exists and will be overwritten")
+    if params.get("color_mode") == "altitude" and params.get("color"):
+        warnings.append("Line-color override is ignored in altitude color mode")
+
+    return {
+        "kml_count": kml_count,
+        "airports_count": _count_csv_rows(ap) if ap else 0,
+        "routes_count": _count_csv_rows(rt) if rt else 0,
+        "tail_icao_count": tail_count,
+        "output_path": out_path,
+        "output_exists": output_exists,
+        "argv": build_argv(params),
+        "warnings": warnings,
+        "errors": errors,
+    }

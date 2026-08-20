@@ -111,3 +111,27 @@ def test_classify_line():
     assert server.classify_line("Processing: x.kml (Aircraft: E1)")[0] == "progress"
     assert server.classify_line("Creating output KML...")[0] == "phase"
     assert server.classify_line("random noise")[0] == "raw"
+
+
+def _csv(path, header, rows):
+    with open(path, "w") as f:
+        f.write(header + "\n" + "\n".join(rows) + "\n")
+
+
+def test_validate_counts_and_errors(tmp_path):
+    root = str(tmp_path)
+    kdir = os.path.join(root, "kml"); os.makedirs(kdir)
+    for n in ("a.kml", "b.kml", "c.kml"):
+        open(os.path.join(kdir, n), "w").close()
+    ap = os.path.join(root, "ap.csv"); _csv(ap, "airport,latitude,longitude,elevation_ft",
+                                             ["AAA,0,0,0", "BBB,1,1,1"])
+    rt = os.path.join(root, "rt.csv"); _csv(rt, "origin,destination,avg_enroute_min",
+                                             ["AAA,BBB,60"])
+    params = {"kml_folder": kdir, "airports": ap, "routes": rt,
+              "output_dir": root, "output_name": "o.kml"}
+    v = server.validate(params, [root])
+    assert v["kml_count"] == 3 and v["airports_count"] == 2 and v["routes_count"] == 1
+    assert v["output_exists"] is False and not v["errors"]
+    # missing airports -> error
+    v2 = server.validate({**params, "airports": os.path.join(root, "nope.csv")}, [root])
+    assert any("airport" in e.lower() for e in v2["errors"])
