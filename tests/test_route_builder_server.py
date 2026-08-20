@@ -197,6 +197,66 @@ def test_validate_rejects_output_dir_outside_allowed_roots(tmp_path):
         shutil.rmtree(outside_dir, ignore_errors=True)
 
 
+def test_validate_rejects_pos_and_firehose_folders_outside_allowed_roots(tmp_path):
+    root = str(tmp_path)
+    kdir = os.path.join(root, "kml"); os.makedirs(kdir)
+    open(os.path.join(kdir, "a.kml"), "w").close()
+    ap = os.path.join(root, "ap.csv"); _csv(ap, "airport,latitude,longitude,elevation_ft",
+                                             ["AAA,0,0,0", "BBB,1,1,1"])
+    rt = os.path.join(root, "rt.csv"); _csv(rt, "origin,destination,avg_enroute_min",
+                                             ["AAA,BBB,60"])
+    ti = os.path.join(root, "tail.csv"); _csv(ti, "tail,icao", ["N1,ABC123"])
+    outside_dir = tempfile.mkdtemp()
+    try:
+        base_params = {"kml_folder": kdir, "airports": ap, "routes": rt,
+                       "output_dir": root, "output_name": "o.kml",
+                       "integrate_pos": True, "tail_icao": ti}
+        # pos_folder outside allowed_roots -> error
+        v = server.validate({**base_params, "pos_folder": outside_dir}, [root])
+        assert v["errors"]
+        assert any("POS folder is outside the allowed folders" in e for e in v["errors"])
+        # firehose_folder outside allowed_roots -> error
+        v2 = server.validate({**base_params, "firehose_folder": outside_dir}, [root])
+        assert v2["errors"]
+        assert any("Firehose folder is outside the allowed folders" in e for e in v2["errors"])
+    finally:
+        shutil.rmtree(outside_dir, ignore_errors=True)
+
+
+def test_validate_rejects_unsafe_output_name(tmp_path):
+    root = str(tmp_path)
+    kdir = os.path.join(root, "kml"); os.makedirs(kdir)
+    open(os.path.join(kdir, "a.kml"), "w").close()
+    ap = os.path.join(root, "ap.csv"); _csv(ap, "airport,latitude,longitude,elevation_ft",
+                                             ["AAA,0,0,0", "BBB,1,1,1"])
+    rt = os.path.join(root, "rt.csv"); _csv(rt, "origin,destination,avg_enroute_min",
+                                             ["AAA,BBB,60"])
+    base_params = {"kml_folder": kdir, "airports": ap, "routes": rt, "output_dir": root}
+
+    v = server.validate({**base_params, "output_name": "../x.kml"}, [root])
+    assert any("plain filename" in e.lower() for e in v["errors"])
+
+    v2 = server.validate({**base_params, "output_name": "/tmp/x.kml"}, [root])
+    assert any("plain filename" in e.lower() for e in v2["errors"])
+
+    v3 = server.validate({**base_params, "output_name": "x.kml"}, [root])
+    assert not any("plain filename" in e.lower() for e in v3["errors"])
+
+
+def test_validate_rejects_zero_altitude_bands(tmp_path):
+    root = str(tmp_path)
+    kdir = os.path.join(root, "kml"); os.makedirs(kdir)
+    open(os.path.join(kdir, "a.kml"), "w").close()
+    ap = os.path.join(root, "ap.csv"); _csv(ap, "airport,latitude,longitude,elevation_ft",
+                                             ["AAA,0,0,0", "BBB,1,1,1"])
+    rt = os.path.join(root, "rt.csv"); _csv(rt, "origin,destination,avg_enroute_min",
+                                             ["AAA,BBB,60"])
+    params = {"kml_folder": kdir, "airports": ap, "routes": rt,
+              "output_dir": root, "output_name": "o.kml", "altitude_bands": 0}
+    v = server.validate(params, [root])
+    assert any("altitude bands" in e.lower() for e in v["errors"])
+
+
 def test_runmanager_streams_and_parses(tmp_path):
     fake = os.path.join(str(tmp_path), "fake.py")
     with open(fake, "w") as f:

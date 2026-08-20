@@ -5,7 +5,7 @@
     "airports_dir": "input",
     "routes_dir": "input",
     "output_default": "output",
-    "allowed_roots": ["~/Git/kml", "."]
+    "allowed_roots": ["~/Git/kml", ".", "/Volumes/jy-ext"]
   },
   "server": { "port": 8765 },
   "defaults": {

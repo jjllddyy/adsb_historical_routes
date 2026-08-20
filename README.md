@@ -308,8 +308,9 @@ KML colors are **`AABBGGRR`** (alpha, blue, green, red) — **not** RGB. Example
 hue ramp as **ADS-B Exchange**: near ground level renders **orange**, climbing through
 yellow → green → cyan as altitude increases, cruise altitudes render **blue**, and the highest
 bands (35,000–40,000+ ft) render **violet/magenta**. Each track is split into
-`--altitude-bands` (default `24`) discrete color steps rather than a continuous gradient, so
-file size stays similar to source-mode output.
+`--altitude-bands` (default `24`) discrete color steps rather than a continuous gradient. Altitude
+mode adds a placemark per altitude-band transition along each track, so output files grow modestly
+compared to source-mode output.
 
 ```bash
 python3 adsb_historical_routes.py ... --color-mode altitude --altitude-bands 24

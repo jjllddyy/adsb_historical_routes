@@ -216,6 +216,16 @@ def validate(params: Dict[str, Any], allowed_roots: List[str]) -> Dict[str, Any]
             errors.append("Integrate positions is on but no tail<->icao CSV is set")
         if not (params.get("pos_folder") or params.get("firehose_folder")):
             errors.append("Integrate positions is on but no POS or firehose folder is set")
+        if params.get("pos_folder"):
+            try:
+                confine_path(params["pos_folder"], allowed_roots)
+            except PermissionError:
+                errors.append("ACARS POS folder is outside the allowed folders")
+        if params.get("firehose_folder"):
+            try:
+                confine_path(params["firehose_folder"], allowed_roots)
+            except PermissionError:
+                errors.append("Firehose folder is outside the allowed folders")
         ti = ok(params.get("tail_icao"), "Tail<->ICAO CSV") if params.get("tail_icao") else None
         tail_count = _count_csv_rows(ti) if ti else 0
 
@@ -229,11 +239,15 @@ def validate(params: Dict[str, Any], allowed_roots: List[str]) -> Dict[str, Any]
     out_path = os.path.join(params.get("output_dir", ""), params.get("output_name", ""))
     if not params.get("output_name"):
         errors.append("Output filename not set")
+    elif os.path.basename(params["output_name"]) != params["output_name"]:
+        errors.append("Output filename must be a plain filename, not a path")
     output_exists = bool(out_path) and os.path.exists(out_path)
     if output_exists:
         warnings.append("Output file already exists and will be overwritten")
     if params.get("color_mode") == "altitude" and params.get("color"):
         warnings.append("Line-color override is ignored in altitude color mode")
+    if params.get("altitude_bands") is not None and params["altitude_bands"] < 1:
+        errors.append("Altitude bands must be >= 1")
 
     return {
         "kml_count": kml_count,
@@ -394,8 +408,23 @@ def make_server(port: int, app_dir: str = APP_DIR,
             n = int(self.headers.get("Content-Length", 0))
             return json.loads(self.rfile.read(n) or b"{}")
 
+        def _check_host(self) -> bool:
+            """Reject (with a 403) any request whose Host header isn't localhost/127.0.0.1.
+
+            Defense-in-depth against DNS-rebinding-style requests reaching this
+            loopback-only server with a spoofed Host header. Returns False (after
+            already sending the 403) when the request should not be dispatched.
+            """
+            host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+            if host not in ("127.0.0.1", "localhost"):
+                self._send(403, {"error": "invalid host header"})
+                return False
+            return True
+
         def do_GET(self) -> None:
             """Route GET requests: static assets, config/browse/outputs reads, and SSE stream."""
+            if not self._check_host():
+                return
             u = urlparse(self.path)
             q = parse_qs(u.query)
             try:
@@ -423,6 +452,8 @@ def make_server(port: int, app_dir: str = APP_DIR,
 
         def do_POST(self) -> None:
             """Route POST requests: validate, preset add, run start/cancel/reveal."""
+            if not self._check_host():
+                return
             u = urlparse(self.path)
             try:
                 if u.path == "/api/validate":
@@ -448,6 +479,8 @@ def make_server(port: int, app_dir: str = APP_DIR,
 
         def do_DELETE(self) -> None:
             """Route DELETE requests: remove a user preset (409 if it's a built-in)."""
+            if not self._check_host():
+                return
             u = urlparse(self.path)
             q = parse_qs(u.query)
             if u.path == "/api/presets":
