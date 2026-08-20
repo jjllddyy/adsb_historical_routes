@@ -1423,6 +1423,64 @@ class DiagnosticsRecorder:
         print(f"Diagnostics written to: {self.csv_path}")
 
 
+# --- Altitude color palette (ADS-B Exchange / tar1090 style) -----------------
+# (altitude_ft, hue_deg); fixed saturation 85%, lightness 50%.
+ADSBEX_ALT_STOPS = [
+    (0, 20), (2000, 40), (4000, 55), (6000, 70), (8000, 100),
+    (10000, 140), (20000, 190), (30000, 240), (35000, 275), (40000, 300),
+]
+
+
+def hsl_to_rgb(h, s, l):
+    """HSL (h in [0,360), s/l in [0,100]) -> (r, g, b) ints 0-255."""
+    h = h % 360.0
+    s /= 100.0
+    l /= 100.0
+    c = (1 - abs(2 * l - 1)) * s
+    x = c * (1 - abs((h / 60.0) % 2 - 1))
+    mm = l - c / 2
+    if h < 60:    rp, gp, bp = c, x, 0
+    elif h < 120: rp, gp, bp = x, c, 0
+    elif h < 180: rp, gp, bp = 0, c, x
+    elif h < 240: rp, gp, bp = 0, x, c
+    elif h < 300: rp, gp, bp = x, 0, c
+    else:         rp, gp, bp = c, 0, x
+    return (round((rp + mm) * 255), round((gp + mm) * 255), round((bp + mm) * 255))
+
+
+def alt_hue(alt_ft, stops=ADSBEX_ALT_STOPS):
+    """Interpolate the palette hue (deg) for an altitude in feet; clamped to the ends."""
+    if alt_ft <= stops[0][0]:
+        return float(stops[0][1])
+    if alt_ft >= stops[-1][0]:
+        return float(stops[-1][1])
+    for (a0, h0), (a1, h1) in zip(stops, stops[1:]):
+        if a0 <= alt_ft <= a1:
+            t = (alt_ft - a0) / (a1 - a0) if a1 > a0 else 0.0
+            return h0 + t * (h1 - h0)
+    return float(stops[-1][1])
+
+
+def rgb_to_kml(r, g, b, a=255):
+    """(r,g,b[,a]) 0-255 -> KML AABBGGRR hex string."""
+    return f"{a:02x}{b:02x}{g:02x}{r:02x}"
+
+
+def alt_band_index(alt_m, bands):
+    """Altitude in meters -> band index in [0, bands) over 0..top-of-palette (ft)."""
+    top_ft = ADSBEX_ALT_STOPS[-1][0]
+    alt_ft = max(0.0, alt_m / 0.3048)
+    return min(bands - 1, int(min(alt_ft, top_ft) / top_ft * bands))
+
+
+def alt_band_color(band, bands):
+    """Band index -> banded ADS-B-Exchange KML color (AABBGGRR) at the band center."""
+    top_ft = ADSBEX_ALT_STOPS[-1][0]
+    center_ft = (band + 0.5) / bands * top_ft
+    r, g, b = hsl_to_rgb(alt_hue(center_ft), 85, 50)
+    return rgb_to_kml(r, g, b)
+
+
 def create_output_kml(flight_segments: List[FlightSegment], output_file: str,
                      group_by: str = "destination",
                      sample_minutes: float = 2.0,
