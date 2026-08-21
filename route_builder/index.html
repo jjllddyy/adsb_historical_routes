@@ -1220,19 +1220,49 @@ function setStatus(state) {
   el('statusText').textContent = { idle: 'Idle', running: 'Running', success: 'Success', failed: 'Failed' }[state] || state;
 }
 
+// The console is a live tail: buffer incoming lines and flush them to the DOM in
+// batches (one DocumentFragment on a timer), capped to the last MAX_CONSOLE_LINES.
+// A big run emits tens of thousands of stdout lines; appending each one live (with a
+// forced reflow per line) locks up the tab. The full stdout is still parsed
+// server-side for the final summary, so dropping older lines here is safe.
+var CONSOLE_PENDING = [];
+var CONSOLE_FLUSH_TIMER = null;
+var MAX_CONSOLE_LINES = 500;
+
 function clearConsole() {
+  if (CONSOLE_FLUSH_TIMER) { clearTimeout(CONSOLE_FLUSH_TIMER); CONSOLE_FLUSH_TIMER = null; }
+  CONSOLE_PENDING.length = 0;
   el('consoleBox').innerHTML = '';
 }
 function appendLine(text, kind) {
+  CONSOLE_PENDING.push({ text: text, kind: kind });
+  // Keep the buffer bounded even if flushes fall behind — we only ever render the tail.
+  if (CONSOLE_PENDING.length > MAX_CONSOLE_LINES) {
+    CONSOLE_PENDING.splice(0, CONSOLE_PENDING.length - MAX_CONSOLE_LINES);
+  }
+  if (!CONSOLE_FLUSH_TIMER) CONSOLE_FLUSH_TIMER = setTimeout(flushConsole, 120);
+}
+function flushConsole() {
+  CONSOLE_FLUSH_TIMER = null;
+  if (!CONSOLE_PENDING.length) return;
   var box = el('consoleBox');
   var empty = box.querySelector('.console-empty');
   if (empty) empty.remove();
-  var div = document.createElement('div');
-  div.className = 'line';
-  div.dataset.kind = kind;
-  div.textContent = text;
   var nearBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
-  box.appendChild(div);
+  var frag = document.createDocumentFragment();
+  for (var i = 0; i < CONSOLE_PENDING.length; i++) {
+    var item = CONSOLE_PENDING[i];
+    var div = document.createElement('div');
+    div.className = 'line';
+    div.dataset.kind = item.kind;
+    div.textContent = item.text;
+    frag.appendChild(div);
+  }
+  CONSOLE_PENDING.length = 0;
+  box.appendChild(frag);
+  // Cap the rendered tail: drop the oldest line nodes beyond MAX_CONSOLE_LINES.
+  var extra = box.childElementCount - MAX_CONSOLE_LINES;
+  while (extra-- > 0 && box.firstChild) box.removeChild(box.firstChild);
   if (nearBottom) box.scrollTop = box.scrollHeight;
 }
 function classifyClient(text) {
@@ -1317,6 +1347,7 @@ function cancelRun() {
    ════════════════════════════════════════════════════════════════ */
 function onDone(payload) {
   if (ES) { ES.close(); ES = null; }
+  flushConsole();   // render any buffered tail (incl. the final summary lines)
   CURRENT_JOB = null;
   el('cancelBtn').style.display = 'none';
   el('cancelBtn').disabled = false;
