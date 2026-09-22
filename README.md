@@ -43,6 +43,10 @@ Prefer a form over a terminal? `route_builder/` ships a local, browser-based GUI
 this exact script — every field in it maps directly to an `adsb_historical_routes.py` flag
 documented below, so the CLI reference doubles as the GUI's field reference.
 
+> 📖 **New to the tool? Start with the [User Guide](docs/USER_GUIDE.md)** — a step-by-step
+> walk-through of the GUI, every setting with recommendations, worked examples, and the
+> **two-file rule** (which files go in the Airports / Routes fields — the most common mistake).
+
 **Launch it:**
 - Double-click `route_builder/Route Builder.command` in Finder, **or**
 - `python3 route_builder/server.py --open` from a terminal (`--open` opens your browser
@@ -212,8 +216,8 @@ records use the current `SPJC`. Add rows as new mismatches are found.
 |---|---|---|
 | `--kml-folder` | *(one of folder/files required)* | Folder of `*.kml` track files (one per tail/day typical). |
 | `--kml-files` | *(one of folder/files required)* | Explicit list of KML files (space-separated). |
-| `--airports` | *required* | Airports CSV: `airport,latitude,longitude,elevation_ft` (ICAO). |
-| `--routes` | *required* | Routes CSV: `origin,destination,avg_enroute_min` (ICAO). |
+| `--airports` | *required* | The generated per-airline airports CSV: `airport,latitude,longitude,elevation_ft` (ICAO) — from `build_cirium_inputs.py`. **Not** the OurAirports `Airports_*.txt` database, and **not** the raw Cirium export. |
+| `--routes` | *required* | The generated per-airline route-time CSV: `origin,destination,avg_enroute_min` (ICAO) — from `build_cirium_inputs.py`. **Not** the raw Cirium schedule export. |
 | `--output` | *required* | Output KML path (parent dir auto-created; a `.diagnostics.csv` sidecar is written next to it). |
 
 **Detection & sampling**
