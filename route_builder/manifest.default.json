@@ -5,6 +5,7 @@
     "airports_dir": "input",
     "routes_dir": "input",
     "output_default": "output",
+    "airport_lookup_dir": "~/Git/conversion_tools/airport_lookup",
     "allowed_roots": ["~/Git/kml", ".", "/Volumes/jy-ext"]
   },
   "server": { "port": 8765 },

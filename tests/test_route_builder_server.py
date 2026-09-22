@@ -361,3 +361,71 @@ def test_http_delete_preset_user_ok_builtin_returns_409(tmp_path):
         assert any(p["name"] == builtin_name for p in cfg2["presets"])
     finally:
         srv.shutdown()
+
+
+# ── Cirium input builder (second tool) ─────────────────────────────────────────
+
+BUILD_STDOUT_READY = """Airport overrides applied: 1 from airport_overrides.csv (LIM)
+============================================================
+Cirium input build report
+============================================================
+Source rows read:        232
+Routes written:          116
+Airports written:        30
+Routes dropped (no map): 0
+
+VERDICT: READY — both files complete; adsb_historical_routes.py can run.
+============================================================
+"""
+
+BUILD_STDOUT_NEEDS = """Source rows read:        232
+Routes written:          100
+Airports written:        28
+
+VERDICT: NEEDS INPUT — 2 unmapped IATA code(s).
+============================================================
+"""
+
+
+def test_build_cirium_argv():
+    argv = server.build_cirium_argv(
+        {"cirium_input": "/in/poe.csv", "output_dir": "/repo/input", "output_prefix": "poe_2026"},
+        airport_lookup_dir="/tools/airport_lookup", airport_override="/repo/airport_overrides.csv")
+    assert argv[:3] == ["python3", "-u", server.BUILD_SCRIPT] or argv[1] == "-u"
+    assert "--input" in argv and "/in/poe.csv" in argv
+    i = argv.index("--output")
+    assert argv[i + 1] == "/repo/input/poe_2026"
+    assert argv[argv.index("--airport-lookup-dir") + 1] == "/tools/airport_lookup"
+    assert argv[argv.index("--airport-override") + 1] == "/repo/airport_overrides.csv"
+
+
+def test_parse_build_summary_ready_and_needs():
+    r = server.parse_build_summary(BUILD_STDOUT_READY)
+    assert r["ready"] is True and r["verdict"] == "READY"
+    assert r["routes_written"] == 116 and r["airports_written"] == 30 and r["rows_read"] == 232
+    n = server.parse_build_summary(BUILD_STDOUT_NEEDS)
+    assert n["ready"] is False and n["verdict"] == "NEEDS INPUT"
+    assert "unmapped" in n.get("reasons", "")
+
+
+def test_validate_cirium(tmp_path):
+    root = str(tmp_path)
+    ci = os.path.join(root, "poe.csv"); open(ci, "w").write("Orig,Dest\n")
+    v = server.validate_cirium(
+        {"cirium_input": ci, "output_dir": root, "output_prefix": "poe_2026"},
+        [root], airport_lookup_dir="", airport_override="")
+    assert not v["errors"]
+    assert v["outputs"]["airports"].endswith("poe_2026_airports.csv")
+    assert v["outputs"]["routes"].endswith("poe_2026_routes_time.csv")
+    # missing input -> error
+    v2 = server.validate_cirium({"cirium_input": os.path.join(root, "nope.csv"),
+                                 "output_dir": root, "output_prefix": "x"}, [root])
+    assert any("not found" in e.lower() for e in v2["errors"])
+    # cirium input outside allowed roots -> error
+    other = tempfile.mkdtemp(); oc = os.path.join(other, "p.csv"); open(oc, "w").write("x\n")
+    v3 = server.validate_cirium({"cirium_input": oc, "output_dir": root, "output_prefix": "x"}, [root])
+    assert any("outside the allowed" in e.lower() for e in v3["errors"])
+    # bad airport_lookup_dir -> error
+    v4 = server.validate_cirium({"cirium_input": ci, "output_dir": root, "output_prefix": "x"},
+                                [root], airport_lookup_dir="/no/such/lookup/dir")
+    assert any("airport_lookup" in e.lower() for e in v4["errors"])

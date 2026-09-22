@@ -242,6 +242,26 @@ details.adv .panel-body { padding: 10px 0 0; }
 .modal-foot .path { font-size: 10.5px; color: var(--muted); font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 footer.hint { text-align: center; font-size: 11px; color: var(--muted); padding: 4px 0 18px; }
+/* Cirium build: CTA + modal */
+.cirium-cta { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+  margin-top: 10px; padding: 9px 11px; background: var(--accent-soft2); border: 1px dashed var(--line); border-radius: 7px; }
+.cirium-cta-text { font-size: 12px; color: var(--muted); }
+.cirium-modal { width: min(620px, 94vw); }
+.cirium-sub { font-size: 11.5px; color: var(--muted); line-height: 1.45; margin-top: 4px; }
+.cirium-sub code { font-size: 11px; }
+.cirium-body { padding: 14px; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; }
+.field-hint { font-size: 11px; color: var(--muted); margin-top: 3px; }
+.cirium-argv { font-family: var(--mono); font-size: 10.5px; color: var(--ink-soft); background: var(--line2);
+  border: 1px solid var(--line); border-radius: 6px; padding: 8px 9px; white-space: pre-wrap; word-break: break-all; max-height: 92px; overflow-y: auto; }
+.cirium-console { height: 200px; }
+.cirium-result { font-size: 12.5px; padding: 9px 11px; border-radius: 7px; line-height: 1.5; }
+.cirium-result.ok { background: var(--green-soft); color: var(--green-ink); border: 1px solid var(--green); }
+.cirium-result.warn { background: var(--amber-soft); color: var(--amber); border: 1px solid var(--amber); }
+.cirium-result.err { background: var(--red-soft); color: var(--red-ink); border: 1px solid var(--red); }
+.cirium-status { font-size: 11.5px; color: var(--muted); flex: 1 1 auto; }
+#modalOverlay { z-index: 120; }  /* browse modal stacks above the Cirium modal */
+.cirium-body .console { background: var(--line2); border: 1px solid var(--line); border-radius: 6px; padding: 6px 0; font-family: var(--mono); font-size: 11px; line-height: 1.5; overflow-y: auto; }
+.cirium-body .console .line { padding: 0 9px; white-space: pre-wrap; word-break: break-word; color: var(--ink-soft); }
 </style>
 </head>
 <body>
@@ -316,6 +336,36 @@ footer.hint { text-align: center; font-size: 11px; color: var(--muted); padding:
       <div style="display:flex;gap:8px;flex:0 0 auto;">
         <button class="rb-btn rb-btn-ghost" id="modalCancelBtn" type="button">Cancel</button>
         <button class="rb-btn rb-btn-solid" id="modalConfirmBtn" type="button" style="display:none;">Use this folder</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="ciriumOverlay">
+  <div class="modal cirium-modal">
+    <div class="modal-head">
+      <div class="modal-title">Build inputs from a Cirium export</div>
+      <div class="cirium-sub">Generates the <code>*_airports.csv</code> and <code>*_routes_time.csv</code> this tool needs, from a raw Cirium schedule CSV. Airport coordinates come from the <code>airport_lookup</code> tool.</div>
+    </div>
+    <div class="cirium-body">
+      <div class="field"><div class="field-label-row"><label>Cirium CSV</label></div>
+        <div class="path-row"><input type="text" id="ciriumInput" readonly placeholder="No file chosen">
+          <button type="button" class="rb-btn rb-btn-ghost" id="ciriumInputBtn">Browse…</button></div></div>
+      <div class="field"><div class="field-label-row"><label>Output folder</label></div>
+        <div class="path-row"><input type="text" id="ciriumOutDir" readonly placeholder="No folder chosen">
+          <button type="button" class="rb-btn rb-btn-ghost" id="ciriumOutBtn">Browse…</button></div></div>
+      <div class="field"><div class="field-label-row"><label>Output name (prefix)</label></div>
+        <input type="text" id="ciriumPrefix" placeholder="e.g. poe_202606-202607">
+        <div class="field-hint" id="ciriumOutHint"></div></div>
+      <div class="cirium-argv" id="ciriumArgv" style="display:none;"></div>
+      <div class="cirium-result" id="ciriumResult" style="display:none;"></div>
+      <div class="console" id="ciriumConsole" style="display:none;"></div>
+    </div>
+    <div class="modal-foot">
+      <div class="cirium-status" id="ciriumStatus"></div>
+      <div style="display:flex;gap:8px;flex:0 0 auto;">
+        <button class="rb-btn rb-btn-ghost" id="ciriumCancelBtn" type="button">Close</button>
+        <button class="rb-btn rb-btn-solid" id="ciriumBuildBtn" type="button">Build</button>
       </div>
     </div>
   </div>
@@ -438,6 +488,7 @@ function boot() {
     updateConditionalSections();
     wireRunPanel();
     wireModal();
+    wireCirium();
     scheduleValidate();
   }).catch(function (err) {
     el('formCol').innerHTML = '<div class="panel"><div class="panel-body">Could not load /api/config: ' +
@@ -593,6 +644,13 @@ function renderForm() {
     body.className = 'panel-body';
     paramsByGroup(group).forEach(function (param) { body.appendChild(buildField(param)); });
 
+    if (group === 'input') {
+      var cb = document.createElement('div');
+      cb.className = 'cirium-cta';
+      cb.innerHTML = '<span class="cirium-cta-text">Don\'t have the Airports / Routes CSVs yet?</span>' +
+        '<button type="button" class="rb-btn rb-btn-ghost" id="ciriumOpenBtn">⚙ Build from Cirium…</button>';
+      body.appendChild(cb);
+    }
     if (group === 'detection') {
       var adv = document.createElement('details');
       adv.className = 'adv';
@@ -808,7 +866,8 @@ function buildColorControl(param) {
 
 /* -- folder / file (Browse button; Step 4 modal) -- */
 function fieldRoot(key) {
-  var map = { airports: 'airports_dir', routes: 'routes_dir', tail_icao: 'airports_dir', output_dir: 'output_default' };
+  var map = { airports: 'airports_dir', routes: 'routes_dir', tail_icao: 'airports_dir', output_dir: 'output_default',
+    cirium_input: 'airports_dir', cirium_out: 'airports_dir' };
   var rk = map[key] || 'input_default';
   return (CONFIG.roots[rk] || CONFIG.roots.input_default);
 }
@@ -1073,8 +1132,9 @@ function renderPreflight(data) {
    ════════════════════════════════════════════════════════════════ */
 var BROWSE = { key: null, selectable: null, kind: null, path: null, parent: null, selected: null };
 
-function openBrowse(key, selectable, kind) {
+function openBrowse(key, selectable, kind, onPick) {
   BROWSE.key = key; BROWSE.selectable = selectable; BROWSE.kind = kind; BROWSE.selected = new Set();
+  BROWSE.onPick = onPick || null;
   el('modalTitle').textContent = selectable === 'folder' ? 'Choose a folder'
     : selectable === 'files' ? 'Choose KML files' : 'Choose a file';
   el('modalOverlay').classList.add('open');
@@ -1178,6 +1238,7 @@ function updateModalFoot() {
 }
 function confirmBrowse(paths, isFolder, isMulti) {
   closeBrowse();
+  if (BROWSE.onPick) { BROWSE.onPick(isMulti ? paths : paths[0]); return; }
   if (isFolder) {
     if (BROWSE.key === 'kml_folder') {
       setParam('kml_folder', paths[0]);
@@ -1202,6 +1263,117 @@ function confirmBrowse(paths, isFolder, isMulti) {
 function wireModal() {
   el('modalCancelBtn').addEventListener('click', closeBrowse);
   el('modalOverlay').addEventListener('click', function (ev) { if (ev.target === el('modalOverlay')) closeBrowse(); });
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Build inputs from Cirium (optional, integrated pre-step)
+   ════════════════════════════════════════════════════════════════ */
+var CIRIUM = { cirium_input: '', output_dir: '', output_prefix: '', es: null, job: null, running: false };
+
+function ciriumDerivePrefix(path) {
+  var base = (path.split('/').pop() || '').replace(/\.(csv|txt)$/i, '');
+  return base.replace(/route[_-]?cirium[_-]?/i, '').replace(/__+/g, '_').replace(/^_|_$/g, '');
+}
+function ciriumRefresh() {
+  el('ciriumInput').value = CIRIUM.cirium_input || '';
+  el('ciriumOutDir').value = CIRIUM.output_dir || '';
+  var prefEl = el('ciriumPrefix');
+  if (document.activeElement !== prefEl) prefEl.value = CIRIUM.output_prefix || '';
+  el('ciriumOutHint').textContent = (CIRIUM.output_dir && CIRIUM.output_prefix)
+    ? ('Writes ' + CIRIUM.output_prefix + '_airports.csv and ' + CIRIUM.output_prefix + '_routes_time.csv')
+    : '';
+}
+function openCirium() {
+  if (!CIRIUM.output_dir) CIRIUM.output_dir = (CONFIG.roots.airports_dir || CONFIG.roots.output_default || '');
+  el('ciriumResult').style.display = 'none';
+  el('ciriumConsole').style.display = 'none';
+  el('ciriumConsole').innerHTML = '';
+  el('ciriumStatus').textContent = '';
+  el('ciriumBuildBtn').disabled = false;
+  ciriumRefresh();
+  el('ciriumOverlay').classList.add('open');
+}
+function closeCirium() {
+  if (CIRIUM.es) { CIRIUM.es.close(); CIRIUM.es = null; }
+  el('ciriumOverlay').classList.remove('open');
+}
+function ciriumAppend(text) {
+  var cons = el('ciriumConsole');
+  var atBottom = cons.scrollTop + cons.clientHeight >= cons.scrollHeight - 30;
+  var div = document.createElement('div'); div.className = 'line'; div.textContent = text;
+  cons.appendChild(div);
+  if (atBottom) cons.scrollTop = cons.scrollHeight;
+}
+function ciriumShowResult(cls, html) {
+  var r = el('ciriumResult'); r.className = 'cirium-result ' + cls; r.innerHTML = html; r.style.display = '';
+}
+function runCiriumBuild() {
+  if (CIRIUM.running) return;
+  var p = { cirium_input: CIRIUM.cirium_input, output_dir: CIRIUM.output_dir,
+            output_prefix: CIRIUM.output_prefix };
+  el('ciriumResult').style.display = 'none';
+  var cons = el('ciriumConsole'); cons.style.display = ''; cons.innerHTML = '';
+  el('ciriumStatus').textContent = 'Building…'; el('ciriumBuildBtn').disabled = true; CIRIUM.running = true;
+  fetch('/api/build-cirium/run', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(p) })
+    .then(function (r) { if (!r.ok) return r.json().then(function (e) { throw new Error(e.error || 'Build failed to start'); }); return r.json(); })
+    .then(function (d) { CIRIUM.job = d.job_id; ciriumStream(d.job_id, p); })
+    .catch(function (err) {
+      CIRIUM.running = false; el('ciriumBuildBtn').disabled = false; el('ciriumStatus').textContent = '';
+      ciriumShowResult('err', escapeHtml('Could not start: ' + err.message));
+    });
+}
+function ciriumStream(jobId, p) {
+  CIRIUM.es = new EventSource('/api/run/' + jobId + '/stream');
+  CIRIUM.es.addEventListener('line', function (e) { try { ciriumAppend(JSON.parse(e.data).text); } catch (x) {} });
+  CIRIUM.es.addEventListener('error', function (e) { try { var m = JSON.parse(e.data); if (m && m.message) ciriumAppend('[error] ' + m.message); } catch (x) {} });
+  CIRIUM.es.addEventListener('done', function (e) {
+    var payload = JSON.parse(e.data);
+    if (CIRIUM.es) { CIRIUM.es.close(); CIRIUM.es = null; }
+    CIRIUM.running = false; el('ciriumBuildBtn').disabled = false; el('ciriumStatus').textContent = '';
+    ciriumOnDone(payload, p);
+  });
+}
+function ciriumFillFields(p) {
+  var airports = joinPath(p.output_dir, p.output_prefix + '_airports.csv');
+  var routes = joinPath(p.output_dir, p.output_prefix + '_routes_time.csv');
+  setParam('airports', airports); refreshFieldDisplay('airports');
+  setParam('routes', routes); refreshFieldDisplay('routes');
+  scheduleValidate();
+}
+function ciriumOnDone(payload, p) {
+  var s = payload.summary || {};
+  if (payload.success && s.ready) {
+    ciriumFillFields(p);
+    ciriumShowResult('ok', '<b>✓ READY</b> — ' + (s.routes_written || 0) + ' routes, ' + (s.airports_written || 0) +
+      ' airports. The Airports &amp; Routes fields have been filled in — you can close this dialog.');
+  } else {
+    var reasons = s.reasons ? (' — ' + escapeHtml(s.reasons)) : '';
+    ciriumShowResult('warn', '<b>NEEDS INPUT</b>' + reasons + '. Partial files were written (see the console / report). ' +
+      'Fix the mapping and re-build, or <button type="button" class="rb-btn rb-btn-ghost" id="ciriumUseAnyway">use them anyway</button>.');
+    var b = el('ciriumUseAnyway');
+    if (b) b.addEventListener('click', function () { ciriumFillFields(p); closeCirium(); });
+  }
+}
+function wireCirium() {
+  var openBtn = el('ciriumOpenBtn');
+  if (openBtn) openBtn.addEventListener('click', openCirium);
+  el('ciriumCancelBtn').addEventListener('click', closeCirium);
+  el('ciriumOverlay').addEventListener('click', function (ev) { if (ev.target === el('ciriumOverlay')) closeCirium(); });
+  el('ciriumBuildBtn').addEventListener('click', runCiriumBuild);
+  el('ciriumInputBtn').addEventListener('click', function () {
+    openBrowse('cirium_input', 'file', ['csv', 'txt'], function (path) {
+      CIRIUM.cirium_input = path;
+      if (!el('ciriumPrefix').value) CIRIUM.output_prefix = ciriumDerivePrefix(path);
+      ciriumRefresh();
+    });
+  });
+  el('ciriumOutBtn').addEventListener('click', function () {
+    openBrowse('cirium_out', 'folder', null, function (path) { CIRIUM.output_dir = path; ciriumRefresh(); });
+  });
+  el('ciriumPrefix').addEventListener('input', function () {
+    CIRIUM.output_prefix = el('ciriumPrefix').value.trim(); ciriumRefresh();
+  });
 }
 
 /* ════════════════════════════════════════════════════════════════

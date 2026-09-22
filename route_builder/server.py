@@ -33,7 +33,8 @@ def load_manifest(app_dir: str) -> dict:
     with open(runtime) as f:
         man = json.load(f)
     roots = man.setdefault("roots", {})
-    for k in ("input_default", "airports_dir", "routes_dir", "output_default"):
+    roots.setdefault("airport_lookup_dir", "~/Git/conversion_tools/airport_lookup")
+    for k in ("input_default", "airports_dir", "routes_dir", "output_default", "airport_lookup_dir"):
         if roots.get(k):
             roots[k] = _resolve(roots[k])
     roots["allowed_roots"] = [_resolve(r) for r in roots.get("allowed_roots", [])]
@@ -119,6 +120,51 @@ def suggest_name(batch_stem: str, params: Dict[str, Any]) -> str:
     if params.get("color_mode") == "altitude":
         stem += "_altcolor"
     return stem + ".kml"
+
+
+# ── Cirium input builder (second tool: build_cirium_inputs.py) ──────────────────
+# Turns a raw Cirium schedule export into the *_airports.csv / *_routes_time.csv the
+# splitter needs. Reuses RunManager with a build-specific summary parser (below).
+BUILD_SCRIPT = os.path.join(REPO_ROOT, "build_cirium_inputs.py")
+DEFAULT_AIRPORT_OVERRIDE = os.path.join(REPO_ROOT, "airport_overrides.csv")
+
+
+def build_cirium_argv(params: Dict[str, Any], airport_lookup_dir: str = "",
+                      airport_override: str = "", script: Optional[str] = None) -> List[str]:
+    """Map a params dict -> a `python3 -u build_cirium_inputs.py …` argv list.
+
+    ``airport_lookup_dir``/``airport_override`` come from server config (the manifest),
+    NOT the request body, because the lookup dir is imported as code by the subprocess.
+    """
+    out_prefix = os.path.join(params.get("output_dir", ""), params.get("output_prefix", ""))
+    argv = ["python3", "-u", script or BUILD_SCRIPT,
+            "--input", params.get("cirium_input", ""),
+            "--output", out_prefix]
+    if airport_lookup_dir:
+        argv += ["--airport-lookup-dir", airport_lookup_dir]
+    if airport_override:
+        argv += ["--airport-override", airport_override]
+    return argv
+
+
+def parse_build_summary(text: str) -> Dict[str, Any]:
+    """Parse build_cirium_inputs.py's report into a structured summary."""
+    out: Dict[str, Any] = {}
+    for key, pat, cast in [
+        ("rows_read", r"Source rows read:\s*(\d+)", int),
+        ("routes_written", r"Routes written:\s*(\d+)", int),
+        ("airports_written", r"Airports written:\s*(\d+)", int),
+    ]:
+        mm = re.search(pat, text)
+        if mm:
+            out[key] = cast(mm.group(1))
+    mm = re.search(r"VERDICT:\s*(READY|NEEDS INPUT)(?:\s*[—-]\s*(.+?))?\s*$", text, re.M)
+    if mm:
+        out["ready"] = mm.group(1) == "READY"
+        out["verdict"] = mm.group(1)
+        if mm.group(2):
+            out["reasons"] = mm.group(2).strip().rstrip(".")
+    return out
 
 
 _PHASE_PREFIXES = ("Loading extra position sources", "Combining segments by aircraft",
@@ -262,6 +308,60 @@ def validate(params: Dict[str, Any], allowed_roots: List[str]) -> Dict[str, Any]
     }
 
 
+def validate_cirium(params: Dict[str, Any], allowed_roots: List[str],
+                    airport_lookup_dir: str = "",
+                    airport_override: str = "") -> Dict[str, Any]:
+    """Pre-flight for the Cirium build: confine paths, report the output files + argv."""
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    ci = params.get("cirium_input")
+    if not ci:
+        errors.append("Cirium CSV not selected")
+    else:
+        try:
+            rp = confine_path(ci, allowed_roots)
+            if not os.path.exists(rp):
+                errors.append(f"Cirium CSV not found: {ci}")
+        except PermissionError:
+            errors.append("Cirium CSV is outside the allowed folders")
+
+    out_dir = params.get("output_dir", "")
+    prefix = params.get("output_prefix", "")
+    if not out_dir:
+        errors.append("Output folder not selected")
+    else:
+        try:
+            confine_path(out_dir, allowed_roots)
+        except PermissionError:
+            errors.append("Output folder is outside the allowed folders")
+    if not prefix:
+        errors.append("Output name (prefix) not set")
+    elif os.path.basename(prefix) != prefix:
+        errors.append("Output name must be a plain name, not a path")
+
+    out_prefix = os.path.join(out_dir, prefix)
+    outputs = {
+        "airports": out_prefix + "_airports.csv",
+        "routes": out_prefix + "_routes_time.csv",
+        "report": out_prefix + "_error.txt",
+    }
+    outputs_exist = bool(prefix) and os.path.exists(outputs["airports"]) and os.path.exists(outputs["routes"])
+    if outputs_exist:
+        warnings.append("Generated files already exist and will be overwritten")
+    if airport_lookup_dir and not os.path.isdir(airport_lookup_dir):
+        errors.append(f"airport_lookup tool not found at {airport_lookup_dir} "
+                      "(set roots.airport_lookup_dir in manifest.json)")
+
+    return {
+        "outputs": outputs,
+        "outputs_exist": outputs_exist,
+        "argv": build_cirium_argv(params, airport_lookup_dir, airport_override),
+        "warnings": warnings,
+        "errors": errors,
+    }
+
+
 class RunManager:
     """Runs the flight-route script as a subprocess, streaming stdout as progress events."""
 
@@ -269,12 +369,20 @@ class RunManager:
         self._jobs: Dict[str, dict] = {}
         self._lock = threading.Lock()
 
-    def start(self, argv: List[str], total_files: int = 0, cwd: str = REPO_ROOT) -> str:
-        """Spawn argv as a subprocess and start streaming its stdout; return the new job id."""
+    def start(self, argv: List[str], total_files: int = 0, cwd: str = REPO_ROOT,
+              summary_parser=None, success_fn=None) -> str:
+        """Spawn argv as a subprocess and start streaming its stdout; return the new job id.
+
+        ``summary_parser(text) -> dict`` and ``success_fn(code, summary) -> bool`` are
+        per-tool: they default to the flight-route splitter's, but a second tool (e.g. the
+        Cirium input builder) supplies its own so the same run/stream machinery is reused.
+        """
         jid = uuid.uuid4().hex[:12]
         job = {"q": queue.Queue(), "proc": None, "status": "running",
                "total": total_files, "processed": 0, "start": time.time(),
-               "buf": [], "summary": {}, "output": None}
+               "buf": [], "summary": {}, "output": None,
+               "summary_parser": summary_parser or parse_summary,
+               "success_fn": success_fn or (lambda code, summary: code == 0 and "output" in summary)}
         with self._lock:
             self._jobs[jid] = job
         try:
@@ -311,11 +419,11 @@ class RunManager:
                     job["q"].put(("phase", {"phase": payload}))
             code = proc.wait()
             text = "\n".join(job["buf"])
-            summary = parse_summary(text)
+            summary = job["summary_parser"](text)
             job["summary"] = summary
             out = summary.get("output")
             size = os.path.getsize(out) if out and os.path.exists(out) else None
-            success = (code == 0 and "output" in summary)
+            success = job["success_fn"](code, summary)
             job["status"] = "done" if success else "error"
             job["q"].put(("done", {"exit_code": code, "success": success,
                                    "summary": summary, "output_size": size}))
@@ -384,6 +492,10 @@ def make_server(port: int, app_dir: str = APP_DIR,
     with open(os.path.join(app_dir, "parameters.json")) as f:
         params_catalog = json.load(f)
     runs = RunManager()
+    # Cirium-build config comes from the manifest / repo, never the request body: the
+    # airport_lookup dir is imported as code by the build subprocess, so it must be trusted.
+    airport_lookup_dir = manifest["roots"].get("airport_lookup_dir", "")
+    airport_override = DEFAULT_AIRPORT_OVERRIDE if os.path.exists(DEFAULT_AIRPORT_OVERRIDE) else ""
 
     def man_input(_dir: str) -> str:
         return load_manifest(_dir)["roots"]["input_default"]
@@ -466,6 +578,19 @@ def make_server(port: int, app_dir: str = APP_DIR,
                     if v["errors"]:
                         return self._send(400, {"error": "; ".join(v["errors"])})
                     jid = runs.start(build_argv(params), total_files=v["kml_count"])
+                    return self._send(200, {"job_id": jid})
+                if u.path == "/api/build-cirium/validate":
+                    return self._send(200, validate_cirium(self._body(), roots,
+                                                           airport_lookup_dir, airport_override))
+                if u.path == "/api/build-cirium/run":
+                    params = self._body()
+                    v = validate_cirium(params, roots, airport_lookup_dir, airport_override)
+                    if v["errors"]:
+                        return self._send(400, {"error": "; ".join(v["errors"])})
+                    jid = runs.start(
+                        build_cirium_argv(params, airport_lookup_dir, airport_override),
+                        summary_parser=parse_build_summary,
+                        success_fn=lambda code, summary: code == 0)
                     return self._send(200, {"job_id": jid})
                 if u.path.startswith("/api/run/") and u.path.endswith("/cancel"):
                     runs.cancel(u.path.split("/")[3]); return self._send(200, {"status": "cancelled"})
