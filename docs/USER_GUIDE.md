@@ -66,12 +66,10 @@ Cirium schedule export                ADS-B KML tracks
                           + .diagnostics.csv sidecar
 ```
 
-**Step A — build the reference inputs** (once per airline/period), currently a command-line
-pre-processing step (§4).
+**Step A — build the reference inputs** (once per airline/period). **Optional:** if the two
+CSVs already exist, just load them in Step B. If they don't, build them right in the GUI with
+**Build from Cirium…** (§4), or from the command line (§4).
 **Step B — split the tracks** in the Route Builder GUI (§3, §5).
-
-> **Planned:** Step A will get its own tab in the GUI so the whole pipeline is terminal-free.
-> For now it's a single command.
 
 ---
 
@@ -95,6 +93,27 @@ no dependencies — Python 3 standard library only.
 ---
 
 ## 4. Building the input CSVs (Cirium)
+
+You only need this if you **don't already have** the two generated CSVs for your airline. If you
+do, skip to Step B and just load them.
+
+### Option 1 — in the GUI (no terminal)
+
+In the Route Builder's **Inputs** section, click **⚙ Build from Cirium…**. In the dialog:
+
+1. **Cirium CSV** — pick the raw export (`input/<airline>_route_cirium_<period>.csv`).
+2. **Output folder** — defaults to `input/`.
+3. **Output name (prefix)** — suggested from the file name (e.g. `poe_202606-202607`).
+4. Click **Build**. The live report streams; on **✓ READY** the **Airports CSV** and
+   **Routes-time CSV** fields are filled in for you automatically. Close the dialog and run.
+
+If the report says **NEEDS INPUT** (some IATA codes couldn't be mapped), it lists the reasons and
+writes partial files; add the missing mappings to `airport_overrides.csv` and rebuild, or choose
+*use them anyway*. Airport coordinates come from the shared **`airport_lookup`** tool (configured
+by `roots.airport_lookup_dir` in `route_builder/manifest.json`); if it isn't found, the dialog
+tells you.
+
+### Option 2 — command line
 
 Run this once per airline/period to turn a raw Cirium export into the two files the splitter
 needs:
@@ -145,7 +164,8 @@ left **form** column, and a right **run panel**.
   keeps your chosen files/paths.
 - **Form (left)** — collapsible sections: **Inputs · Output · Detection & sampling · Styling ·
   Gap Stitching · Position Sources**. Every field has an **ⓘ** tooltip with a one-line
-  explanation and an example.
+  explanation and an example. The **Inputs** section also has a **⚙ Build from Cirium…** button
+  for generating the Airports/Routes CSVs when you don't have them yet (§4).
 - **Run panel (right)** — a **pre-flight card** (file/airport/route counts, the exact command
   line that will run, and any blocking errors), the **Run** button, a live **progress bar + ETA +
   console**, and finally a **✓/✗ result** with the run summary and a *Reveal in Finder* button.

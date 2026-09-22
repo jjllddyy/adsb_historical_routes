@@ -47,6 +47,10 @@ documented below, so the CLI reference doubles as the GUI's field reference.
 > walk-through of the GUI, every setting with recommendations, worked examples, and the
 > **two-file rule** (which files go in the Airports / Routes fields — the most common mistake).
 
+The GUI can also **build the Airports/Routes CSVs from a Cirium export** (Inputs →
+**⚙ Build from Cirium…**), so the whole pipeline is terminal-free; it's optional — if the CSVs
+already exist you just load them.
+
 **Launch it:**
 - Double-click `route_builder/Route Builder.command` in Finder, **or**
 - `python3 route_builder/server.py --open` from a terminal (`--open` opens your browser

@@ -10,6 +10,15 @@ builder, route-time builder, and ICAO↔hex tail matcher — needs to satisfy to
 this same shell, ideally with no changes to `server.py`'s HTTP layer or `index.html`'s
 layout code.
 
+> **Status:** a **second tool is now integrated** — the Cirium input builder
+> (`build_cirium_inputs.py`), reached from the Inputs section's *Build from Cirium…* button.
+> It was added as a focused special-case rather than a full generic registry: `RunManager.start`
+> gained a per-tool `summary_parser`/`success_fn` (so the same run/stream/cancel machinery is
+> reused), plus `build_cirium_argv` / `parse_build_summary` / `validate_cirium` and
+> `POST /api/build-cirium/{validate,run}`. The **tool tab / registry** structure below remains
+> the recommended path for the **third** tool onward, when hardcoding a second endpoint set
+> stops paying off.
+
 Reference implementation: `route_builder/server.py`. Read it alongside this doc — the
 functions named below (`build_argv`, `validate`, `parse_summary`, `classify_line`,
 `make_server`) are the concrete example every new tool should follow the shape of.
