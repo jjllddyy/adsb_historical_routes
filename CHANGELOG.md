@@ -5,6 +5,29 @@ All notable changes to the Flight Route Splitter project will be documented in t
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-09-22 (route-builder branch)
+
+### Added
+
+- **Route Builder GUI** (`route_builder/`): a stdlib-only local web app that drives `adsb_historical_routes.py` from a browser form — folder/file pickers, built-in and user presets, a pre-flight card showing the exact command line, live SSE progress + ETA + console, and a graphical pass/fail result. Launch with `python3 route_builder/server.py --open` or the double-click `Route Builder.command`; binds `127.0.0.1` only. See [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) and `route_builder/EXTENSION_SPEC.md`.
+- **Integrated Cirium input builder** in the GUI (Inputs → *Build from Cirium…*): generate the `*_airports.csv` / `*_routes_time.csv` without a terminal; on `READY` it auto-fills the Airports/Routes fields. Optional — if the files exist you just load them.
+- **Position-source integration** (`--integrate-pos`): fill in-flight ADS-B coverage gaps with real ACARS position reports and/or ADS-B firehose fixes, color-marked by source (`--pos-color` / `--firehose-color`). Flight detection is unchanged; the extra sources only densify flights already found.
+- **Altitude color mode** (`--color-mode altitude`, `--altitude-palette adsbex`, `--altitude-bands`): colors lines by the ADS-B Exchange altitude gradient (orange at ground → magenta at 40 000  ft+).
+- **Gap stitching** (`--stitch-gaps`, `--inferred-color`, `--stitch-gap-min`): draw straight-line connectors across coverage gaps in a distinct colour to mark inferred data.
+- **Corridor cross-track gate** (`--corridor-cross-track-km`): the main recovery/noise knob for endpoint rescue.
+- **Airport override manifest** (`airport_overrides.csv`, `--airport-override`) for `build_cirium_inputs.py`.
+- **User Guide** (`docs/USER_GUIDE.md`) covering the GUI, every setting, worked examples, and the two-file rule.
+
+### Changed
+
+- The GUI's Airports/Routes/Tail file pickers accept `.csv` **and** `.txt`, and their field help now points at the generated `*_airports.csv` / `*_routes_time.csv` (not the OurAirports `Airports_*.txt` DB or the raw Cirium export).
+- README documents the GUI, the Cirium build option, and the altitude/position/stitching flags.
+
+### Fixed
+
+- Run console now batches and caps output (last 500 lines) so large batches no longer freeze the browser tab.
+- Path confinement (realpath containment in `allowed_roots`) applied to every GUI filesystem endpoint, including `kml_files`, the output path, and the Cirium build's inputs.
+
 ## [1.1.0] - 2026-04-28 (improved-route-detection branch)
 
 ### Added

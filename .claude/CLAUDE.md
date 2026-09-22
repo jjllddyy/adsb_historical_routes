@@ -137,14 +137,15 @@ See [.claude/known_issues.md](.claude/known_issues.md) for detailed list.
 1. No spatial indexing (O(n) airport lookups)
 2. Sequential processing only (no parallelization)
 3. Memory-resident processing (all data in RAM)
-4. No GUI interface
-5. Limited export formats (KML only)
+4. Limited export formats (KML only)
+
+> A browser-based GUI now exists: `route_builder/` (stdlib-only local web app,
+> `python3 route_builder/server.py --open`). See `docs/USER_GUIDE.md`.
 
 ### Future Enhancements
 - R-tree spatial indexing for faster airport matching
 - Parallel file processing
 - Streaming/incremental processing
-- GUI interface (tkinter)
 - Export to GeoJSON, CSV, Shapefile
 - Web-based viewer
 
