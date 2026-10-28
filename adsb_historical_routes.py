@@ -10,7 +10,7 @@ Major improvements:
 """
 
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from math import radians, cos, sin, asin, sqrt
 import argparse
 import sys
@@ -19,12 +19,22 @@ import gc
 import glob
 import json
 import bisect
+import sqlite3
+import tempfile
+import time
 import urllib.parse
 from collections import defaultdict
 from dataclasses import dataclass, replace
-from typing import List, Tuple, Dict, Optional, Set
+from typing import Any, List, Tuple, Dict, Optional, Set
 import csv
 import re
+
+# The vendored GeoPackage writer lives next to this script (shared with
+# company_route_extractor); make it importable however this file is loaded.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gpkg_writer  # noqa: E402
+
+TOOL_VERSION = "1.3.0"
 
 
 @dataclass(frozen=True)
@@ -393,21 +403,41 @@ def load_routes_csv(filepath: str) -> List[Route]:
     return routes
 
 
-def find_nearest_airport(lat: float, lon: float, alt_meters: float, airports: List[Airport], 
+# Height above an airport (ft per km of distance from it) that an endpoint may add on top
+# of the plain altitude allowance and still be treated as climbing out of / descending
+# into it: a 3-degree path, tan(3 deg) * 3280.84 ft/km.
+ENDPOINT_PATH_FT_PER_KM = 171.9
+
+
+def find_nearest_airport(lat: float, lon: float, alt_meters: float, airports: List[Airport],
                         max_distance_km: float = 15.0, max_alt_diff_ft: float = 3000.0,
                         lenient: bool = False) -> Optional[Airport]:
     """
     Find the nearest airport within distance and altitude constraints
     lenient mode: used for takeoff/landing detection, more forgiving on altitude
+
+    In lenient mode a farther airport may not "steal" an endpoint from a closer one. The
+    altitude allowance grows with airport elevation, so a climbing aircraft first seen
+    16 km from MMSM (elev 7,369 ft) at 12,100 ft fails MMSM's allowance but passes the
+    larger one of MMTO (elev 8,466 ft), 89 km away, and was labelled MMTO. When the
+    geometrically closest airport in range was rejected only on altitude, but the height
+    above it fits a 3-degree climb/descent path from it, the closest airport wins. This
+    only re-labels endpoints that already matched; it never matches a new one.
     """
     nearest = None
     min_distance = float('inf')
+    closest = None
+    closest_distance = float('inf')
     alt_feet = alt_meters * 3.28084  # Convert meters to feet
-    
+
     for airport in airports:
         distance = haversine_distance(lat, lon, airport.lat, airport.lon)
         alt_diff = abs(alt_feet - airport.elevation)
-        
+
+        if distance <= max_distance_km and distance < closest_distance:
+            closest = airport
+            closest_distance = distance
+
         if distance <= max_distance_km and distance < min_distance:
             # More lenient altitude check for low altitudes near airports
             if lenient:
@@ -416,13 +446,19 @@ def find_nearest_airport(lat: float, lon: float, alt_meters: float, airports: Li
                     min_distance = distance
                     nearest = airport
                     continue
-                    
+
             # Standard altitude check with adaptive threshold
             adjusted_alt_threshold = max_alt_diff_ft + (airport.elevation * 0.15 if airport.elevation > 3000 else 0)
             if alt_diff <= adjusted_alt_threshold:
                 min_distance = distance
                 nearest = airport
-    
+
+    if lenient and nearest is not None and closest is not nearest:
+        threshold = max_alt_diff_ft + (closest.elevation * 0.15 if closest.elevation > 3000 else 0)
+        height_above = alt_feet - closest.elevation
+        if -threshold <= height_above <= threshold + ENDPOINT_PATH_FT_PER_KM * closest_distance:
+            return closest
+
     return nearest
 
 
@@ -882,7 +918,8 @@ def match_route_by_time_with_bearing(segment: "FlightSegment",
                                       airports_dict: Dict[str, "Airport"],
                                       tolerance: float = 0.4,
                                       bearing_tolerance_deg: float = 45.0,
-                                      max_cross_track_km: Optional[float] = None) -> Optional[str]:
+                                      max_cross_track_km: Optional[float] = None,
+                                      along_slack: float = 1.15) -> Optional[str]:
     """Match a missing destination by scheduled enroute time + direction from the origin.
 
     Requires the origin->candidate bearing to align with the segment's mean cruise bearing.
@@ -893,6 +930,11 @@ def match_route_by_time_with_bearing(segment: "FlightSegment",
     truncated ~65 km short of SBMO is not mis-assigned to a same-bearing but far-off Salvador
     merely because its clipped (short) duration happens to match the shorter route. Rejected
     candidates fall through to corridor geometry, which infers the endpoint by direction.
+
+    With the corridor gate on, the airborne endpoint must also not lie beyond the candidate
+    (``along_slack``, as in corridor geometry). Cross-track alone accepts a point on the
+    great circle's extension: VIV MMSM departures last seen near Mazatlan, already 450 km
+    past Leon, were labelled MMSM->MMLO because the short MMLO block time fit best.
     """
     if not segment.origin or not segment.points:
         return None
@@ -921,6 +963,10 @@ def match_route_by_time_with_bearing(segment: "FlightSegment",
             xt = abs(cross_track_km(last.lat, last.lon,
                                     segment.origin.lat, segment.origin.lon, cand.lat, cand.lon))
             if xt > max_cross_track_km:
+                continue
+            if (haversine_distance(segment.origin.lat, segment.origin.lon, last.lat, last.lon)
+                    > haversine_distance(segment.origin.lat, segment.origin.lon,
+                                         cand.lat, cand.lon) * along_slack):
                 continue
 
         if time_diff < best_diff:
@@ -992,6 +1038,36 @@ def infer_endpoint_by_corridor(segment: "FlightSegment",
     return (None, None)
 
 
+def head_bearing(points: List["TrackPoint"], window_minutes: float = 10.0) -> float:
+    """Average bearing over the first `window_minutes` of a track (cf. ``mean_bearing``)."""
+    if not points:
+        return 0.0
+    cutoff = points[0].datetime + timedelta(minutes=window_minutes)
+    window = [p for p in points if p.datetime <= cutoff]
+    if len(window) < 2:
+        window = points[:min(10, len(points))]
+    return mean_bearing(window, window_minutes=window_minutes)
+
+
+# A gap across which the track reverses (> TURNAROUND_MIN_REVERSAL_DEG) while covering
+# ground slower than this has the aircraft on the ground somewhere, not in flight. The
+# floor matches the 200 km/h lower bound of Case 5's plausible-cruise band.
+TURNAROUND_MIN_REVERSAL_DEG = 120.0
+TURNAROUND_MAX_GAP_SPEED_KMH = 200.0
+
+
+def is_turnaround(current: "FlightSegment", next_seg: "FlightSegment", time_gap_h: float) -> bool:
+    """True when ``next_seg`` is a return leg, not the continuation of ``current``."""
+    if len(current.points) < 2 or len(next_seg.points) < 2:
+        return False
+    a, b = current.points[-1], next_seg.points[0]
+    gap_km = haversine_distance(a.lat, a.lon, b.lat, b.lon)
+    if gap_km / max(time_gap_h, 0.01) >= TURNAROUND_MAX_GAP_SPEED_KMH:
+        return False
+    return angular_diff(mean_bearing(current.points, window_minutes=10.0),
+                        head_bearing(next_seg.points, window_minutes=10.0)) > TURNAROUND_MIN_REVERSAL_DEG
+
+
 def assert_join_invariants(current: "FlightSegment", next_seg: "FlightSegment") -> None:
     """Enforce that any join attempt is between two segments of the same aircraft, in chronological order.
 
@@ -1042,7 +1118,8 @@ def try_recover_endpoint(segment: "FlightSegment",
     if segment.origin and not segment.destination:
         if rt_rescue:
             dest_code = match_route_by_time_with_bearing(
-                segment, routes_dict, airports_dict, tolerance=route_tol, max_cross_track_km=mct
+                segment, routes_dict, airports_dict, tolerance=route_tol, max_cross_track_km=mct,
+                along_slack=corridor_slack
             )
             if dest_code and dest_code in airports_dict:
                 segment.destination = airports_dict[dest_code]
@@ -1080,6 +1157,12 @@ def try_recover_endpoint(segment: "FlightSegment",
                     xt = abs(cross_track_km(first.lat, first.lon, cand.lat, cand.lon,
                                             segment.destination.lat, segment.destination.lon))
                     if xt > mct:
+                        continue
+                    # ...and must not lie beyond the candidate origin (see the forward case)
+                    dest_ap = segment.destination
+                    if (haversine_distance(dest_ap.lat, dest_ap.lon, first.lat, first.lon)
+                            > haversine_distance(dest_ap.lat, dest_ap.lon, cand.lat, cand.lon)
+                            * corridor_slack):
                         continue
                     if xt < best_xt:
                         best_xt, best_orig = xt, orig
@@ -1148,20 +1231,33 @@ def combine_segments_intelligently(segments: List["FlightSegment"], airports: Li
 
     def record_outcome(seg, disposition, drop_reason="", joined_with=None, rescue_method="none"):
         if recorder is not None:
-            recorder.record_outcome(
+            return recorder.record_outcome(
                 seg, segment_idx=raw_idx(seg), disposition=disposition,
                 drop_reason=drop_reason, joined_with=joined_with or [],
                 rescue_method=rescue_method, airports=airports
             )
+        return None
+
+    def keep(seg, disposition, rescue_method, n_segments, absorbed, final_row):
+        """Accept ``seg`` as a flight; tie its diagnostics rows (absorbed + own) to it."""
+        seg.disposition = disposition
+        seg.rescue_method = rescue_method
+        seg.joined_segment_count = n_segments
+        combined.append(seg)
+        for row in absorbed + [final_row]:
+            if row is not None:
+                row["_flight"] = seg
+        if final_row is not None:
+            final_row["_flight_row"] = True
 
     while i < len(segments):
         current = segments[i]
         joined_idxs = []
+        absorbed_rows = []
         rescue_method = "none"
 
         if current.is_complete and current.is_valid_flight():
-            combined.append(current)
-            record_outcome(current, "kept_complete")
+            keep(current, "kept_complete", "none", 1, [], record_outcome(current, "kept_complete"))
             i += 1
             continue
 
@@ -1178,6 +1274,7 @@ def combine_segments_intelligently(segments: List["FlightSegment"], airports: Li
         if rm:
             rescue_method = rm
             print(f"        Enhanced {current.origin.code} -> {current.destination.code} via {rm}")
+        dest_inferred = rm.endswith("_forward")
 
         # Join with subsequent segment(s). When multi_hop is enabled the merged segment
         # keeps absorbing further adjacent fragments in this same pass, so a flight split
@@ -1243,17 +1340,32 @@ def combine_segments_intelligently(segments: List["FlightSegment"], airports: Li
                         if rescue_method == "none":
                             rescue_method = "bearing_join"
 
+            # Case 6: turnaround → DO NOT JOIN. The aircraft went out and came back across a
+            # coverage hole at the far airport (e.g. MMSM->MMVA->MMSM with no coverage at
+            # MMVA): the heading reverses and the gap shows no progress below cruise speed.
+            # Joining those fragments produced one "flight" whose labels came from two
+            # different legs (VIV MMTO->MMSM, ~5x the great-circle distance).
+            if should_join and is_turnaround(current, next_seg, time_gap_h):
+                should_join = False
+
             if not should_join:
                 break
 
             print(f"        Joining segments: {current} + {next_seg}")
             new_points = current.points + next_seg.points
+            # A destination inferred for the shorter fragment is stale once the track
+            # continues past it: drop it and let recovery re-run on the merged track.
+            carried_dest = None if dest_inferred else current.destination
+            if dest_inferred:
+                dest_inferred = False
+                if rescue_method.endswith("_forward"):
+                    rescue_method = "none"
             new_segment = FlightSegment(
                 current.aircraft_id,
                 current.registration,
                 new_points,
                 current.origin or next_seg.origin,
-                next_seg.destination or current.destination,
+                next_seg.destination or carried_dest,
                 current.style_color,
                 current.style_width,
                 current.style_opacity,
@@ -1262,8 +1374,8 @@ def combine_segments_intelligently(segments: List["FlightSegment"], airports: Li
             new_segment.has_gaps = current.has_gaps or next_seg.has_gaps
             joined_idxs.append(raw_idx(next_seg))
             # Record the consumed `next_seg` outcome before overwriting `current`
-            record_outcome(next_seg, "kept_joined", joined_with=[base_idx],
-                           rescue_method=rescue_method)
+            absorbed_rows.append(record_outcome(next_seg, "kept_joined", joined_with=[base_idx],
+                                                rescue_method=rescue_method))
             current = new_segment
             i += 1
 
@@ -1279,6 +1391,8 @@ def combine_segments_intelligently(segments: List["FlightSegment"], airports: Li
                 )
                 if rm2 and rescue_method in ("none", "bearing_join"):
                     rescue_method = rm2
+                if rm2.endswith("_forward"):
+                    dest_inferred = True
 
             if not multi_hop:
                 break
@@ -1289,8 +1403,9 @@ def combine_segments_intelligently(segments: List["FlightSegment"], airports: Li
             disp = "kept_rescued" if rescue_method != "none" else (
                 "kept_joined" if joined_idxs else "kept_complete"
             )
-            combined.append(current)
-            record_outcome(current, disp, joined_with=joined_with_final, rescue_method=rescue_method)
+            row = record_outcome(current, disp, joined_with=joined_with_final,
+                                 rescue_method=rescue_method)
+            keep(current, disp, rescue_method, 1 + len(joined_idxs), absorbed_rows, row)
         else:
             # Last chance: looser route-time tolerance plus geometry-corridor inference,
             # now applied to the fully reassembled track and to BOTH directions (a truncated
@@ -1304,9 +1419,9 @@ def combine_segments_intelligently(segments: List["FlightSegment"], airports: Li
             )
             if rm3 and current.is_valid_flight():
                 print(f"        Rescued segment: {current.origin.code} -> {current.destination.code} via {rm3}")
-                combined.append(current)
-                record_outcome(current, "kept_rescued",
-                               joined_with=joined_with_final, rescue_method=rm3)
+                row = record_outcome(current, "kept_rescued",
+                                     joined_with=joined_with_final, rescue_method=rm3)
+                keep(current, "kept_rescued", rm3, 1 + len(joined_idxs), absorbed_rows, row)
                 i += 1
                 continue
             record_outcome(current, "dropped_unjoined",
@@ -1329,12 +1444,18 @@ class DiagnosticsRecorder:
         "nearest_airport_start_code", "nearest_airport_start_km",
         "nearest_airport_end_code", "nearest_airport_end_km",
         "disposition", "drop_reason", "joined_with_segment_idx", "rescue_method",
+        # Filled by link_flights() for the final row of each kept flight and for every
+        # fragment absorbed into it; empty for dropped segments.
+        "flight_id", "od_gc_km", "od_distance_ratio", "suspect_od",
     ]
 
     def __init__(self, output_kml_path: str, preset_name: str):
-        self.csv_path = output_kml_path + ".diagnostics.csv"
+        self.set_output(output_kml_path)
         self.preset_name = preset_name
         self.rows: List[Dict[str, str]] = []
+
+    def set_output(self, output_kml_path: str) -> None:
+        self.csv_path = output_kml_path + ".diagnostics.csv"
 
     def _nearest_within(self, lat: float, lon: float, airports: List["Airport"], max_km: float = 1000.0):
         """Return (airport, distance_km) for the closest airport.
@@ -1398,6 +1519,10 @@ class DiagnosticsRecorder:
             "drop_reason": "",
             "joined_with_segment_idx": "",
             "rescue_method": "",
+            "flight_id": "",
+            "od_gc_km": "",
+            "od_distance_ratio": "",
+            "suspect_od": "",
         }
 
     def record_raw(self, segment: "FlightSegment", segment_idx: int, airports: List["Airport"]) -> None:
@@ -1405,18 +1530,37 @@ class DiagnosticsRecorder:
 
     def record_outcome(self, segment: "FlightSegment", segment_idx: int, disposition: str,
                        drop_reason: str = "", joined_with: Optional[List[int]] = None,
-                       rescue_method: str = "none", airports: Optional[List["Airport"]] = None) -> None:
+                       rescue_method: str = "none", airports: Optional[List["Airport"]] = None
+                       ) -> Dict[str, str]:
         row = self._build_row("final", segment, segment_idx, airports or [])
         row["disposition"] = disposition
         row["drop_reason"] = drop_reason
         row["joined_with_segment_idx"] = ",".join(str(i) for i in (joined_with or []))
         row["rescue_method"] = rescue_method
         self.rows.append(row)
+        return row
+
+    def link_flights(self) -> None:
+        """Copy each kept flight's id and O/D check onto the rows tied to it (``_flight``).
+
+        The absorbed ``kept_joined`` fragments get the flight_id only; the O/D check
+        describes the whole flight and goes on its own final row.
+        """
+        for row in self.rows:
+            seg = row.get("_flight")
+            if seg is None:
+                continue
+            row["flight_id"] = seg.flight_id
+            if row.get("_flight_row"):
+                row["od_gc_km"] = f"{seg.od_gc_km:.2f}" if seg.od_gc_km is not None else ""
+                row["od_distance_ratio"] = (f"{seg.od_distance_ratio:.3f}"
+                                            if seg.od_distance_ratio is not None else "")
+                row["suspect_od"] = "1" if seg.suspect_od else "0"
 
     def write_csv(self) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(self.csv_path)), exist_ok=True)
         with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=self.COLUMNS)
+            writer = csv.DictWriter(f, fieldnames=self.COLUMNS, extrasaction="ignore")
             writer.writeheader()
             for row in self.rows:
                 writer.writerow(row)
@@ -1687,6 +1831,402 @@ def create_output_kml(flight_segments: List[FlightSegment], output_file: str,
     return total_segments
 
 
+# ---------------------------------------------------------------------------
+# GeoPackage output: schema `flown_routes` v1
+# (docs/superpowers/specs/2026-10-27-route-gpkg-output-spec.md §3-§4, §6, §12)
+#
+# One `flights` row per kept flight (sampled display line), one `tracks_full` row per
+# flight (every point, M = Unix epoch seconds), optional `track_points` (per point, with
+# source and recomputed motion), `diagnostics` (the CSV rows + flight_id) and `meta`.
+# KML is rebuilt from the file by reading the flights back into FlightSegments and
+# handing them to create_output_kml, so both KML paths share one renderer.
+# ---------------------------------------------------------------------------
+
+FLOWN_SCHEMA_NAME = "flown_routes"
+FLOWN_SCHEMA_VERSION = "1"
+SUSPECT_OD_RATIO = 2.5
+
+FLIGHTS_COLUMNS = [
+    ("flight_id", "TEXT"), ("airline", "TEXT"), ("aircraft_id", "TEXT"),
+    ("registration", "TEXT"), ("callsign", "TEXT"),
+    ("origin", "TEXT"), ("dest", "TEXT"), ("city_pair", "TEXT"), ("group_key", "TEXT"),
+    ("takeoff_time", "DATETIME"), ("landing_time", "DATETIME"), ("flight_date", "DATE"),
+    ("duration_min", "REAL"), ("distance_km", "REAL"), ("max_alt_ft", "REAL"),
+    ("n_points_full", "INTEGER"), ("n_points_display", "INTEGER"),
+    ("has_gaps", "INTEGER"), ("gap_duration_min", "REAL"),
+    ("disposition", "TEXT"), ("rescue_method", "TEXT"), ("joined_segment_count", "INTEGER"),
+    ("sources", "TEXT"), ("source_file", "TEXT"), ("preset", "TEXT"),
+    ("style_color", "TEXT"), ("style_width", "REAL"), ("style_opacity", "REAL"),
+    ("od_gc_km", "REAL"), ("od_distance_ratio", "REAL"), ("suspect_od", "INTEGER"),
+]
+TRACKS_FULL_COLUMNS = [
+    ("flight_id", "TEXT"), ("city_pair", "TEXT"), ("group_key", "TEXT"),
+    ("origin", "TEXT"), ("dest", "TEXT"), ("flight_date", "DATE"),
+]
+TRACK_POINTS_COLUMNS = [
+    ("flight_id", "TEXT"), ("city_pair", "TEXT"), ("group_key", "TEXT"),
+    ("origin", "TEXT"), ("dest", "TEXT"), ("seq", "INTEGER"), ("t", "DATETIME"),
+    ("alt_ft", "REAL"), ("gs_kt", "REAL"), ("vs_fpm", "REAL"), ("track_deg", "REAL"),
+    ("source", "TEXT"),
+]
+DIAGNOSTICS_TYPES = {
+    "segment_idx": "INTEGER", "takeoff_time": "DATETIME", "landing_time": "DATETIME",
+    "duration_min": "REAL", "num_points": "INTEGER", "max_alt_m": "REAL",
+    "total_distance_km": "REAL", "mean_bearing_deg": "REAL", "origin_dist_km": "REAL",
+    "dest_dist_km": "REAL", "nearest_airport_start_km": "REAL",
+    "nearest_airport_end_km": "REAL", "od_gc_km": "REAL", "od_distance_ratio": "REAL",
+    "suspect_od": "INTEGER",
+}
+SOURCE_ORDER = ["ADSB", "POS", "FIREHOSE"]
+
+# create_output_kml keyword arguments recorded in meta.kml_params, so gpkg_to_kml
+# reproduces the build's KML by default.
+KML_PARAM_KEYS = [
+    "group_by", "sample_minutes", "override_color", "override_width", "override_opacity",
+    "show_labels", "show_icons", "extend_to_ground", "stitch_gaps", "inferred_color",
+    "stitch_gap_min", "mark_sources", "pos_color", "firehose_color", "color_mode",
+    "altitude_bands",
+]
+
+
+def annotate_flights(segments: List[FlightSegment], gap_min: float,
+                     suspect_ratio: float = SUSPECT_OD_RATIO) -> int:
+    """Give each kept flight its id, measured coverage gaps and O/D plausibility check.
+
+    * ``flight_id`` = ``{aircraft_id}_{takeoff:%Y%m%dT%H%M%SZ}``, stable across reruns of
+      the same data. A repeat (two flights of one aircraft taking off in the same second)
+      gets a ``_2``/``_3`` suffix; the number of repeats is returned.
+    * ``gap_count`` / ``gap_total_min``: inter-point gaps longer than ``gap_min`` minutes in
+      the full-resolution (post-enrichment) track. (``FlightSegment.has_gaps`` is left as
+      is: detection never sets it, and it drives the KML description.)
+    * ``od_gc_km``: great circle between the labelled airports; ``od_distance_ratio``:
+      flown distance / great circle; ``suspect_od``: ratio > ``suspect_ratio``.
+    """
+    seen: Dict[str, int] = {}
+    repeats = 0
+    for seg in segments:
+        base = f"{seg.aircraft_id}_{seg.takeoff_time:%Y%m%dT%H%M%SZ}"
+        n = seen.get(base, 0) + 1
+        seen[base] = n
+        if n > 1:
+            repeats += 1
+        seg.flight_id = base if n == 1 else f"{base}_{n}"
+
+        gaps = [(b.datetime - a.datetime).total_seconds() / 60.0
+                for a, b in zip(seg.points, seg.points[1:])]
+        long_gaps = [g for g in gaps if g > gap_min]
+        seg.gap_count = len(long_gaps)
+        seg.gap_total_min = sum(long_gaps)
+
+        gc_km = haversine_distance(seg.origin.lat, seg.origin.lon,
+                                   seg.destination.lat, seg.destination.lon)
+        seg.od_gc_km = gc_km
+        seg.od_distance_ratio = seg.total_distance / gc_km if gc_km > 0 else None
+        seg.suspect_od = (seg.od_distance_ratio is not None
+                          and seg.od_distance_ratio > suspect_ratio)
+    return repeats
+
+
+def resolve_output_path(output: str, date_from: str, date_to: str) -> str:
+    """Fill ``{from}`` / ``{to}`` in --output with the first/last flight dates."""
+    return output.replace("{from}", date_from).replace("{to}", date_to)
+
+
+def gpkg_path_for(kml_path: str) -> str:
+    """``<output>.gpkg`` next to ``<output>.kml``."""
+    root, ext = os.path.splitext(kml_path)
+    return (root if ext.lower() == ".kml" else kml_path) + ".gpkg"
+
+
+def _group_key(seg: FlightSegment, group_by: str) -> str:
+    # Same rule as create_output_kml's top-level folders.
+    if group_by == "origin":
+        return seg.origin.code if seg.origin else "UNKNOWN"
+    return seg.destination.code if seg.destination else "UNKNOWN"
+
+
+def _epoch(dt: datetime) -> float:
+    return dt.timestamp()
+
+
+def _point_motion(points: List[TrackPoint]):
+    """Yield (gs_kt, vs_fpm, track_deg) per point from the previous point; None for the
+    first point and wherever consecutive points share a timestamp."""
+    prev = None
+    for p in points:
+        if prev is None:
+            yield None, None, None
+        else:
+            dt_s = (p.datetime - prev.datetime).total_seconds()
+            if dt_s <= 0:
+                yield None, None, None
+            else:
+                gs = haversine_distance(prev.lat, prev.lon, p.lat, p.lon) / (dt_s / 3600.0) * 0.539957
+                vs = (p.alt - prev.alt) * 3.28084 / (dt_s / 60.0)
+                trk = (bearing(prev.lat, prev.lon, p.lat, p.lon)
+                       if (p.lat, p.lon) != (prev.lat, prev.lon) else None)
+                yield gs, vs, trk
+        prev = p
+
+
+def _style_number(text: str) -> Optional[float]:
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _diag_value(col: str, value: str):
+    if value is None or value == "":
+        return None
+    typ = DIAGNOSTICS_TYPES.get(col)
+    if typ == "DATETIME":
+        return gpkg_writer.format_datetime(datetime.fromisoformat(value))
+    if typ == "INTEGER":
+        return int(value)
+    if typ == "REAL":
+        return float(value)
+    return value
+
+
+def write_flown_gpkg(path: str, segments: List[FlightSegment], *, airline: str,
+                     preset_name: str, group_by: str, sample_minutes: float,
+                     include_points: bool, diagnostics_rows: List[Dict[str, Any]],
+                     meta: Dict[str, str]) -> Dict[str, int]:
+    """Write the ``flown_routes`` v1 GeoPackage for ``segments`` (annotated, in output order)."""
+    w = gpkg_writer.GeoPackageWriter(path)
+    try:
+        w.add_feature_table("flights", "LINESTRING", FLIGHTS_COLUMNS, z=True,
+                            description="One row per kept flight; geometry is the sampled "
+                                        "display line (Z metres).")
+        w.add_feature_table("tracks_full", "LINESTRING", TRACKS_FULL_COLUMNS, z=True, m=True,
+                            description="Every point of each flight; M = Unix epoch seconds.")
+        if include_points:
+            w.add_feature_table("track_points", "POINT", TRACK_POINTS_COLUMNS, z=True,
+                                description="Every point of each flight, with source and motion.")
+        diag_cols = [(c, DIAGNOSTICS_TYPES.get(c, "TEXT")) for c in DiagnosticsRecorder.COLUMNS]
+        w.add_attribute_table("diagnostics", diag_cols,
+                              description="Per-segment detection/join outcomes (CSV sidecar rows).")
+        w.add_attribute_table("meta", [("key", "TEXT"), ("value", "TEXT")],
+                              description="flown_routes schema metadata")
+
+        def flight_rows():
+            for seg in segments:
+                display = seg.sample_points(sample_minutes)
+                blob, bbox = gpkg_writer.encode_linestring(
+                    [(p.lon, p.lat, p.alt) for p in display], has_z=True)
+                present = {p.source for p in seg.points}
+                yield blob, bbox, (
+                    seg.flight_id, airline, seg.aircraft_id, seg.registration, None,
+                    seg.origin.code, seg.destination.code, seg.get_route_folder(),
+                    _group_key(seg, group_by),
+                    gpkg_writer.format_datetime(seg.takeoff_time),
+                    gpkg_writer.format_datetime(seg.landing_time),
+                    seg.takeoff_date_str,
+                    seg.flight_duration, seg.total_distance, seg.max_altitude * 3.28084,
+                    len(seg.points), len(display),
+                    1 if seg.gap_count else 0, seg.gap_total_min,
+                    seg.disposition,
+                    None if seg.rescue_method in (None, "", "none") else seg.rescue_method,
+                    seg.joined_segment_count,
+                    ",".join([s for s in SOURCE_ORDER if s in present]
+                             + sorted(present - set(SOURCE_ORDER))),
+                    seg.source_file, preset_name,
+                    seg.style_color, _style_number(seg.style_width),
+                    int(seg.style_opacity, 16) / 255.0 if re.fullmatch(r"[0-9a-fA-F]{2}",
+                                                                       seg.style_opacity or "")
+                    else None,
+                    seg.od_gc_km, seg.od_distance_ratio, 1 if seg.suspect_od else 0,
+                )
+
+        def track_rows():
+            for seg in segments:
+                blob, bbox = gpkg_writer.encode_linestring(
+                    [(p.lon, p.lat, p.alt, _epoch(p.datetime)) for p in seg.points],
+                    has_z=True, has_m=True)
+                yield blob, bbox, (seg.flight_id, seg.get_route_folder(),
+                                   _group_key(seg, group_by), seg.origin.code,
+                                   seg.destination.code, seg.takeoff_date_str)
+
+        def point_rows():
+            for seg in segments:
+                cp, gk = seg.get_route_folder(), _group_key(seg, group_by)
+                o, d = seg.origin.code, seg.destination.code
+                for seq, (p, (gs, vs, trk)) in enumerate(zip(seg.points, _point_motion(seg.points))):
+                    blob, bbox = gpkg_writer.encode_point(p.lon, p.lat, p.alt)
+                    yield blob, bbox, (seg.flight_id, cp, gk, o, d, seq,
+                                       gpkg_writer.format_datetime(p.datetime),
+                                       p.alt * 3.28084, gs, vs, trk, p.source)
+
+        counts = {"flights": w.insert_features("flights", flight_rows()),
+                  "tracks_full": w.insert_features("tracks_full", track_rows())}
+        if include_points:
+            counts["track_points"] = w.insert_features("track_points", point_rows())
+        counts["diagnostics"] = w.insert_rows(
+            "diagnostics",
+            ([_diag_value(c, row.get(c, "")) for c in DiagnosticsRecorder.COLUMNS]
+             for row in diagnostics_rows))
+        counts["meta"] = w.insert_rows("meta", sorted(meta.items()))
+
+        for col in ("city_pair", "group_key", "dest", "origin", "flight_date",
+                    "registration", "aircraft_id"):
+            w.add_index("flights", [col])
+        w.add_index("flights", ["flight_id"], unique=True)
+        w.add_index("tracks_full", ["flight_id"])
+        w.add_index("tracks_full", ["city_pair"])
+        if include_points:
+            w.add_index("track_points", ["flight_id", "seq"])
+            w.add_index("track_points", ["city_pair"])
+        w.add_index("diagnostics", ["flight_id"])
+        w.close()
+    except BaseException:
+        w.abort()
+        raise
+    return counts
+
+
+def _timestamp_from_epoch(m: float, source: str) -> str:
+    """Rebuild a ``<when>`` string from an M value (ms precision).
+
+    POS and firehose fixes were stamped to the whole second (``...:SSZ``) when loaded, so
+    those keep that form; ADS-B KML timestamps carry milliseconds (``...:SS.fffZ``).
+    """
+    ms = int(round(m * 1000.0))
+    secs, frac = divmod(ms, 1000)
+    base = datetime.fromtimestamp(secs, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    if frac == 0 and source in ("POS", "FIREHOSE"):
+        return base + "Z"
+    return f"{base}.{frac:03d}Z"
+
+
+def _style_width_text(width: Optional[float]) -> str:
+    if width is None:
+        return "2"
+    return str(int(width)) if float(width).is_integer() else repr(float(width))
+
+
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+class StoredFlight(FlightSegment):
+    """A flight read back from a ``flown_routes`` GeoPackage, for create_output_kml.
+
+    Keeps the raw ``tracks_full`` vertices and builds TrackPoints only for the vertices
+    the KML draws (rebuilding ~3M points per VIV run cost more than the KML itself).
+    ``points`` is the vertex list: the renderer only takes its length. Every value the
+    renderer prints is exact: times are whole milliseconds, ``max_altitude`` is the max Z,
+    ``total_distance`` is the stored ``distance_km`` (the builder's own double), and
+    ``sample_points`` repeats FlightSegment's arithmetic on integer milliseconds.
+    """
+
+    def __init__(self, flight_id: str, aircraft_id: str, registration: str,
+                 origin: str, dest: str, style_color: str, style_width: str,
+                 style_opacity: str, source_file: str, verts: List[Tuple[float, ...]],
+                 sources: Optional[List[str]], distance_km: float):
+        self.flight_id = flight_id
+        self.aircraft_id = aircraft_id
+        self.registration = registration
+        # Code-only airports: the KML renderer uses nothing else from them.
+        self.origin = Airport(origin, 0.0, 0.0, 0.0)
+        self.destination = Airport(dest, 0.0, 0.0, 0.0)
+        self.style_color = style_color
+        self.style_width = style_width
+        self.style_opacity = style_opacity
+        self.source_file = source_file
+        self.is_complete = True
+        # The builder never sets FlightSegment.has_gaps (detection always reports False),
+        # so the KML never carries the gap note; flights.has_gaps holds measured gaps.
+        self.has_gaps = False
+        self.gap_duration_min = 0
+        self.points = verts
+        self._sources = sources
+        self._ms = [int(round(v[3] * 1000.0)) for v in verts]
+        self.takeoff_time = _UNIX_EPOCH + timedelta(milliseconds=self._ms[0])
+        self.landing_time = _UNIX_EPOCH + timedelta(milliseconds=self._ms[-1])
+        self.flight_duration = (self.landing_time - self.takeoff_time).total_seconds() / 60
+        self.takeoff_date_str = self.takeoff_time.strftime('%Y-%m-%d')
+        self.max_altitude = max(v[2] for v in verts)
+        self.total_distance = distance_km
+
+    def _point(self, i: int) -> TrackPoint:
+        x, y, z, m = self.points[i]
+        source = self._sources[i] if self._sources else "ADSB"
+        return TrackPoint(_timestamp_from_epoch(m, source), x, y, z, source=source)
+
+    def sample_points(self, sample_minutes: float) -> List[TrackPoint]:
+        ms = self._ms
+        if not ms or sample_minutes <= 0:
+            return [self._point(i) for i in range(len(ms))]
+        keep = [0]
+        last = ms[0]
+        for i in range(1, len(ms) - 1):
+            # == (point.datetime - last).total_seconds() / 60, bit for bit
+            if (ms[i] - last) * 1000 / 10**6 / 60 >= sample_minutes:
+                keep.append(i)
+                last = ms[i]
+        if len(ms) > 1:
+            keep.append(len(ms) - 1)
+        return [self._point(i) for i in keep]
+
+
+def load_flown_gpkg(path: str) -> Tuple[Dict[str, str], List[FlightSegment]]:
+    """Read a ``flown_routes`` GeoPackage back as StoredFlights, in the written order.
+
+    Points come from ``tracks_full`` (and per-point ``source`` from ``track_points`` when
+    present; otherwise every point is ADS-B).
+    """
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM meta"))
+        if meta.get("schema_name") != FLOWN_SCHEMA_NAME:
+            raise ValueError(f"{path} is not a {FLOWN_SCHEMA_NAME} GeoPackage")
+        if meta.get("schema_version") != FLOWN_SCHEMA_VERSION:
+            raise ValueError(f"{path}: unsupported {FLOWN_SCHEMA_NAME} schema version "
+                             f"{meta.get('schema_version')}")
+        sources: Dict[str, List[str]] = defaultdict(list)
+        has_points = conn.execute("SELECT 1 FROM gpkg_contents WHERE table_name = "
+                                  "'track_points'").fetchone() is not None
+        if has_points:
+            for fid, src in conn.execute("SELECT flight_id, source FROM track_points "
+                                         "ORDER BY flight_id, seq"):
+                sources[fid].append(src)
+        tracks = dict(conn.execute("SELECT flight_id, geom FROM tracks_full"))
+        segments = []
+        for (flight_id, aircraft_id, registration, origin, dest, color, width, opacity,
+             source_file, distance_km) in conn.execute(
+                "SELECT flight_id, aircraft_id, registration, origin, dest, style_color, "
+                "style_width, style_opacity, source_file, distance_km FROM flights "
+                "ORDER BY fid").fetchall():
+            _, _, _, verts = gpkg_writer.decode_geometry(tracks[flight_id])
+            srcs = sources.get(flight_id)
+            if srcs is not None and len(srcs) != len(verts):
+                raise ValueError(f"{flight_id}: track_points/tracks_full point counts differ")
+            segments.append(StoredFlight(
+                flight_id, aircraft_id, registration, origin, dest, color,
+                _style_width_text(width),
+                format(int(round(opacity * 255)), "02x") if opacity is not None else "ff",
+                source_file or "", verts, srcs, distance_km))
+        return meta, segments
+    finally:
+        conn.close()
+
+
+def export_gpkg_to_kml(gpkg_path: str, kml_path: str, **overrides) -> int:
+    """Write KML from a ``flown_routes`` GeoPackage; returns the number of flights.
+
+    Rendering options default to the build's (``meta.kml_params``); any keyword in
+    ``KML_PARAM_KEYS`` passed with a non-None value overrides it.
+    """
+    meta, segments = load_flown_gpkg(gpkg_path)
+    params = json.loads(meta.get("kml_params", "{}"))
+    for k, v in overrides.items():
+        if k not in KML_PARAM_KEYS:
+            raise TypeError(f"unknown KML option {k}")
+        if v is not None:
+            params[k] = v
+    return create_output_kml(segments, kml_path, **params)
+
+
 def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: List["Route"],
                      output_file: str, preset: ConfidencePreset,
                      group_by: str = "destination",
@@ -1708,8 +2248,21 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
                      pos_color: str = "ff00a5ff",
                      firehose_color: str = "ff00ff00",
                      color_mode: str = "source",
-                     altitude_bands: int = 24):
-    """Main processing pipeline driven by a ConfidencePreset, emitting both KML and a diagnostics CSV."""
+                     altitude_bands: int = 24,
+                     output_format: str = "both",
+                     gpkg_points: bool = False,
+                     legacy_kml: bool = False,
+                     airline: str = "",
+                     suspect_od_ratio: float = SUSPECT_OD_RATIO,
+                     argv: Optional[List[str]] = None):
+    """Main processing pipeline driven by a ConfidencePreset.
+
+    Builds the flights once, then writes them per ``output_format`` (spec §12):
+    ``both`` = ``<output>.gpkg`` + ``<output>.kml``, ``gpkg`` = GeoPackage only, ``kml`` =
+    KML only. KML is rendered from the GeoPackage (a temporary one for ``kml``) unless
+    ``legacy_kml``, which uses the in-memory flights directly. ``{from}``/``{to}`` in
+    ``output_file`` become the first/last flight dates. The diagnostics CSV is always written.
+    """
     routes_dict = {(r.origin, r.destination): r.avg_time_min for r in routes}
     recorder = DiagnosticsRecorder(output_file, preset_name=preset.name)
 
@@ -1797,16 +2350,97 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
               f"{n_flights_enriched} of {len(final_segments)} flights "
               f"(gaps >= {stitch_gap_min:.0f} min, within each flight's own time window)")
 
-    print("\nCreating output KML...")
-    total_flights = create_output_kml(
-        final_segments, output_file, group_by,
-        sample_minutes,
-        override_color, override_width, override_opacity,
-        show_labels, show_icons, extend_to_ground,
-        stitch_gaps, inferred_color, stitch_gap_min,
+    # Flight identity, measured gaps and the origin/destination plausibility check.
+    repeats = annotate_flights(final_segments, gap_min=stitch_gap_min,
+                               suspect_ratio=suspect_od_ratio)
+    if repeats:
+        print(f"\nWarning: {repeats} flight id(s) repeated (same aircraft, same takeoff "
+              f"second); suffixed _2, _3, ...")
+    suspect = [s for s in final_segments if s.suspect_od]
+    recorder.link_flights()
+
+    # Name outputs from the actual first/last flight (UTC takeoff) dates.
+    flight_dates = sorted(s.takeoff_date_str for s in final_segments)
+    date_from = flight_dates[0] if flight_dates else ""
+    date_to = flight_dates[-1] if flight_dates else ""
+    output_file = resolve_output_path(output_file, date_from or "nodata", date_to or "nodata")
+    recorder.set_output(output_file)
+    gpkg_path = gpkg_path_for(output_file)
+    write_kml = output_format in ("both", "kml")
+    write_gpkg = output_format in ("both", "gpkg") or (write_kml and not legacy_kml)
+    keep_gpkg = output_format in ("both", "gpkg")
+
+    route_counts = defaultdict(int)
+    for seg in final_segments:
+        route_counts[f"{seg.origin.code}-{seg.destination.code}"] += 1
+    n_raw_segments = len(all_segments)
+
+    kml_params = dict(
+        group_by=group_by, sample_minutes=sample_minutes,
+        override_color=override_color, override_width=override_width,
+        override_opacity=override_opacity, show_labels=show_labels, show_icons=show_icons,
+        extend_to_ground=extend_to_ground, stitch_gaps=stitch_gaps,
+        inferred_color=inferred_color, stitch_gap_min=stitch_gap_min,
         mark_sources=integrate_pos, pos_color=pos_color, firehose_color=firehose_color,
-        color_mode=color_mode, altitude_bands=altitude_bands
+        color_mode=color_mode, altitude_bands=altitude_bands,
     )
+
+    gpkg_counts: Dict[str, int] = {}
+    gpkg_seconds = 0.0
+    if write_gpkg:
+        if not keep_gpkg:
+            fd, gpkg_path = tempfile.mkstemp(suffix=".gpkg",
+                                             dir=os.path.dirname(os.path.abspath(output_file)))
+            os.close(fd)
+        include_points = gpkg_points or integrate_pos  # per-point source needed (spec §4.3)
+        if not airline:
+            print("\nWarning: --airline not given; the GeoPackage's airline fields are empty.")
+        meta = {
+            "schema_name": FLOWN_SCHEMA_NAME, "schema_version": FLOWN_SCHEMA_VERSION,
+            "tool": "adsb_historical_routes", "tool_version": TOOL_VERSION,
+            "created_utc": gpkg_writer.utc_now_str(), "airline": airline,
+            "date_from": date_from, "date_to": date_to,
+            "argv": json.dumps(argv if argv is not None else sys.argv[1:]),
+            "source_count": str(len(kml_files)),
+            "preset": preset.name, "group_by": group_by,
+            "sample_minutes": str(sample_minutes), "stitch_gap_min": str(stitch_gap_min),
+            "integrate_pos": "1" if integrate_pos else "0",
+            "track_points": "1" if include_points else "0",
+            "kml_params": json.dumps(kml_params),
+            "flight_count": str(len(final_segments)),
+            "suspect_od_ratio": str(suspect_od_ratio),
+            "suspect_od_count": str(len(suspect)),
+        }
+        print(f"\nWriting GeoPackage{' (temporary, for KML)' if not keep_gpkg else ''}...")
+        t0 = time.time()
+        gpkg_counts = write_flown_gpkg(
+            gpkg_path, final_segments, airline=airline, preset_name=preset.name,
+            group_by=group_by, sample_minutes=sample_minutes, include_points=include_points,
+            diagnostics_rows=recorder.rows, meta=meta)
+        gpkg_seconds = time.time() - t0
+        if keep_gpkg:
+            print(f"GeoPackage written to: {gpkg_path}")
+            print("  " + ", ".join(f"{k}: {v}" for k, v in gpkg_counts.items())
+                  + f" ({gpkg_seconds:.1f}s)")
+
+    total_flights = len(final_segments)
+    if write_kml:
+        print("\nCreating output KML...")
+        if legacy_kml:
+            total_flights = create_output_kml(final_segments, output_file, **kml_params)
+        else:
+            # Everything the KML needs is now in the GeoPackage: release the in-memory
+            # tracks before reading it back, so peak memory stays near a single copy.
+            for seg in all_segments:
+                seg.points = None
+            for seg in final_segments:
+                seg.points = None
+            all_segments = segments_by_aircraft = pos_index = None
+            try:
+                total_flights = export_gpkg_to_kml(gpkg_path, output_file)
+            finally:
+                if not keep_gpkg and os.path.exists(gpkg_path):
+                    os.remove(gpkg_path)
 
     recorder.write_csv()
 
@@ -1815,12 +2449,12 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
     print("=" * 60)
     print(f"Confidence preset: {preset.name}")
     print(f"Total valid complete flights: {total_flights}")
-    print(f"Match rate: {total_flights}/{len(all_segments)} = "
-          f"{total_flights / max(len(all_segments), 1) * 100:.1f}%")
+    print(f"Match rate: {total_flights}/{n_raw_segments} = "
+          f"{total_flights / max(n_raw_segments, 1) * 100:.1f}%")
+    print(f"Flight dates: {date_from} -> {date_to}")
+    print(f"Suspect O/D (flown > {suspect_od_ratio:g}x great circle): {len(suspect)} "
+          f"({len(suspect) / max(total_flights, 1) * 100:.1f}%)")
 
-    route_counts = defaultdict(int)
-    for seg in final_segments:
-        route_counts[f"{seg.origin.code}-{seg.destination.code}"] += 1
     print("\nFlights by route:")
     for route, count in sorted(route_counts.items()):
         print(f"  {route}: {count} flights")
@@ -1852,7 +2486,29 @@ def main():
     parser.add_argument('--routes', required=True,
                        help='CSV file containing route times')
     parser.add_argument('--output', required=True,
-                       help='Output KML file name')
+                       help='Output KML file name; the GeoPackage is written next to it as '
+                            '<output>.gpkg. {from} and {to} are replaced by the first and last '
+                            'flight dates (e.g. viv_flown_{from}_{to}.kml)')
+
+    # Output selection (GeoPackage spec §12)
+    parser.add_argument('--format', choices=['both', 'gpkg', 'kml'], default=None,
+                       dest='output_format',
+                       help='Outputs to write: both (default) = <output>.gpkg + <output>.kml; '
+                            'gpkg = GeoPackage only; kml = KML only')
+    parser.add_argument('--gpkg', action='store_true',
+                       help='Deprecated alias for --format both')
+    parser.add_argument('--gpkg-points', action='store_true', dest='gpkg_points',
+                       help='Also write the per-point track_points layer (always on with '
+                            '--integrate-pos)')
+    parser.add_argument('--legacy-kml', action='store_true', dest='legacy_kml',
+                       help='Write KML with the direct (pre-GeoPackage) writer instead of '
+                            'rendering it from the GeoPackage. Kept for one release.')
+    parser.add_argument('--airline', default='',
+                       help='Airline code recorded in the GeoPackage (flights.airline, meta)')
+    parser.add_argument('--suspect-od-ratio', type=float, default=SUSPECT_OD_RATIO,
+                       dest='suspect_od_ratio',
+                       help='Flag a flight as suspect_od when its flown distance exceeds this '
+                            'multiple of the great circle between its airports (default 2.5)')
     
     parser.add_argument('--sample', type=float, default=2.0,
                        help='Point sampling interval in minutes (default: 2)')
@@ -1963,6 +2619,17 @@ def main():
         print("Error: --altitude-bands must be >= 1")
         sys.exit(1)
 
+    output_format = args.output_format or 'both'
+    if args.gpkg:
+        if output_format != 'both':
+            print("Error: --gpkg (alias for --format both) conflicts with "
+                  f"--format {output_format}")
+            sys.exit(1)
+        print("Note: --gpkg is deprecated; GeoPackage output is the default (--format both).")
+    if args.suspect_od_ratio <= 0:
+        print("Error: --suspect-od-ratio must be > 0")
+        sys.exit(1)
+
     kml_files = []
     if args.kml_files:
         for f in args.kml_files:
@@ -2013,6 +2680,8 @@ def main():
     print(f"  Sample interval: {args.sample} minutes")
     print(f"  Max gap allowed: {args.maxgap} minutes")
     print(f"  Grouping: by {args.group}")
+    print(f"  Output format: {output_format}"
+          f"{' (legacy KML writer)' if args.legacy_kml and output_format != 'gpkg' else ''}")
     print(f"  Zero-altitude track filtering: ENABLED")
     print(f"  Cross-file segment joining: ENABLED")
     print(f"  Route time matching: ENABLED")
@@ -2052,8 +2721,14 @@ def main():
         firehose_color=args.firehose_color,
         color_mode=args.color_mode,
         altitude_bands=args.altitude_bands,
+        output_format=output_format,
+        gpkg_points=args.gpkg_points,
+        legacy_kml=args.legacy_kml,
+        airline=args.airline,
+        suspect_od_ratio=args.suspect_od_ratio,
+        argv=sys.argv[1:],
     )
-    
+
     print("\nProcessing complete!")
 
     # All output files are already written and closed above. On large runs the process

@@ -1,6 +1,7 @@
 """Shared pytest fixtures for adsb_historical_routes tests."""
 
 import importlib.util
+import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -70,6 +71,82 @@ def make_segment(ahr, make_track_point):
 def utc():
     """A baseline UTC datetime."""
     return datetime(2026, 2, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _write_track_kml(path: Path, registration: str, flights) -> None:
+    """One ADS-B-Exchange-style day file: one gx:Track holding every point of the day."""
+    whens, coords = [], []
+    for pts in flights:
+        for t, lat, lon, alt in pts:
+            whens.append(f"<when>{t:%Y-%m-%dT%H:%M:%S}.{t.microsecond // 1000:03d}Z</when>")
+            coords.append(f"<gx:coord>{lon:.6f} {lat:.6f} {alt:.0f}</gx:coord>")
+    path.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2">'
+        f"<Folder><Folder><name>{registration} track</name><Placemark><name>{registration}</name>"
+        "<Style><LineStyle><color>ff1c1ae3</color><width>4</width></LineStyle></Style>"
+        "<gx:Track><altitudeMode>absolute</altitudeMode><extrude>1</extrude>"
+        + "".join(whens) + "".join(coords) + "</gx:Track></Placemark></Folder></Folder></kml>")
+
+
+def _flight_points(start: datetime, minutes: float, a, b, step_s: int = 20, skip=None):
+    """(t, lat, lon, alt_m) along a->b: climb/descent over the first/last 15%, cruise 10 km.
+    ``skip`` = (from_min, to_min) leaves a coverage hole."""
+    n = int(minutes * 60 / step_s)
+    out = []
+    for i in range(n + 1):
+        f = i / n
+        m = f * minutes
+        if skip and skip[0] < m < skip[1]:
+            continue
+        alt = 30.0 + 9970.0 * min(1.0, f / 0.15, (1 - f) / 0.15)
+        out.append((start + timedelta(seconds=i * step_s),
+                    a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, alt))
+    return out
+
+
+@pytest.fixture(scope="session")
+def flown_fixture(tmp_path_factory):
+    """Synthetic VIV-like inputs: 4 flights over 2 days for 2 aircraft.
+
+    * ABC001 10-01: AAA->BBB, then BBB->AAA with an 8-min interior gap (stitch connector);
+      10-02: AAA->BBB.
+    * ABC002 10-01: AAA->CCC with a 30-min hole, so it arrives as two segments that are
+      joined, plus firehose fixes inside the hole (--integrate-pos fills it).
+    """
+    root = tmp_path_factory.mktemp("flown_fixture")
+    kml_dir = root / "kml"
+    fh_dir = root / "firehose"
+    kml_dir.mkdir()
+    fh_dir.mkdir()
+    AAA, BBB, CCC = (0.0, 0.0), (0.0, 5.0), (4.0, 2.0)
+    (root / "airports.csv").write_text(
+        "airport,latitude,longitude,elevation_ft\nAAA,0.0,0.0,100\nBBB,0.0,5.0,100\nCCC,4.0,2.0,100\n")
+    (root / "routes.csv").write_text(
+        "origin,destination,avg_enroute_min\nAAA,BBB,60\nBBB,AAA,60\nAAA,CCC,80\nCCC,AAA,80\n")
+    d1 = datetime(2026, 10, 1, 10, 0, 0, 250000, tzinfo=timezone.utc)
+    d2 = datetime(2026, 10, 2, 9, 30, 0, 125000, tzinfo=timezone.utc)
+    _write_track_kml(kml_dir / "abc001_2026-10-01_baro_avg.kml", "XA-AAA", [
+        _flight_points(d1, 60, AAA, BBB),
+        _flight_points(d1 + timedelta(hours=2), 60, BBB, AAA, skip=(30, 38)),
+    ])
+    _write_track_kml(kml_dir / "abc001_2026-10-02_baro_avg.kml", "XA-AAA", [
+        _flight_points(d2, 60, AAA, BBB),
+    ])
+    hole = (25, 55)
+    _write_track_kml(kml_dir / "abc002_2026-10-01_baro_avg.kml", "XA-BBB", [
+        _flight_points(d1 + timedelta(minutes=7), 80, AAA, CCC, skip=hole),
+    ])
+    start = d1 + timedelta(minutes=7)
+    for k, m in enumerate(range(hole[0] + 1, hole[1], 2)):
+        t = start + timedelta(minutes=m)
+        f = m / 80
+        (fh_dir / f"XABBB_{k:04d}.json").write_text(json.dumps({
+            "icao": "abc002", "timestamp": int(t.timestamp()),
+            "latitude": AAA[0] + (CCC[0] - AAA[0]) * f,
+            "longitude": AAA[1] + (CCC[1] - AAA[1]) * f, "altitude": "33000"}))
+    return {"root": root, "kml_dir": kml_dir, "firehose": fh_dir,
+            "airports": root / "airports.csv", "routes": root / "routes.csv"}
 
 
 @pytest.fixture(scope="session")
