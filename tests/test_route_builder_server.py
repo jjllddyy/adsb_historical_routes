@@ -429,3 +429,26 @@ def test_validate_cirium(tmp_path):
     v4 = server.validate_cirium({"cirium_input": ci, "output_dir": root, "output_prefix": "x"},
                                 [root], airport_lookup_dir="/no/such/lookup/dir")
     assert any("airport_lookup" in e.lower() for e in v4["errors"])
+
+
+def test_build_argv_gpkg_options():
+    base = {"kml_folder": "/in", "airports": "a.csv", "routes": "r.csv",
+            "output_dir": "/out", "output_name": "viv_{from}_{to}.kml"}
+    argv = server.build_argv(dict(base, format="both", airline="", gpkg_points=False))
+    assert "--format" not in argv and "--airline" not in argv and "--gpkg-points" not in argv
+    argv = server.build_argv(dict(base, format="gpkg", airline="VIV", gpkg_points=True))
+    assert argv[argv.index("--format") + 1] == "gpkg"
+    assert argv[argv.index("--airline") + 1] == "VIV"
+    assert "--gpkg-points" in argv and argv[argv.index("--gpkg-points") + 1:] == []
+    assert argv[argv.index("--output") + 1] == "/out/viv_{from}_{to}.kml"
+
+
+def test_parse_summary_gpkg_only_counts_as_output():
+    text = ("TOTAL VALID COMPLETE FLIGHTS: 12\n"
+            "GeoPackage written to: /out/viv_2026-09-30_2026-10-19.gpkg\n"
+            "Flight dates: 2026-09-30 -> 2026-10-19\n"
+            "Suspect O/D (flown > 2.5x great circle): 3 (0.3%)\n")
+    s = server.parse_summary(text)
+    assert s["output"] == s["gpkg"] == "/out/viv_2026-09-30_2026-10-19.gpkg"
+    assert s["suspect_od"] == 3
+    assert (s["date_from"], s["date_to"]) == ("2026-09-30", "2026-10-19")

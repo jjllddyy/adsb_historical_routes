@@ -77,9 +77,12 @@ _ARGV_MAP = [
     ("pos_color", "--pos-color", "ff00a5ff"), ("firehose_color", "--firehose-color", "ff00ff00"),
     ("pos_folder", "--pos-folder", ""), ("firehose_folder", "--firehose-folder", ""),
     ("tail_icao", "--tail-icao", ""),
+    ("format", "--format", "both"), ("airline", "--airline", ""),
 ]
 _BOOL_FLAGS = [("labels", "--labels"), ("icons", "--icons"), ("ground", "--ground"),
                ("stitch_gaps", "--stitch-gaps"), ("integrate_pos", "--integrate-pos")]
+# Switches that take no value (argparse store_true).
+_SWITCH_FLAGS = [("gpkg_points", "--gpkg-points")]
 
 
 def build_argv(params: Dict[str, Any], script: Optional[str] = None) -> List[str]:
@@ -103,6 +106,9 @@ def build_argv(params: Dict[str, Any], script: Optional[str] = None) -> List[str
     for key, flag in _BOOL_FLAGS:
         if params.get(key):                       # only emit when user turned it on
             argv += [flag, "true"]
+    for key, flag in _SWITCH_FLAGS:
+        if params.get(key):
+            argv.append(flag)
     return argv
 
 
@@ -193,6 +199,8 @@ def parse_summary(text: str) -> Dict[str, Any]:
         ("points_out", r"Data reduction:\s*\d+ points -> (\d+) points", int),
         ("compression", r"Compression ratio:\s*([\d.]+)%", float),
         ("connectors", r"Gap stitching:\s*(\d+) inferred connector", int),
+        ("gpkg", r"GeoPackage written to:\s*(.+)", str),
+        ("suspect_od", r"Suspect O/D[^:]*:\s*(\d+)", int),
     ]:
         v = grab(pat, cast)
         if v is not None:
@@ -202,6 +210,11 @@ def parse_summary(text: str) -> Dict[str, Any]:
         out["filled_fixes"] = int(mm.group(1).replace(",", ""))
         out["filled_flights"] = int(mm.group(2))
         out["total_flights"] = int(mm.group(3))
+    mm = re.search(r"Flight dates:\s*(\S+) -> (\S+)", text)
+    if mm:
+        out["date_from"], out["date_to"] = mm.group(1), mm.group(2)
+    if "output" not in out and "gpkg" in out:     # --format gpkg writes no KML
+        out["output"] = out["gpkg"]
     return out
 
 
@@ -287,9 +300,18 @@ def validate(params: Dict[str, Any], allowed_roots: List[str]) -> Dict[str, Any]
         errors.append("Output filename not set")
     elif os.path.basename(params["output_name"]) != params["output_name"]:
         errors.append("Output filename must be a plain filename, not a path")
-    output_exists = bool(out_path) and os.path.exists(out_path)
+    fmt = params.get("format") or "both"
+    targets = []
+    if fmt in ("both", "kml"):
+        targets.append(out_path)
+    if fmt in ("both", "gpkg"):
+        root, ext = os.path.splitext(out_path)
+        targets.append((root if ext.lower() == ".kml" else out_path) + ".gpkg")
+    output_exists = bool(params.get("output_name")) and any(os.path.exists(p) for p in targets)
     if output_exists:
         warnings.append("Output file already exists and will be overwritten")
+    if fmt != "kml" and not params.get("airline"):
+        warnings.append("Airline code not set; the GeoPackage's airline fields will be empty")
     if params.get("color_mode") == "altitude" and params.get("color"):
         warnings.append("Line-color override is ignored in altitude color mode")
     if params.get("altitude_bands") is not None and params["altitude_bands"] < 1:
