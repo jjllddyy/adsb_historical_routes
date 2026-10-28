@@ -5,6 +5,31 @@ All notable changes to the Flight Route Splitter project will be documented in t
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-10-28 (gpkg-output branch)
+
+### Added
+
+- **GeoPackage output** (`flown_routes` schema v1, see [`docs/GEOPACKAGE.md`](docs/GEOPACKAGE.md)): `flights` (one row per flight, sampled display line), `tracks_full` (every point, M = epoch seconds), optional `track_points` (per-point source, ground speed, vertical speed, track), `diagnostics` and `meta`. Written with the new standard-library `gpkg_writer.py` (no GDAL); validated with GDAL's `validate_gpkg.py`, `ogrinfo` and QGIS 3.44.
+- **Output selection** `--format both|gpkg|kml` (default `both`), `--gpkg-points`, `--airline`, `--suspect-od-ratio`; `--gpkg` is a deprecated alias for `--format both`.
+- **`gpkg_to_kml.py`**: rebuild the KML from a GeoPackage without re-running the builder; every styling/sampling option defaults to the build's.
+- **`kml_compare.py`**: the spec §6 KML equivalence check (folder tree, placemarks, descriptions, styles, coordinates to 1e-6, `when` to 1 ms), streaming, for multi-hundred-MB files.
+- `{from}` / `{to}` in `--output` are replaced by the first/last flight dates.
+- Origin/destination plausibility check: `od_gc_km`, `od_distance_ratio`, `suspect_od` on each flight, counted in the diagnostics and the run summary.
+- Diagnostics CSV gains `flight_id`, `od_gc_km`, `od_distance_ratio`, `suspect_od`.
+- Route Builder GUI: Output format, Airline code and GeoPackage track points in the Output section; result card shows suspect O/D count, flight dates and the GeoPackage.
+
+### Changed
+
+- KML is now rendered from the GeoPackage (a temporary one with `--format kml`). Output is byte-identical to the direct writer in every mode tested; the direct writer remains behind `--legacy-kml` for one release.
+
+### Fixed
+
+- **Origin/destination mislabels** (about 2.7% of VIV October flights flew > 2.5× the great circle between their labelled airports, e.g. 131 "MMTO→MMSM" flights of 2½–10 h). Four root causes in airport assignment:
+  - A farther airport could "steal" an endpoint: a climbing departure first seen 16 km from MMSM failed MMSM's altitude allowance but passed the larger, elevation-scaled one of MMTO 89 km away. The closest airport now wins when the height above it fits a 3° climb/descent path.
+  - Route-time rescue accepted a destination the track had already flown past (corridor cross-track has no along-track limit); it now applies the same along-track limit as corridor geometry.
+  - Fragments of an out-and-back across a coverage hole (MMSM→MMVA→MMSM with no coverage at MMVA) were joined into one "flight"; a reversed heading with no progress across the gap now blocks the join.
+  - A destination inferred for a short fragment survived a join that extended the track past it; it is now dropped and re-inferred on the merged track.
+
 ## [1.2.0] - 2026-09-22 (route-builder branch)
 
 ### Added
