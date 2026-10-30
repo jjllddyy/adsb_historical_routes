@@ -6,7 +6,7 @@
     "routes_dir": "input",
     "output_default": "output",
     "airport_lookup_dir": "~/Git/conversion_tools/airport_lookup",
-    "allowed_roots": ["~/Git/kml", ".", "/Volumes/jy-ext"]
+    "allowed_roots": ["~/Git/kml", "~/Git/qgis", ".", "/Volumes/jy-ext"]
   },
   "server": { "port": 8765 },
   "defaults": {
@@ -17,7 +17,8 @@
     "stitch_gaps": false, "inferred_color": "ff888888", "stitch_gap_min": 5,
     "integrate_pos": false, "pos_color": "ff00a5ff", "firehose_color": "ff00ff00",
     "altitude_palette": "adsbex", "altitude_bands": 24,
-    "format": "both", "airline": "", "gpkg_points": false
+    "format": "both", "airline": "", "gpkg_points": false,
+    "qgz": false, "navdb": "", "company": ""
   },
   "presets": [
     {"name": "Recommended — clean & complete", "builtin": true,

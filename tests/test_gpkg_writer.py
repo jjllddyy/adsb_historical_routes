@@ -60,6 +60,22 @@ class TestGeometryEncoding:
         assert gw.decode_geometry(blob) == ("POINT", True, False, [(-99.5, 19.25, 2840.0)])
         assert bbox == (-99.5, -99.5, 19.25, 19.25)
 
+    def test_multilinestring_zm_round_trip(self):
+        parts = [[(170.0, -17.0, 100.0, 1.7e9), (180.0, -16.0, 150.0, 1.7e9 + 30.0)],
+                 [(-180.0, -16.0, 150.0, 1.7e9 + 30.0), (-172.0, -13.8, 0.0, 1.7e9 + 90.5)]]
+        blob, bbox = gw.encode_multilinestring(parts, has_z=True, has_m=True)
+        assert bbox == (-180.0, 180.0, -17.0, -13.8)
+        assert struct.unpack_from("<4d", blob, 8) == bbox
+        assert struct.unpack_from("<BII", blob, 40) == (1, 3005, 2)   # ISO MultiLineString ZM
+        assert struct.unpack_from("<BI", blob, 49) == (1, 3002)       # each part a LineString ZM
+        kind, has_z, has_m, got = gw.decode_geometry(blob)
+        assert (kind, has_z, has_m) == ("MULTILINESTRING", True, True)
+        assert [[tuple(v) for v in part] for part in got] == parts
+
+    def test_multilinestring_needs_a_part(self):
+        with pytest.raises(ValueError):
+            gw.encode_multilinestring([])
+
     def test_dimension_mismatch_rejected(self):
         with pytest.raises(ValueError):
             gw.encode_linestring([(0.0, 0.0)], has_z=True)
@@ -125,3 +141,21 @@ class TestGeoPackageFile:
         assert "Warning" not in res.stdout + res.stderr
         assert "Feature Count: 3" in res.stdout
         assert "3D Measured Line String" in res.stdout
+
+    @pytest.mark.skipif(_ogrinfo() is None, reason="GDAL ogrinfo not installed")
+    def test_ogrinfo_reads_multilinestring(self, tmp_path):
+        path = tmp_path / "m.gpkg"
+        w = gw.GeoPackageWriter(str(path))
+        w.add_feature_table("multi", "MULTILINESTRING", [("k", "TEXT")], z=True, m=True)
+        blob, bbox = gw.encode_multilinestring(
+            [[(170.0, -17.0, 1.0, 1.0), (180.0, -16.0, 2.0, 2.0)],
+             [(-180.0, -16.0, 2.0, 2.0), (-172.0, -13.8, 3.0, 3.0)]], has_z=True, has_m=True)
+        w.insert_features("multi", [(blob, bbox, ("a",))])
+        w.close()
+        res = subprocess.run([_ogrinfo(), "-al", str(path)], capture_output=True, text=True,
+                             timeout=60)
+        assert res.returncode == 0, res.stderr
+        assert "Warning" not in res.stdout + res.stderr
+        assert "3D Measured Multi Line String" in res.stdout
+        assert "MULTILINESTRING ZM ((170 -17 1 1,180 -16 2 2),(-180 -16 2 2,-172 -13.8 3 3))" \
+            in res.stdout

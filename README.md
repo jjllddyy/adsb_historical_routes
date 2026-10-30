@@ -230,6 +230,11 @@ records use the current `SPJC`. Add rows as new mismatches are found.
 | `--suspect-od-ratio` | `2.5` | A flight whose flown distance exceeds this multiple of its airports' great circle is flagged `suspect_od`. |
 | `--legacy-kml` | off | Write KML with the direct (pre-GeoPackage) writer. Kept for one release. |
 | `--gpkg` | — | Deprecated alias for `--format both`. |
+| `--takeoff-from`, `--takeoff-to` | *(none)* | Keep only flights whose UTC takeoff date is in range (`YYYY-MM-DD`, inclusive); daily KML files more than a day outside it are skipped. |
+| `--qgz` | off | Also write `<output base>.qgz` next to the GeoPackage: a QGIS project built by `~/Git/qgis` `prepare` (navdb chart layers, basemaps, styles; links to the GeoPackages, copies no data). Not allowed with `--format kml`. |
+| `--navdb` | *(none)* | `navdb_<AIRAC>.gpkg` for the project's chart layers. Required with `--qgz`; checked before the build starts. |
+| `--company` | *(none)* | Optional `company_routes` GeoPackage. With it the project is the full Route Explorer (flights matched to company routes); without it, flown routes only. |
+| `--qgis-repo` | `$QGIS_REPO`, else `~/Git/qgis` | The QGIS viewer checkout whose `prepare` builds the project. |
 
 **Detection & sampling**
 
@@ -503,12 +508,15 @@ skipped (ground noise).
 placemarks; each `gx:coord` is `lon lat alt` (altitude in meters, preserved). Document title is the
 output filename stem + grouping mode (e.g. `lan_routes_2026_0601-0731_destination`).
 
-**Output GeoPackage** (`flown_routes` v1) — `flights` (one row per flight, sampled line),
-`tracks_full` (every point, M = epoch seconds), optional `track_points`, `diagnostics`, `meta`.
-Opens directly in QGIS. Rebuild KML from it any time without re-running the builder:
+**Output GeoPackage** (`flown_routes` v2) — `flights` (one row per flight, sampled line),
+`tracks_full` (every point, M = epoch seconds), both MULTILINESTRINGs split at the date line;
+optional `track_points`, `diagnostics`, `meta`. Opens directly in QGIS. Without re-running the
+builder you can rebuild the KML, build the QGIS project, or print a summary:
 
 ```bash
 python3 gpkg_to_kml.py output/viv_flown_2026-09-30_2026-10-19.gpkg -o viv.kml [--color-mode altitude ...]
+python3 gpkg_to_qgz.py output/viv_flown_2026-09-30_2026-10-19.gpkg --navdb ~/Git/qgis/input/navdb_2610.gpkg [--company company.gpkg]
+python3 gpkg_summary.py output/viv_flown_2026-09-30_2026-10-19.gpkg -o viv_summary.txt
 ```
 
 Full schema, columns and the origin/destination check: [docs/GEOPACKAGE.md](docs/GEOPACKAGE.md).

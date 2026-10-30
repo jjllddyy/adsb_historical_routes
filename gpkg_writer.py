@@ -21,6 +21,7 @@ Usage::
     w.add_feature_table("lines", "LINESTRING", [("name", "TEXT")], z=True)
     blob, bbox = encode_linestring([(lon, lat, z), ...], has_z=True)
     w.insert_features("lines", [(blob, bbox, ("a",))])
+    # MULTILINESTRING tables take encode_multilinestring([[part 1 vertices], [part 2], ...])
     w.add_attribute_table("meta", [("key", "TEXT"), ("value", "TEXT")])
     w.insert_rows("meta", [("schema_version", "1")])
     w.add_index("lines", ["name"])
@@ -45,7 +46,7 @@ WGS84_WKT = (
     'AUTHORITY["EPSG","4326"]]'
 )
 
-_GEOM_TYPE_CODES = {"POINT": 1, "LINESTRING": 2}
+_GEOM_TYPE_CODES = {"POINT": 1, "LINESTRING": 2, "MULTILINESTRING": 5}
 _GEOM_CODE_NAMES = {v: k for k, v in _GEOM_TYPE_CODES.items()}
 
 Bbox = Tuple[float, float, float, float]  # (minx, maxx, miny, maxy), the R-tree order
@@ -93,9 +94,8 @@ def encode_point(x: float, y: float, z: Optional[float] = None,
     return _header(srs_id, None) + body, (x, x, y, y)
 
 
-def encode_linestring(coords: Sequence[Sequence[float]], has_z: bool = False,
-                      has_m: bool = False, srs_id: int = WGS84_SRS_ID) -> Tuple[bytes, Bbox]:
-    """Encode a LineString[Z][M] from ``(x, y[, z][, m])`` tuples; returns (blob, bbox)."""
+def _linestring_wkb(coords: Sequence[Sequence[float]], has_z: bool,
+                    has_m: bool) -> Tuple[bytes, Bbox]:
     dims = 2 + (1 if has_z else 0) + (1 if has_m else 0)
     flat: List[float] = []
     for c in coords:
@@ -108,11 +108,49 @@ def encode_linestring(coords: Sequence[Sequence[float]], has_z: bool = False,
     n = len(coords)
     body = (struct.pack("<BII", 1, _wkb_type(2, has_z, has_m), n)
             + struct.pack(f"<{n * dims}d", *flat))
+    return body, bbox
+
+
+def encode_linestring(coords: Sequence[Sequence[float]], has_z: bool = False,
+                      has_m: bool = False, srs_id: int = WGS84_SRS_ID) -> Tuple[bytes, Bbox]:
+    """Encode a LineString[Z][M] from ``(x, y[, z][, m])`` tuples; returns (blob, bbox)."""
+    body, bbox = _linestring_wkb(coords, has_z, has_m)
     return _header(srs_id, bbox) + body, bbox
 
 
-def decode_geometry(blob: bytes) -> Tuple[str, bool, bool, List[Tuple[float, ...]]]:
-    """Decode a GeoPackage Point/LineString blob -> (type_name, has_z, has_m, vertices)."""
+def encode_multilinestring(parts: Sequence[Sequence[Sequence[float]]], has_z: bool = False,
+                           has_m: bool = False,
+                           srs_id: int = WGS84_SRS_ID) -> Tuple[bytes, Bbox]:
+    """Encode a MultiLineString[Z][M] from parts of ``(x, y[, z][, m])`` tuples.
+
+    Each part is a full WKB LineString of the same dimension; the envelope covers all parts.
+    """
+    if not parts:
+        raise ValueError("a MultiLineString needs at least one part")
+    bodies = []
+    minx = miny = float("inf")
+    maxx = maxy = float("-inf")
+    for part in parts:
+        body, (x0, x1, y0, y1) = _linestring_wkb(part, has_z, has_m)
+        bodies.append(body)
+        minx, maxx, miny, maxy = min(minx, x0), max(maxx, x1), min(miny, y0), max(maxy, y1)
+    bbox = (minx, maxx, miny, maxy)
+    head = struct.pack("<BII", 1, _wkb_type(5, has_z, has_m), len(parts))
+    return _header(srs_id, bbox) + head + b"".join(bodies), bbox
+
+
+def _read_linestring(blob: bytes, off: int, endian: str, dims: int):
+    (n,) = struct.unpack_from(endian + "I", blob, off)
+    flat = struct.unpack_from(f"{endian}{n * dims}d", blob, off + 4)
+    return [flat[i:i + dims] for i in range(0, n * dims, dims)], off + 4 + 8 * n * dims
+
+
+def decode_geometry(blob: bytes) -> Tuple[str, bool, bool, List]:
+    """Decode a GeoPackage Point/LineString/MultiLineString blob.
+
+    Returns ``(type_name, has_z, has_m, vertices)``; for a MULTILINESTRING ``vertices`` is
+    the list of parts, each a list of vertex tuples.
+    """
     if blob[:2] != b"GP":
         raise ValueError("not a GeoPackage geometry blob")
     flags = blob[3]
@@ -129,9 +167,15 @@ def decode_geometry(blob: bytes) -> Tuple[str, bool, bool, List[Tuple[float, ...
     if base == 1:
         verts = [struct.unpack_from(f"{endian}{dims}d", blob, off)]
     elif base == 2:
-        (n,) = struct.unpack_from(endian + "I", blob, off)
-        flat = struct.unpack_from(f"{endian}{n * dims}d", blob, off + 4)
-        verts = [flat[i:i + dims] for i in range(0, n * dims, dims)]
+        verts = _read_linestring(blob, off, endian, dims)[0]
+    elif base == 5:
+        (n_parts,) = struct.unpack_from(endian + "I", blob, off)
+        off += 4
+        verts = []
+        for _ in range(n_parts):
+            part_endian = "<" if blob[off] == 1 else ">"
+            part, off = _read_linestring(blob, off + 5, part_endian, dims)
+            verts.append(part)
     else:
         raise ValueError(f"unsupported WKB geometry type {code}")
     return _GEOM_CODE_NAMES[base], has_z, has_m, verts

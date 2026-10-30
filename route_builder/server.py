@@ -78,11 +78,12 @@ _ARGV_MAP = [
     ("pos_folder", "--pos-folder", ""), ("firehose_folder", "--firehose-folder", ""),
     ("tail_icao", "--tail-icao", ""),
     ("format", "--format", "both"), ("airline", "--airline", ""),
+    ("navdb", "--navdb", ""), ("company", "--company", ""),
 ]
 _BOOL_FLAGS = [("labels", "--labels"), ("icons", "--icons"), ("ground", "--ground"),
                ("stitch_gaps", "--stitch-gaps"), ("integrate_pos", "--integrate-pos")]
 # Switches that take no value (argparse store_true).
-_SWITCH_FLAGS = [("gpkg_points", "--gpkg-points")]
+_SWITCH_FLAGS = [("gpkg_points", "--gpkg-points"), ("qgz", "--qgz")]
 
 
 def build_argv(params: Dict[str, Any], script: Optional[str] = None) -> List[str]:
@@ -201,6 +202,8 @@ def parse_summary(text: str) -> Dict[str, Any]:
         ("connectors", r"Gap stitching:\s*(\d+) inferred connector", int),
         ("gpkg", r"GeoPackage written to:\s*(.+)", str),
         ("suspect_od", r"Suspect O/D[^:]*:\s*(\d+)", int),
+        ("qgz", r"Wrote [\d,]+ bytes to (.+?) \(QGIS project", str),
+        ("qgz_error", r"error: \.qgz not built: (.+)", str),
     ]:
         v = grab(pat, cast)
         if v is not None:
@@ -306,10 +309,19 @@ def validate(params: Dict[str, Any], allowed_roots: List[str]) -> Dict[str, Any]
         targets.append(out_path)
     if fmt in ("both", "gpkg"):
         root, ext = os.path.splitext(out_path)
-        targets.append((root if ext.lower() == ".kml" else out_path) + ".gpkg")
+        targets.append((root if ext.lower() in (".kml", ".gpkg") else out_path) + ".gpkg")
     output_exists = bool(params.get("output_name")) and any(os.path.exists(p) for p in targets)
     if output_exists:
         warnings.append("Output file already exists and will be overwritten")
+    if params.get("qgz"):
+        if fmt == "kml":
+            errors.append("QGIS project needs the GeoPackage: set Output format to both or gpkg")
+        if not params.get("navdb"):
+            errors.append("QGIS project is on but no navdb GeoPackage is set")
+        else:
+            ok(params["navdb"], "navdb GeoPackage")
+        if params.get("company"):
+            ok(params["company"], "Company routes GeoPackage")
     if fmt != "kml" and not params.get("airline"):
         warnings.append("Airline code not set; the GeoPackage's airline fields will be empty")
     if params.get("color_mode") == "altitude" and params.get("color"):

@@ -5,6 +5,20 @@ All notable changes to the Flight Route Splitter project will be documented in t
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-10-30 (gpkg-output branch)
+
+### Added
+
+- **QGIS project output** (`--qgz`, `--navdb`, `--company`, `--qgis-repo`): writes `<output base>.qgz` next to the GeoPackage by running `~/Git/qgis` `prepare` (chart layers, basemaps, styles; links to the GeoPackages, copies no data). `--navdb` is required and checked before the build. On failure the GeoPackage is kept, the run exits 1 and the message points to the qgis handoff. Same interface as `company_route_extractor`.
+- **`gpkg_to_qgz.py`**: build the project for an existing flown GeoPackage.
+- Route Builder: *QGIS project (.qgz)*, *navdb GeoPackage* and *Company routes GeoPackage* in the Output section; `~/Git/qgis` added to the default allowed folders.
+- Handoffs: [`docs/handoff/qgis_flown_v2.md`](docs/handoff/qgis_flown_v2.md), [`docs/handoff/direct_detect_flown_v2.md`](docs/handoff/direct_detect_flown_v2.md).
+
+### Changed
+
+- **`flown_routes` schema v2**: `flights` (MULTILINESTRING Z) and `tracks_full` (MULTILINESTRING ZM) are split at the date line (±180°, lat/Z/M interpolated), so QGIS no longer draws a crossing flight across the whole map. A line that does not cross is one part with its exact coordinates. `gpkg_to_kml.py` reads v1 and v2, and the KML is unchanged. 0 of 7,125 VIV and 0 of 51,345 LAN flights cross today.
+- `gpkg_writer.py` writes and reads MULTILINESTRING (`encode_multilinestring`).
+
 ## [1.3.1] - 2026-10-30 (gpkg-output branch)
 
 ### Added

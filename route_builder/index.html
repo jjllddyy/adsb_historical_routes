@@ -876,6 +876,7 @@ function fieldRoot(key) {
 // airports/routes/tail are CSV-content files but may carry a .txt extension, so accept both.
 function fieldKind(key) {
   if (key === 'airports' || key === 'routes' || key === 'tail_icao') return ['csv', 'txt'];
+  if (key === 'navdb' || key === 'company') return ['gpkg'];
   return null;
 }
 function buildPathControl(param) {
@@ -1549,6 +1550,7 @@ function renderResultSuccess(payload) {
   if (s.suspect_od !== undefined) stats.push(['Suspect O/D', s.suspect_od]);
   if (s.date_from) stats.push(['Flight dates', s.date_from + ' → ' + s.date_to]);
   if (s.gpkg && s.gpkg !== s.output) stats.push(['GeoPackage', baseOf(s.gpkg)]);
+  if (s.qgz) stats.push(['QGIS project', baseOf(s.qgz)]);
   var outName = s.output ? baseOf(s.output) : (PARAMS.output_name || '');
   stats.push(['Output', outName + (payload.output_size != null ? ' · ' + humanizeBytes(payload.output_size) : '')]);
 

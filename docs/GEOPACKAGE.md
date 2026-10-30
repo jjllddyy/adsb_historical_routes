@@ -1,4 +1,4 @@
-# GeoPackage output (`flown_routes` v1)
+# GeoPackage output (`flown_routes` v2)
 
 `adsb_historical_routes.py` writes a GeoPackage as its primary output. It is the input for the
 QGIS route viewer (`~/Git/qgis`) and for `direct_detect` (`~/Git/analytics_tools/direct_detect`).
@@ -28,6 +28,8 @@ python3 adsb_historical_routes.py \
 | `--suspect-od-ratio` | `2.5` | Threshold for `suspect_od`. |
 | `--legacy-kml` | off | Writes the KML with the direct writer, not from the GeoPackage. Kept for one release. |
 | `--gpkg` | n/a | Deprecated alias for `--format both`. |
+| `--qgz` | off | Also write `<output base>.qgz`, the QGIS project, with `~/Git/qgis` `prepare` (§6). Needs `--navdb`; not allowed with `--format kml`. |
+| `--navdb`, `--company`, `--qgis-repo` | none, none, `$QGIS_REPO` or `~/Git/qgis` | The project's chart-layer navdb (required with `--qgz`, checked before the build), an optional `company_routes` GeoPackage, and the qgis checkout. |
 | `--takeoff-from`, `--takeoff-to` | none | Keep only flights whose UTC takeoff date is in the range (inclusive, `YYYY-MM-DD`). Daily KML files dated more than one day outside it are not read. Excluded flights stay in the diagnostics as `dropped_date_range`. |
 
 - **Naming:** `{from}` and `{to}` in `--output` become the first and last flight dates (UTC takeoff).
@@ -51,7 +53,7 @@ All geometry is EPSG:4326. Z is in **metres**; `*_ft` attribute columns are in f
 `DATETIME` strings (`2026-10-19T14:34:55.437Z`). `city_pair`, `group_key`, `origin` and `dest` are
 copied onto every child table, so no filter ever needs a join.
 
-### `flights`: one row per kept flight (LineStringZ, the sampled display line)
+### `flights`: one row per kept flight (MultiLineStringZ, the sampled display line)
 
 | Column | Notes |
 |---|---|
@@ -73,7 +75,7 @@ Indexes: `flight_id` (unique), `city_pair`, `group_key`, `dest`, `origin`, `flig
 
 ### Other tables
 
-- **`tracks_full`** (LineStringZM): every point of each flight, after POS/firehose enrichment.
+- **`tracks_full`** (MultiLineStringZM): every point of each flight, after POS/firehose enrichment.
   - M is Unix epoch seconds, as a double.
   - Columns: `flight_id`, `city_pair`, `group_key`, `origin`, `dest`, `flight_date`.
   - Indexes on `flight_id` and `city_pair`.
@@ -87,6 +89,16 @@ Indexes: `flight_id` (unique), `city_pair`, `group_key`, `dest`, `origin`, `flig
 - **`meta`**: key/value rows.
   - `schema_name` (`flown_routes`), `schema_version` (`1`), `tool`, `tool_version`, `created_utc`, `airline`, `date_from`, `date_to`, `argv` (JSON), `source_count`.
   - Also `preset`, `group_by`, `sample_minutes`, `stitch_gap_min`, `integrate_pos`, `track_points`, `kml_params` (JSON), `flight_count`, `suspect_od_ratio` and `suspect_od_count`.
+
+**Date line (v2).** `flights` and `tracks_full` are MULTILINESTRINGs. A line is cut where two
+consecutive vertices are more than 180° apart in longitude: one part ends at ±180 and the next
+starts at ∓180, at the latitude (and Z, M) interpolated linearly in lon/lat. A line that does not
+cross is a single part with exactly its coordinates; every longitude stays within -180..180.
+This keeps QGIS (EPSG:3857 wraps longitudes) from drawing a crossing flight across the whole map.
+`track_points` is unchanged. The rule is the same as `company_route_extractor`'s
+`company_routes` v2. `gpkg_to_kml.py` reads v1 and v2; it rejoins the parts without the ±180
+vertices, so the KML is unchanged (byte-identical). Measured on 2026-10-30: 0 of 7,125 VIV flights
+and 0 of 51,345 LAN (LATAM Brasil) flights cross; the rule matters for VOI and long-haul fleets.
 
 There are no gap-connector features: `--stitch-gaps` connectors are drawn only at KML export (§4.4).
 The altitude colour mode is also export-only (§4.6).
@@ -139,20 +151,52 @@ These projects were not modified as part of this change. This is what each needs
   - Vendor `gpkg_writer.py` from this repo unchanged.
   - The API:
     - `GeoPackageWriter(path)`;
-    - `add_feature_table(name, "LINESTRING"|"POINT", [(col, type)], z=, m=)`;
+    - `add_feature_table(name, "LINESTRING"|"MULTILINESTRING"|"POINT", [(col, type)], z=, m=)`;
     - `add_attribute_table`;
-    - `insert_features(name, [(blob, bbox, values)])` with `encode_linestring` / `encode_point`;
+    - `insert_features(name, [(blob, bbox, values)])` with `encode_linestring` /
+      `encode_multilinestring` / `encode_point`;
     - `insert_rows`;
     - `add_index(name, cols, unique=)`;
     - `close()`, which writes the file atomically from `<path>.part`.
   - Use `format_datetime` for `DATETIME` columns; GDAL warns on any other format.
   - The routes are 2D: call `encode_linestring(coords)` without `has_z`.
 - **`qgis`** (viewer and spike):
+  - **v2:** `flights` is MULTILINESTRING Z and `tracks_full` MULTILINESTRING ZM, split at the
+    date line. `prepare` must accept `schema_version` 2 (it checks "1" exactly today) and read
+    multi-part lines; see `docs/handoff/qgis_flown_v2.md`.
   - The new file uses `takeoff_time`/`landing_time`.
   - `tracks_full` is always present; `track_points` is present when `meta.track_points = 1`.
   - Exclude `suspect_od = 1` from statistics.
   - `flights.has_gaps` is now measured, not the always-false builder flag.
 - **`direct_detect`:**
+  - **v2:** `tracks_full` is MULTILINESTRING ZM; see `docs/handoff/direct_detect_flown_v2.md`.
   - `tracks_full` M values are epoch seconds.
   - `flight_id` is stable across reruns of the same inputs.
   - The diagnostics `flight_id` links absorbed fragments to their flight.
+
+## 6. QGIS project (`.qgz`)
+
+The GeoPackage holds data only. The map (navdb chart layers, basemaps, styles, the Route Explorer
+configuration) is a QGIS project built by `~/Git/qgis` `prepare`, which owns all styling. This tool
+only runs `prepare`; the project links to the GeoPackages and copies no data (about 70–90 KB).
+
+```bash
+# with the build
+python3 adsb_historical_routes.py ... --format gpkg --output out/lan.gpkg \
+    --qgz --navdb ~/Git/qgis/input/navdb_2610.gpkg [--company company_routes.gpkg]
+# for an existing GeoPackage
+python3 gpkg_to_qgz.py out/lan.gpkg --navdb ~/Git/qgis/input/navdb_2610.gpkg \
+    [--company company_routes.gpkg] [-o out/lan.qgz] [--qgis-repo ~/Git/qgis]
+```
+
+- **The call** (the interface agreed in the qgis handoff §3.7), run from the qgis checkout:
+  `bash -c 'source scripts/env.sh && exec "$QGIS_PY" -m prepare "$@"' prepare --airline LAN
+  --navdb <abs> --flown <abs> [--company <abs>] --out <abs folder> --project-name <stem>`.
+- **Success** is exit 0 and the `.qgz` existing: `Wrote N bytes to <qgz> (QGIS project; links to …)`.
+- **Failure** prints `error: .qgz not built: qgis prepare exited N`, the last five stderr lines and
+  a pointer to `~/Git/kml/company_route_extractor/docs/handoff/qgis_prepare_partial_inputs.md`, and
+  exits 1. The GeoPackage is already written and stays.
+- **Today's `prepare` fails** (2026-10-30): it has no `--project-name`, requires `--company`, and
+  accepts flown `schema_version` "1" only. Until the qgis handoff lands, add the layers to QGIS
+  directly (*Layer → Add Layer → Add Vector Layer…*).
+- `--navdb` (and `--company`, when given) must exist; this is checked before the long build starts.

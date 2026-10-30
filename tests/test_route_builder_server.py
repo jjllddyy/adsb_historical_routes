@@ -452,3 +452,43 @@ def test_parse_summary_gpkg_only_counts_as_output():
     assert s["output"] == s["gpkg"] == "/out/viv_2026-09-30_2026-10-19.gpkg"
     assert s["suspect_od"] == 3
     assert (s["date_from"], s["date_to"]) == ("2026-09-30", "2026-10-19")
+
+
+def test_build_argv_qgz_options():
+    base = {"kml_folder": "/in", "airports": "a.csv", "routes": "r.csv",
+            "output_dir": "/out", "output_name": "lan.gpkg", "format": "gpkg"}
+    argv = server.build_argv(dict(base, qgz=False, navdb="", company=""))
+    assert "--qgz" not in argv and "--navdb" not in argv and "--company" not in argv
+    argv = server.build_argv(dict(base, qgz=True, navdb="/q/navdb_2610.gpkg", company="/c.gpkg"))
+    assert "--qgz" in argv
+    assert argv[argv.index("--navdb") + 1] == "/q/navdb_2610.gpkg"
+    assert argv[argv.index("--company") + 1] == "/c.gpkg"
+
+
+def test_validate_qgz_needs_navdb_and_gpkg(tmp_path):
+    root = str(tmp_path)
+    kml = tmp_path / "kml"
+    kml.mkdir()
+    (kml / "a_2026-07-14.kml").write_text("<kml/>")
+    for name in ("a.csv", "r.csv"):
+        (tmp_path / name).write_text("h\nx\n")
+    base = {"kml_folder": str(kml), "airports": str(tmp_path / "a.csv"),
+            "routes": str(tmp_path / "r.csv"), "output_dir": root, "output_name": "lan.gpkg",
+            "airline": "LAN", "qgz": True}
+    v = server.validate(dict(base, format="kml"), [root])
+    assert any("needs the GeoPackage" in e for e in v["errors"])
+    assert any("no navdb" in e for e in v["errors"])
+    v = server.validate(dict(base, format="gpkg", navdb=str(tmp_path / "missing.gpkg")), [root])
+    assert any("navdb GeoPackage not found" in e for e in v["errors"])
+    (tmp_path / "navdb_2610.gpkg").write_bytes(b"")
+    v = server.validate(dict(base, format="gpkg", navdb=str(tmp_path / "navdb_2610.gpkg")), [root])
+    assert v["errors"] == []
+
+
+def test_parse_summary_qgz():
+    s = server.parse_summary("GeoPackage written to: /out/lan.gpkg\n"
+                             "Wrote 81,234 bytes to /out/lan.qgz (QGIS project; links to "
+                             "lan.gpkg and navdb_2610.gpkg)\n")
+    assert s["qgz"] == "/out/lan.qgz" and "qgz_error" not in s
+    s = server.parse_summary("error: .qgz not built: qgis prepare exited 2\n")
+    assert s["qgz_error"] == "qgis prepare exited 2"

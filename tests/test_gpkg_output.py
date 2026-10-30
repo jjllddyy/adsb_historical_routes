@@ -96,7 +96,7 @@ class TestFlownSchema:
 
     def test_meta(self, built):
         meta = dict(built["conn"].execute("SELECT key, value FROM meta"))
-        assert meta["schema_name"] == "flown_routes" and meta["schema_version"] == "1"
+        assert meta["schema_name"] == "flown_routes" and meta["schema_version"] == "2"
         assert meta["tool"] == "adsb_historical_routes" and meta["airline"] == "TST"
         assert (meta["date_from"], meta["date_to"]) == ("2026-10-01", "2026-10-02")
         assert meta["source_count"] == "3"
@@ -137,8 +137,10 @@ class TestFlownSchema:
         blob, n = c.execute("SELECT t.geom, f.n_points_full FROM tracks_full t JOIN flights f "
                             "USING (flight_id) WHERE flight_id = 'ABC001_20261001T100000Z'"
                             ).fetchone()
-        kind, has_z, has_m, verts = ahr.gpkg_writer.decode_geometry(blob)
-        assert (kind, has_z, has_m, len(verts)) == ("LINESTRING", True, True, n)
+        kind, has_z, has_m, parts = ahr.gpkg_writer.decode_geometry(blob)
+        assert (kind, has_z, has_m, len(parts)) == ("MULTILINESTRING", True, True, 1)
+        verts = parts[0]
+        assert len(verts) == n
         first = datetime(2026, 10, 1, 10, 0, 0, 250000, tzinfo=timezone.utc).timestamp()
         assert verts[0][3] == pytest.approx(first, abs=1e-6)
         assert verts[1][3] - verts[0][3] == pytest.approx(20.0, abs=1e-6)

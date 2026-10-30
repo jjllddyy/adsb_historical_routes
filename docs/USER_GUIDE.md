@@ -197,6 +197,9 @@ default shown.
 | **Output format** | **Both** writes the GeoPackage (QGIS, `direct_detect`) and the KML (Google Earth); **GeoPackage** only is the fastest; **KML** only matches the old behaviour. The KML is identical either way. | Both. |
 | **Airline code** | Stored in the GeoPackage (`flights.airline`, `meta`). | The airline's ICAO code, e.g. `VIV`. |
 | **GeoPackage track points** | Adds the per-point `track_points` layer (speed, vertical speed, track, source). About 10× the size of the flights layer; always on with position integration. | Off unless you need per-point colouring in QGIS. |
+| **QGIS project (.qgz)** | Also writes `<name>.qgz` next to the GeoPackage, built by `~/Git/qgis` `prepare`: navdb chart layers, basemaps and styles, linked to your GeoPackage (no data copied). Needs Output format Both or GeoPackage, and a navdb. If `prepare` fails, the GeoPackage is still written and the run is shown as failed with the reason. | Off unless you will open the flights in the Route Explorer. |
+| **navdb GeoPackage** | `navdb_<AIRAC>.gpkg` for the chart layers. Required for the QGIS project. | `~/Git/qgis/input/navdb_2610.gpkg` |
+| **Company routes GeoPackage** | Optional `company_routes` file from `company_route_extractor`; the project then matches flights to company routes. | The airline's company GeoPackage, if you have one. |
 
 ### Detection & sampling
 

@@ -20,12 +20,13 @@ import glob
 import json
 import bisect
 import sqlite3
+import subprocess
 import tempfile
 import time
 import urllib.parse
 from collections import defaultdict
 from dataclasses import dataclass, replace
-from typing import Any, List, Tuple, Dict, Optional, Set
+from typing import Any, List, Tuple, Dict, Optional, Sequence, Set
 import csv
 import re
 
@@ -34,7 +35,7 @@ import re
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gpkg_writer  # noqa: E402
 
-TOOL_VERSION = "1.3.1"
+TOOL_VERSION = "1.4.0"
 
 
 @dataclass(frozen=True)
@@ -1923,14 +1924,17 @@ def create_output_kml(flight_segments: List[FlightSegment], output_file: str,
 # (docs/superpowers/specs/2026-10-27-route-gpkg-output-spec.md §3-§4, §6, §12)
 #
 # One `flights` row per kept flight (sampled display line), one `tracks_full` row per
-# flight (every point, M = Unix epoch seconds), optional `track_points` (per point, with
+# flight (every point, M = Unix epoch seconds); both are MULTILINESTRINGs split at the
+# date line (v2), optional `track_points` (per point, with
 # source and recomputed motion), `diagnostics` (the CSV rows + flight_id) and `meta`.
 # KML is rebuilt from the file by reading the flights back into FlightSegments and
 # handing them to create_output_kml, so both KML paths share one renderer.
 # ---------------------------------------------------------------------------
 
 FLOWN_SCHEMA_NAME = "flown_routes"
-FLOWN_SCHEMA_VERSION = "1"
+FLOWN_SCHEMA_VERSION = "2"
+# Versions load_flown_gpkg reads. v1 stored LINESTRINGs; v2 splits lines at the date line.
+FLOWN_READABLE_VERSIONS = ("1", "2")
 SUSPECT_OD_RATIO = 2.5
 
 FLIGHTS_COLUMNS = [
@@ -2107,18 +2111,58 @@ def _diag_value(col: str, value: str):
     return value
 
 
+def split_at_antimeridian(coords: Sequence[Tuple[float, ...]]) -> List[List[Tuple[float, ...]]]:
+    """Parts of a ``(lon, lat, ...)`` line, cut where it crosses the date line.
+
+    A leg whose longitudes differ by more than 180° (e.g. 170° to -170°) is taken the short
+    way: it ends one part at ±180 and starts the next at ∓180. The crossing latitude, and
+    any further ordinates (Z, M), are interpolated linearly in lon/lat. A line that does not
+    cross is one part with exactly its coordinates. Same rule as company_route_extractor.
+    """
+    parts: List[List[Tuple[float, ...]]] = [[]]
+    prev: Optional[Tuple[float, ...]] = None
+    for c in coords:
+        if prev is not None and abs(c[0] - prev[0]) > 180.0:
+            edge = 180.0 if prev[0] > 0 else -180.0
+            lon = c[0] + 2 * edge                      # the next vertex, unwrapped
+            t = (edge - prev[0]) / (lon - prev[0])
+            rest = tuple(a + t * (b - a) for a, b in zip(prev[1:], c[1:]))
+            parts[-1].append((edge,) + rest)
+            parts.append([(-edge,) + rest])
+        parts[-1].append(tuple(c))
+        prev = c
+    return parts
+
+
+def join_antimeridian_parts(parts: List[List[Tuple[float, ...]]]) -> List[Tuple[float, ...]]:
+    """Inverse of split_at_antimeridian: the original vertices, without the ±180 ones."""
+    if len(parts) == 1:
+        return parts[0]
+    verts: List[Tuple[float, ...]] = []
+    last = len(parts) - 1
+    for i, part in enumerate(parts):
+        verts.extend(part[1 if i > 0 else 0:len(part) - 1 if i < last else len(part)])
+    return verts
+
+
+def _encode_split_line(coords: List[Tuple[float, ...]], has_m: bool):
+    return gpkg_writer.encode_multilinestring(split_at_antimeridian(coords),
+                                              has_z=True, has_m=has_m)
+
+
 def write_flown_gpkg(path: str, segments: List[FlightSegment], *, airline: str,
                      preset_name: str, group_by: str, sample_minutes: float,
                      include_points: bool, diagnostics_rows: List[Dict[str, Any]],
                      meta: Dict[str, str]) -> Dict[str, int]:
-    """Write the ``flown_routes`` v1 GeoPackage for ``segments`` (annotated, in output order)."""
+    """Write the ``flown_routes`` v2 GeoPackage for ``segments`` (annotated, in output order)."""
     w = gpkg_writer.GeoPackageWriter(path)
     try:
-        w.add_feature_table("flights", "LINESTRING", FLIGHTS_COLUMNS, z=True,
+        w.add_feature_table("flights", "MULTILINESTRING", FLIGHTS_COLUMNS, z=True,
                             description="One row per kept flight; geometry is the sampled "
-                                        "display line (Z metres).")
-        w.add_feature_table("tracks_full", "LINESTRING", TRACKS_FULL_COLUMNS, z=True, m=True,
-                            description="Every point of each flight; M = Unix epoch seconds.")
+                                        "display line (Z metres), split at the date line.")
+        w.add_feature_table("tracks_full", "MULTILINESTRING", TRACKS_FULL_COLUMNS, z=True,
+                            m=True, description="Every point of each flight; M = Unix epoch "
+                                                "seconds; split at the date line.")
         if include_points:
             w.add_feature_table("track_points", "POINT", TRACK_POINTS_COLUMNS, z=True,
                                 description="Every point of each flight, with source and motion.")
@@ -2131,8 +2175,8 @@ def write_flown_gpkg(path: str, segments: List[FlightSegment], *, airline: str,
         def flight_rows():
             for seg in segments:
                 display = seg.sample_points(sample_minutes)
-                blob, bbox = gpkg_writer.encode_linestring(
-                    [(p.lon, p.lat, p.alt) for p in display], has_z=True)
+                blob, bbox = _encode_split_line([(p.lon, p.lat, p.alt) for p in display],
+                                                has_m=False)
                 present = {p.source for p in seg.points}
                 yield blob, bbox, (
                     seg.flight_id, airline, seg.aircraft_id, seg.registration, None,
@@ -2159,9 +2203,8 @@ def write_flown_gpkg(path: str, segments: List[FlightSegment], *, airline: str,
 
         def track_rows():
             for seg in segments:
-                blob, bbox = gpkg_writer.encode_linestring(
-                    [(p.lon, p.lat, p.alt, _epoch(p.datetime)) for p in seg.points],
-                    has_z=True, has_m=True)
+                blob, bbox = _encode_split_line(
+                    [(p.lon, p.lat, p.alt, _epoch(p.datetime)) for p in seg.points], has_m=True)
                 yield blob, bbox, (seg.flight_id, seg.get_route_folder(),
                                    _group_key(seg, group_by), seg.origin.code,
                                    seg.destination.code, seg.takeoff_date_str)
@@ -2288,7 +2331,7 @@ class StoredFlight(FlightSegment):
 
 
 def load_flown_gpkg(path: str) -> Tuple[Dict[str, str], List[FlightSegment]]:
-    """Read a ``flown_routes`` GeoPackage back as StoredFlights, in the written order.
+    """Read a ``flown_routes`` v1 or v2 GeoPackage back as StoredFlights, in written order.
 
     Points come from ``tracks_full`` (and per-point ``source`` from ``track_points`` when
     present; otherwise every point is ADS-B).
@@ -2298,7 +2341,7 @@ def load_flown_gpkg(path: str) -> Tuple[Dict[str, str], List[FlightSegment]]:
         meta = dict(conn.execute("SELECT key, value FROM meta"))
         if meta.get("schema_name") != FLOWN_SCHEMA_NAME:
             raise ValueError(f"{path} is not a {FLOWN_SCHEMA_NAME} GeoPackage")
-        if meta.get("schema_version") != FLOWN_SCHEMA_VERSION:
+        if meta.get("schema_version") not in FLOWN_READABLE_VERSIONS:
             raise ValueError(f"{path}: unsupported {FLOWN_SCHEMA_NAME} schema version "
                              f"{meta.get('schema_version')}")
         sources: Dict[str, List[str]] = defaultdict(list)
@@ -2315,7 +2358,9 @@ def load_flown_gpkg(path: str) -> Tuple[Dict[str, str], List[FlightSegment]]:
                 "SELECT flight_id, aircraft_id, registration, origin, dest, style_color, "
                 "style_width, style_opacity, source_file, distance_km FROM flights "
                 "ORDER BY fid").fetchall():
-            _, _, _, verts = gpkg_writer.decode_geometry(tracks[flight_id])
+            kind, _, _, verts = gpkg_writer.decode_geometry(tracks[flight_id])
+            if kind == "MULTILINESTRING":
+                verts = join_antimeridian_parts(verts)
             srcs = sources.get(flight_id)
             if srcs is not None and len(srcs) != len(verts):
                 raise ValueError(f"{flight_id}: track_points/tracks_full point counts differ")
@@ -2327,6 +2372,93 @@ def load_flown_gpkg(path: str) -> Tuple[Dict[str, str], List[FlightSegment]]:
         return meta, segments
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# QGIS project (.qgz). ~/Git/qgis owns the project (navdb chart layers, basemaps, styles);
+# --qgz / gpkg_to_qgz.py only run its `prepare` in the QGIS Python that its scripts/env.sh
+# sets up. The project links to the GeoPackages; it copies no data.
+# ---------------------------------------------------------------------------
+
+QGIS_REPO = os.path.expanduser(os.environ.get("QGIS_REPO", "~/Git/qgis"))
+QGIS_HANDOFF = "~/Git/kml/company_route_extractor/docs/handoff/qgis_prepare_partial_inputs.md"
+
+
+def qgz_path_for(gpkg_path: str) -> str:
+    """``<base>.qgz`` next to ``<base>.gpkg``."""
+    return os.path.splitext(gpkg_path)[0] + ".qgz"
+
+
+def validate_qgz_options(qgz: bool, output_format: str, navdb: Optional[str],
+                         company: Optional[str]) -> Optional[str]:
+    """The reason --qgz cannot run, checked before the build; None when it can."""
+    if not qgz:
+        return None
+    if output_format == "kml":
+        return "--qgz needs the GeoPackage: use --format both or gpkg"
+    if not navdb:
+        return "--qgz needs --navdb (the navdb_<AIRAC>.gpkg for the chart layers)"
+    if not os.path.isfile(navdb):
+        return f"navdb GeoPackage does not exist: {navdb}"
+    if company and not os.path.isfile(company):
+        return f"company GeoPackage does not exist: {company}"
+    return None
+
+
+def build_qgz(flown_gpkg: str, qgz: str, navdb: str, airline: str, qgis_repo: str,
+              company: Optional[str] = None) -> int:
+    """Build the QGIS project for a flown_routes GeoPackage with ~/Git/qgis ``prepare``.
+
+    Passes ``--flown`` and, when given, ``--company`` (the full Route Explorer project:
+    flights matched to company routes). Returns 0, or 1 with the reason on stderr; the
+    GeoPackage is never touched.
+    """
+    if not os.path.isfile(os.path.join(qgis_repo, "scripts", "env.sh")):
+        print(f"error: .qgz not built: no QGIS viewer repo at {qgis_repo} "
+              "(scripts/env.sh missing; set --qgis-repo)", file=sys.stderr)
+        return 1
+    out_dir = os.path.dirname(os.path.abspath(qgz))
+    os.makedirs(out_dir, exist_ok=True)
+    args = ["--airline", airline.upper(), "--navdb", os.path.abspath(navdb),
+            "--flown", os.path.abspath(flown_gpkg)]
+    if company:
+        args += ["--company", os.path.abspath(company)]
+    args += ["--out", out_dir, "--project-name", os.path.splitext(os.path.basename(qgz))[0]]
+    # stdout/stderr PIPE + universal_newlines, not capture_output/text: Python 3.6.
+    proc = subprocess.run(
+        ["bash", "-c", 'source scripts/env.sh && exec "$QGIS_PY" -m prepare "$@"',
+         "prepare"] + args,
+        cwd=qgis_repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True, check=False)
+    if proc.returncode != 0 or not os.path.isfile(qgz):
+        tail = "\n".join((proc.stderr or proc.stdout).strip().splitlines()[-5:])
+        print(f"error: .qgz not built: qgis prepare exited {proc.returncode}\n{tail}\n"
+              f"It needs a prepare that takes --project-name and flown_routes v2; "
+              f"see {QGIS_HANDOFF}.", file=sys.stderr)
+        return 1
+    links = os.path.basename(flown_gpkg) + (f", {os.path.basename(company)}" if company else "")
+    print(f"Wrote {os.path.getsize(qgz):,} bytes to {qgz} (QGIS project; links to "
+          f"{links} and {os.path.basename(navdb)})")
+    return 0
+
+
+def add_qgz_args(parser: argparse.ArgumentParser, with_switch: bool = True) -> None:
+    """--qgz / --navdb / --company / --qgis-repo, shared with gpkg_to_qgz.py."""
+    if with_switch:
+        parser.add_argument('--qgz', action='store_true',
+                            help='Also write <output base>.qgz next to the GeoPackage: a QGIS '
+                                 'project linking it with the navdb chart layers, basemaps and '
+                                 'styles. Built by ~/Git/qgis prepare in QGIS\'s Python')
+    parser.add_argument('--navdb', default=None,
+                        help='navdb_<AIRAC>.gpkg for the chart layers (airways, fixes, FIRs, '
+                             'procedures). Linked, not copied. Required with --qgz')
+    parser.add_argument('--company', default=None,
+                        help='Optional company_routes GeoPackage. With it the project is the '
+                             'full Route Explorer (flights matched to company routes); without '
+                             'it, flown routes only')
+    parser.add_argument('--qgis-repo', default=QGIS_REPO, dest='qgis_repo',
+                        help='Checkout of the QGIS viewer repo whose prepare builds the '
+                             'project (default: $QGIS_REPO, else ~/Git/qgis)')
 
 
 def export_gpkg_to_kml(gpkg_path: str, kml_path: str, **overrides) -> int:
@@ -2593,6 +2725,7 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
     for route, count in sorted(route_counts.items()):
         print(f"  {route}: {count} flights")
     print("=" * 60)
+    return gpkg_path if keep_gpkg else None
 
 
 def main():
@@ -2649,6 +2782,7 @@ def main():
                        dest='suspect_od_ratio',
                        help='Flag a flight as suspect_od when its flown distance exceeds this '
                             'multiple of the great circle between its airports (default 2.5)')
+    add_qgz_args(parser)
     
     parser.add_argument('--sample', type=float, default=2.0,
                        help='Point sampling interval in minutes (default: 2)')
@@ -2769,6 +2903,10 @@ def main():
     if args.suspect_od_ratio <= 0:
         print("Error: --suspect-od-ratio must be > 0")
         sys.exit(1)
+    qgz_error = validate_qgz_options(args.qgz, output_format, args.navdb, args.company)
+    if qgz_error:
+        print(f"Error: {qgz_error}")
+        sys.exit(1)
 
     kml_files = []
     if args.kml_files:
@@ -2858,7 +2996,7 @@ def main():
           f"geometry_rescue={preset.geometry_rescue}, "
           f"corridor_cross_track_km={preset.corridor_cross_track_km}")
 
-    process_kml_files(
+    gpkg_path = process_kml_files(
         kml_files, airports, routes, args.output,
         preset=preset,
         group_by=args.group,
@@ -2891,7 +3029,14 @@ def main():
         argv=sys.argv[1:],
     )
 
-    print("\nProcessing complete!")
+    rc = 0
+    if args.qgz:
+        print("\nBuilding the QGIS project (~/Git/qgis prepare)...")
+        rc = build_qgz(gpkg_path, qgz_path_for(gpkg_path), args.navdb, args.airline,
+                       args.qgis_repo, company=args.company)
+
+    print("\nProcessing complete!" if rc == 0
+          else "\nProcessing complete; the GeoPackage is written but the .qgz is not.")
 
     # All output files are already written and closed above. On large runs the process
     # otherwise spends tens of seconds freeing the millions of accumulated point objects
@@ -2899,7 +3044,7 @@ def main():
     # immediately so the OS reclaims the memory at once instead.
     sys.stdout.flush()
     sys.stderr.flush()
-    os._exit(0)
+    os._exit(rc)
 
 
 if __name__ == '__main__':
