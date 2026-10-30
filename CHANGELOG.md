@@ -5,6 +5,16 @@ All notable changes to the Flight Route Splitter project will be documented in t
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-10-30 (gpkg-output branch)
+
+### Added
+
+- `--takeoff-from` / `--takeoff-to`: keep only flights whose UTC takeoff date is in range; daily KML files more than a day outside it are skipped. Excluded flights are recorded in the diagnostics as `dropped_date_range`.
+- `--pos-folder` reads raw ACARS `POS` reports (LATAM's SQS feed: `FI …/AN <reg>`, `-  POS<lat><lon>,…`), dated from the S3 receive stamp. Files for tails not in `--tail-icao` are skipped by name. Checked against ADS-B on 7,726 LATAM Brasil reports: median position difference 0.33 km.
+- `--output` may name the GeoPackage (`x.gpkg`); the KML and diagnostics use the same stem.
+- **`gpkg_summary.py`**: a text summary of a `flown_routes` GeoPackage (build settings, counts, dates, sources, rescue methods, suspect O/D, top city pairs); reads attributes only, under a second on a 1 GB file.
+- [`historical_route_geopackage_instructions_lan.md`](historical_route_geopackage_instructions_lan.md): start-to-finish build of the LAN July–September GeoPackage.
+
 ## [1.3.0] - 2026-10-28 (gpkg-output branch)
 
 ### Added

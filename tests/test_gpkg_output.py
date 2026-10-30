@@ -239,3 +239,56 @@ def test_output_placeholders(ahr):
         "o/viv_2026-09-30_2026-10-19.kml"
     assert ahr.gpkg_path_for("o/viv.kml") == "o/viv.gpkg"
     assert ahr.gpkg_path_for("o/viv") == "o/viv.gpkg"
+
+
+def test_takeoff_date_filter(flown_fixture, tmp_path):
+    stdout = run(flown_fixture, tmp_path / "f_{from}_{to}.kml", "--format", "gpkg",
+                 "--takeoff-from", "2026-10-02", "--takeoff-to", "2026-10-02")
+    assert "dropped 3 flight(s), 1 remain" in stdout
+    gpkg = tmp_path / "f_2026-10-02_2026-10-02.gpkg"
+    conn = sqlite3.connect(str(gpkg))
+    assert conn.execute("SELECT flight_date FROM flights").fetchall() == [("2026-10-02",)]
+    meta = dict(conn.execute("SELECT key, value FROM meta"))
+    assert (meta["date_from"], meta["date_to"]) == ("2026-10-02", "2026-10-02")
+    rows = conn.execute("SELECT disposition, drop_reason, flight_id FROM diagnostics "
+                        "WHERE disposition = 'dropped_date_range'").fetchall()
+    assert rows and all(r[1] == "takeoff outside 2026-10-02..2026-10-02" and r[2] is None
+                        for r in rows)
+    linked = {r[0] for r in conn.execute("SELECT flight_id FROM diagnostics "
+                                         "WHERE flight_id IS NOT NULL")}
+    assert linked == {r[0] for r in conn.execute("SELECT flight_id FROM flights")}
+
+
+def test_takeoff_date_rejects_bad_date(flown_fixture, tmp_path):
+    cmd = [sys.executable, str(SCRIPT), "--kml-folder", str(flown_fixture["kml_dir"]),
+           "--airports", str(flown_fixture["airports"]), "--routes", str(flown_fixture["routes"]),
+           "--output", str(tmp_path / "x.kml"), "--takeoff-from", "2026-13-01"]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    assert res.returncode == 1 and "must be YYYY-MM-DD" in res.stdout
+
+
+def test_output_named_gpkg(flown_fixture, tmp_path):
+    run(flown_fixture, tmp_path / "lan.gpkg", "--format", "gpkg")
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["lan.gpkg", "lan.kml.diagnostics.csv"]
+
+
+def test_filter_kml_files_by_date(ahr):
+    files = [f"/x/e4_2026-07-{d:02d}_baro_avg.kml" for d in (12, 13, 14, 30, 31)] + ["/x/a.kml"]
+    kept, skipped = ahr.filter_kml_files_by_date(files, "2026-07-14", "2026-07-29")
+    assert [f.split("_")[1] if "_" in f else f for f in kept] == [
+        "2026-07-13", "2026-07-14", "2026-07-30", "/x/a.kml"]
+    assert skipped == 2
+
+
+def test_gpkg_summary(flown_fixture, tmp_path):
+    run(flown_fixture, tmp_path / "s.gpkg", "--format", "gpkg", "--integrate-pos", "true")
+    out = tmp_path / "s_summary.txt"
+    res = subprocess.run([sys.executable, str(PROJECT_ROOT / "gpkg_summary.py"),
+                          str(tmp_path / "s.gpkg"), "-o", str(out)],
+                         capture_output=True, text=True, timeout=60)
+    assert res.returncode == 0, res.stderr
+    text = out.read_text()
+    assert text == res.stdout
+    assert "Flights: 4  aircraft: 2" in text
+    assert "flight dates: 2026-10-01 -> 2026-10-02" in text
+    assert "Track points by source:" in text and "FIREHOSE" in text

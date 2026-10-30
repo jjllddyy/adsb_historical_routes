@@ -34,7 +34,7 @@ import re
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gpkg_writer  # noqa: E402
 
-TOOL_VERSION = "1.3.0"
+TOOL_VERSION = "1.3.1"
 
 
 @dataclass(frozen=True)
@@ -617,24 +617,99 @@ def _parse_pos_latlon(freetext: str):
     return lat, lon
 
 
+# Raw ACARS (ARINC 620) Airbus-style position report, e.g.
+#   FI JJ3634/AN PR-MYV
+#   -  POSS23156W046116,S23190W046136,003708,216,UBNOV,005054,UMLAM,M16,32722,204/TS003708,...
+# = present position S23°15.6' W046°11.6' (DDMM.m), last waypoint (name or lat/lon),
+# time HHMMSS (UTC), flight level, next waypoint, ETA, ... The day is not in the report.
+_ACARS_POS_RE = re.compile(
+    r"^-\s*POS([NS])(\d{2})(\d{3})([EW])(\d{3})(\d{3}),[^,\r\n]*,(\d{6}),(\d{1,3}),", re.M)
+_ACARS_REG_RE = re.compile(r"/AN\s+\.?([A-Z0-9-]+)")
+_RECEIVED_RE = re.compile(r"-(\d{14})\d*\.txt$")
+_RAW_FILE_TAIL_RE = re.compile(r"^([A-Z0-9]+)_raw_")
+
+
+def _acars_received_time(msg: dict) -> Optional[datetime]:
+    """When the message reached the ground: the S3 key's ``-YYYYMMDDHHMMSSmmm.txt`` stamp,
+    else the SQS ``SentTimestamp`` (epoch ms). Naive UTC."""
+    attrs = msg.get("message_attributes") or {}
+    for key in ((attrs.get("bucket_path") or {}).get("StringValue"), msg.get("uri")):
+        m = _RECEIVED_RE.search(key or "")
+        if m:
+            return datetime.strptime(m.group(1), "%Y%m%d%H%M%S")
+    sent = (msg.get("attributes") or {}).get("SentTimestamp")
+    try:
+        return datetime.utcfromtimestamp(int(sent) / 1000.0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_acars_pos(msg: dict, body: str):
+    """``(tail, timestamp, lat, lon, alt_ft)`` from a raw ACARS POS message, or None.
+
+    The report carries only HHMMSS; the date is taken from the receive time, stepping back
+    a day when the report time would be more than an hour after it (sent just after
+    midnight). The trailing date field is not used: its order differs between fleets.
+    """
+    m = _ACARS_POS_RE.search(body)
+    reg = _ACARS_REG_RE.search(body)
+    received = _acars_received_time(msg)
+    if not (m and reg and received):
+        return None
+    lat = int(m.group(2)) + int(m.group(3)) / 600.0
+    lon = int(m.group(5)) + int(m.group(6)) / 600.0
+    if lat > 90 or lon > 180:
+        return None
+    hhmmss = m.group(7)
+    try:
+        t = received.replace(hour=int(hhmmss[:2]), minute=int(hhmmss[2:4]),
+                             second=int(hhmmss[4:]), microsecond=0)
+    except ValueError:
+        return None
+    if t > received + timedelta(hours=1):
+        t -= timedelta(days=1)
+    tail = re.sub(r"[^A-Z0-9]", "", reg.group(1).upper())
+    return (tail, t.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            -lat if m.group(1) == "S" else lat, -lon if m.group(4) == "W" else lon,
+            int(m.group(8)) * 100.0)
+
+
 def load_pos_points(folder: str, tail_to_hex: Dict[str, str]) -> Dict[Tuple[str, str], List["TrackPoint"]]:
     """Parse ACARS POS files into {(hex, 'YYYY-MM-DD'): [TrackPoint(source='POS'), ...]}.
 
-    Each file is an SQS message whose (URL-encoded) `body` is `<Airline>_Position=[{...}]`;
-    each report has `tail_number`, `created_at` (date), and a `freetext` encoding
-    `HHMMSS, alt_ft, ?, heading, lat/lon`. Position time = created_at date + freetext HHMMSS (UTC).
+    Each file is an SQS message. Two body formats are read:
+
+    * ``<Airline>_Position=[{...}]`` (URL-encoded); each report has `tail_number`,
+      `created_at` (date), and a `freetext` encoding `HHMMSS, alt_ft, ?, heading, lat/lon`.
+      Position time = created_at date + freetext HHMMSS (UTC).
+    * A raw ACARS ``POS`` report (``FI .../AN <reg>`` + ``-  POS<lat><lon>,...``); see
+      :func:`_parse_acars_pos`. Files named ``<TAIL>_raw_*.json`` for tails not in the map
+      are skipped unread.
     """
     idx: Dict[Tuple[str, str], List["TrackPoint"]] = defaultdict(list)
     if not folder or not os.path.isdir(folder):
         return idx
     for fp in glob.glob(os.path.join(folder, "*.json")):
+        mt = _RAW_FILE_TAIL_RE.match(os.path.basename(fp))
+        if mt and mt.group(1) not in tail_to_hex:
+            continue
         try:
-            body = json.load(open(fp)).get("body", "")
+            msg = json.load(open(fp))
+            body = msg.get("body", "")
         except Exception:
             continue
         body = urllib.parse.unquote_plus(body)
         m = re.match(r"^\w+_Position=(\[.*\])\s*$", body, re.S)
         if not m:
+            report = _parse_acars_pos(msg, body)
+            hexc = tail_to_hex.get(report[0]) if report else None
+            if hexc:
+                tail, ts, lat, lon, alt_ft = report
+                try:
+                    tp = TrackPoint(ts, lon, lat, alt_ft * 0.3048, source="POS")
+                except Exception:
+                    continue
+                idx[(hexc, ts[:10])].append(tp)
             continue
         try:
             reports = json.loads(m.group(1))
@@ -1557,6 +1632,18 @@ class DiagnosticsRecorder:
                                             if seg.od_distance_ratio is not None else "")
                 row["suspect_od"] = "1" if seg.suspect_od else "0"
 
+    def drop_flights(self, segments: List["FlightSegment"], reason: str) -> None:
+        """Re-label the rows tied to kept ``segments`` that are being excluded afterwards
+        (``--takeoff-from`` / ``--takeoff-to``) as ``dropped_date_range``."""
+        ids = {id(s) for s in segments}
+        for row in self.rows:
+            seg = row.get("_flight")
+            if seg is not None and id(seg) in ids:
+                row["disposition"] = "dropped_date_range"
+                row["drop_reason"] = reason
+                del row["_flight"]
+                row.pop("_flight_row", None)
+
     def write_csv(self) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(self.csv_path)), exist_ok=True)
         with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
@@ -1932,6 +2019,37 @@ def resolve_output_path(output: str, date_from: str, date_to: str) -> str:
     return output.replace("{from}", date_from).replace("{to}", date_to)
 
 
+def kml_output_path(output: str) -> str:
+    """--output may name the GeoPackage (``x.gpkg``); everything else keys off ``x.kml``."""
+    root, ext = os.path.splitext(output)
+    return root + ".kml" if ext.lower() == ".gpkg" else output
+
+
+_FILE_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+
+def filter_kml_files_by_date(files: List[str], takeoff_from: Optional[str],
+                             takeoff_to: Optional[str]) -> Tuple[List[str], int]:
+    """Skip daily KML files (``<hex>_YYYY-MM-DD_...kml``) that cannot hold a flight taking
+    off inside [takeoff_from, takeoff_to].
+
+    One extra day is kept on each side: the day before completes flights already airborne
+    at midnight (so their tail end is not mistaken for a new flight), and the day after
+    completes flights that land after midnight. Files without a date in the name are kept.
+    """
+    lo = ((datetime.strptime(takeoff_from, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+          if takeoff_from else None)
+    hi = ((datetime.strptime(takeoff_to, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+          if takeoff_to else None)
+    kept = []
+    for f in files:
+        m = _FILE_DATE_RE.search(os.path.basename(f))
+        if m and ((lo and m.group(1) < lo) or (hi and m.group(1) > hi)):
+            continue
+        kept.append(f)
+    return kept, len(files) - len(kept)
+
+
 def gpkg_path_for(kml_path: str) -> str:
     """``<output>.gpkg`` next to ``<output>.kml``."""
     root, ext = os.path.splitext(kml_path)
@@ -2254,6 +2372,8 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
                      legacy_kml: bool = False,
                      airline: str = "",
                      suspect_od_ratio: float = SUSPECT_OD_RATIO,
+                     takeoff_from: Optional[str] = None,
+                     takeoff_to: Optional[str] = None,
                      argv: Optional[List[str]] = None):
     """Main processing pipeline driven by a ConfidencePreset.
 
@@ -2261,8 +2381,11 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
     ``both`` = ``<output>.gpkg`` + ``<output>.kml``, ``gpkg`` = GeoPackage only, ``kml`` =
     KML only. KML is rendered from the GeoPackage (a temporary one for ``kml``) unless
     ``legacy_kml``, which uses the in-memory flights directly. ``{from}``/``{to}`` in
-    ``output_file`` become the first/last flight dates. The diagnostics CSV is always written.
+    ``output_file`` become the first/last flight dates; a ``.gpkg`` ``output_file`` names the
+    GeoPackage. ``takeoff_from``/``takeoff_to`` (``YYYY-MM-DD``, inclusive) keep only flights
+    whose UTC takeoff date is in range. The diagnostics CSV is always written.
     """
+    output_file = kml_output_path(output_file)
     routes_dict = {(r.origin, r.destination): r.avg_time_min for r in routes}
     recorder = DiagnosticsRecorder(output_file, preset_name=preset.name)
 
@@ -2338,6 +2461,17 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
         final_segments.extend(complete_valid)
 
     print(f"\n\nTOTAL VALID COMPLETE FLIGHTS: {len(final_segments)}")
+
+    # Keep only flights whose UTC takeoff date is inside --takeoff-from/--takeoff-to.
+    if takeoff_from or takeoff_to:
+        lo, hi = takeoff_from or "0000-00-00", takeoff_to or "9999-99-99"
+        out_of_range = [s for s in final_segments if not lo <= s.takeoff_date_str <= hi]
+        if out_of_range:
+            recorder.drop_flights(out_of_range, f"takeoff outside {lo}..{hi}")
+            dropped = {id(s) for s in out_of_range}
+            final_segments = [s for s in final_segments if id(s) not in dropped]
+        print(f"Takeoff-date filter {takeoff_from or '(any)'} .. {takeoff_to or '(any)'}: "
+              f"dropped {len(out_of_range)} flight(s), {len(final_segments)} remain")
 
     # Enrich detected flights with real POS/firehose fixes that fall inside each flight's
     # own time window, filling in-flight ADS-B coverage gaps with measured data (not
@@ -2488,7 +2622,13 @@ def main():
     parser.add_argument('--output', required=True,
                        help='Output KML file name; the GeoPackage is written next to it as '
                             '<output>.gpkg. {from} and {to} are replaced by the first and last '
-                            'flight dates (e.g. viv_flown_{from}_{to}.kml)')
+                            'flight dates (e.g. viv_flown_{from}_{to}.kml). A name ending in '
+                            '.gpkg names the GeoPackage itself (the KML/CSV use the same stem)')
+    parser.add_argument('--takeoff-from', default=None, dest='takeoff_from', metavar='YYYY-MM-DD',
+                       help='Keep only flights whose UTC takeoff date is on/after this date. '
+                            'Daily KML files more than a day outside the range are skipped')
+    parser.add_argument('--takeoff-to', default=None, dest='takeoff_to', metavar='YYYY-MM-DD',
+                       help='Keep only flights whose UTC takeoff date is on/before this date')
 
     # Output selection (GeoPackage spec §12)
     parser.add_argument('--format', choices=['both', 'gpkg', 'kml'], default=None,
@@ -2643,7 +2783,27 @@ def main():
         if not kml_files:
             print(f"Error: No KML files found in {args.kml_folder}")
             sys.exit(1)
-    
+
+    for name in ('takeoff_from', 'takeoff_to'):
+        value = getattr(args, name)
+        if value is not None:
+            try:
+                datetime.strptime(value, "%Y-%m-%d")
+            except ValueError:
+                print(f"Error: --{name.replace('_', '-')} must be YYYY-MM-DD, got {value!r}")
+                sys.exit(1)
+    if args.takeoff_from and args.takeoff_to and args.takeoff_from > args.takeoff_to:
+        print("Error: --takeoff-from is after --takeoff-to")
+        sys.exit(1)
+    if args.takeoff_from or args.takeoff_to:
+        kml_files, n_skipped = filter_kml_files_by_date(kml_files, args.takeoff_from,
+                                                        args.takeoff_to)
+        print(f"Takeoff dates {args.takeoff_from or '(any)'} .. {args.takeoff_to or '(any)'}: "
+              f"skipping {n_skipped} KML file(s) dated outside the range")
+        if not kml_files:
+            print("Error: No KML files left inside the takeoff date range")
+            sys.exit(1)
+
     if not os.path.exists(args.airports):
         print(f"Error: Airports file not found: {args.airports}")
         sys.exit(1)
@@ -2726,6 +2886,8 @@ def main():
         legacy_kml=args.legacy_kml,
         airline=args.airline,
         suspect_od_ratio=args.suspect_od_ratio,
+        takeoff_from=args.takeoff_from,
+        takeoff_to=args.takeoff_to,
         argv=sys.argv[1:],
     )
 

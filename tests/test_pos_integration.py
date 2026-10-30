@@ -129,3 +129,55 @@ def test_no_mark_sources_keeps_single_track(ahr, make_track_point, utc, tmp_path
     txt = open(out).read()
     assert txt.count("<Placemark") == 1
     assert "ff00a5ff" not in txt
+
+
+def _acars_msg(tmp_path, name, body, bucket_path=None, sent_ms=None):
+    msg = {"body": body, "attributes": {}, "message_attributes": {}}
+    if bucket_path:
+        msg["message_attributes"]["bucket_path"] = {"StringValue": bucket_path,
+                                                    "DataType": "String"}
+    if sent_ms is not None:
+        msg["attributes"]["SentTimestamp"] = str(sent_ms)
+    (tmp_path / name).write_text(json.dumps(msg))
+
+
+RAW_POS = ("QU CPYXXXX\r\n.SCLASLA 040037\r\nFML\r\nFI JJ3634/AN PR-MYV\r\n"
+           "DT QXB GRU1 040037 F83A\r\n-  POSS23156W046116,S23190W046136,003708,216,UBNOV,"
+           "005054,UMLAM,M16,32722,204/TS003708,08042675CA\r\n")
+
+
+def test_load_pos_points_parses_raw_acars_report(ahr, tmp_path):
+    _acars_msg(tmp_path, "PRMYV_raw_003721_a.json", RAW_POS,
+               bucket_path="latam/PR/PRMYV-JJ3634-20260804003719545.txt")
+    pts = ahr.load_pos_points(str(tmp_path), {"PRMYV": "E48F12"})
+    tp = pts[("E48F12", "2026-08-04")][0]
+    assert tp.source == "POS" and tp.timestamp == "2026-08-04T00:37:08Z"
+    assert abs(tp.lat - -(23 + 15.6 / 60)) < 1e-9      # DDMM.m, S negative
+    assert abs(tp.lon - -(46 + 11.6 / 60)) < 1e-9
+    assert abs(tp.alt - 21600 * 0.3048) < 1e-6          # flight level -> ft -> m
+
+
+def test_raw_acars_report_before_midnight_takes_previous_day(ahr, tmp_path):
+    # Reported 23:59:50, received 00:00:12 the next day (SentTimestamp only).
+    body = RAW_POS.replace("003708,216", "235950,216")
+    sent = 1785801612000                                 # 2026-08-04T00:00:12Z
+    _acars_msg(tmp_path, "PRMYV_raw_000012_b.json", body, sent_ms=sent)
+    pts = ahr.load_pos_points(str(tmp_path), {"PRMYV": "E48F12"})
+    assert pts[("E48F12", "2026-08-03")][0].timestamp == "2026-08-03T23:59:50Z"
+
+
+def test_raw_acars_unmapped_tail_skipped_by_name(ahr, tmp_path):
+    # Not even opened: the file is not valid JSON.
+    (tmp_path / "CCBAA_raw_000355_c.json").write_text("not json")
+    _acars_msg(tmp_path, "PRMYV_raw_003721_a.json", RAW_POS,
+               bucket_path="latam/PR/PRMYV-JJ3634-20260804003719545.txt")
+    pts = ahr.load_pos_points(str(tmp_path), {"PRMYV": "E48F12"})
+    assert list(pts) == [("E48F12", "2026-08-04")]
+
+
+def test_raw_acars_non_position_message_ignored(ahr, tmp_path):
+    body = ("QU CPYXXXX\r\n.SCLASLA 160003\r\nA80\r\nFI LP2305/AN PR-MYV\r\n"
+            "-  1001 OUTRP  2305/16 SPUR/SPJC .PR-MYV\r\n")
+    _acars_msg(tmp_path, "PRMYV_raw_000353_d.json", body,
+               bucket_path="latam/OOOI/PRMYV-LP2305-20260716000353661.txt")
+    assert not ahr.load_pos_points(str(tmp_path), {"PRMYV": "E48F12"})

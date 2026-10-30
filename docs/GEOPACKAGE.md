@@ -28,8 +28,10 @@ python3 adsb_historical_routes.py \
 | `--suspect-od-ratio` | `2.5` | Threshold for `suspect_od`. |
 | `--legacy-kml` | off | Writes the KML with the direct writer, not from the GeoPackage. Kept for one release. |
 | `--gpkg` | n/a | Deprecated alias for `--format both`. |
+| `--takeoff-from`, `--takeoff-to` | none | Keep only flights whose UTC takeoff date is in the range (inclusive, `YYYY-MM-DD`). Daily KML files dated more than one day outside it are not read. Excluded flights stay in the diagnostics as `dropped_date_range`. |
 
 - **Naming:** `{from}` and `{to}` in `--output` become the first and last flight dates (UTC takeoff).
+  - `--output` may end in `.gpkg` to name the GeoPackage directly; the KML and CSV take the same stem (`x.gpkg`, `x.kml`, `x.kml.diagnostics.csv`).
   - The same dates go into `meta.date_from` and `meta.date_to`.
   - The diagnostics CSV is always written, as `<output>.kml.diagnostics.csv`.
 - **Rebuilding KML without re-running the builder:**
@@ -40,6 +42,7 @@ python3 adsb_historical_routes.py \
   ```
 
   Every option defaults to the value the file was built with (`meta.kml_params`).
+- **Summary of a finished file:** `python3 gpkg_summary.py x.gpkg -o x_summary.txt` (counts, dates, sources, rescue methods, suspect O/D, top city pairs).
 - **The GUI** (`route_builder/`) has Output format, Airline code and GeoPackage track points in its Output section.
 
 ## 2. Schema

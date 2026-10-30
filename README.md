@@ -377,9 +377,14 @@ feed — `--integrate-pos true` fills those gaps with measured fixes instead of 
 
 **Inputs:**
 
-- `--pos-folder` — ACARS files: each an SQS message whose (URL-encoded) `body` is
-  `<Airline>_Position=[{…}]`; each report carries `tail_number`, `created_at`, and a `freetext`
-  encoding `HHMMSS, alt_ft, …, lat/lon` (e.g. `S 33.569 W 060.089`).
+- `--pos-folder` — ACARS files, each an SQS message. Two body formats are read:
+  - `<Airline>_Position=[{…}]` (URL-encoded); each report carries `tail_number`, `created_at`, and
+    a `freetext` encoding `HHMMSS, alt_ft, …, lat/lon` (e.g. `S 33.569 W 060.089`).
+  - A raw ACARS `POS` report (LATAM, e.g. `FI JJ3634/AN PR-MYV` …
+    `-  POSS23156W046116,<last wpt>,003708,216,…`): present position in DDMM.m, time HHMMSS UTC,
+    flight level. The report has no date; it comes from the receive stamp in the S3 key
+    (`…-20260804003719545.txt`) or the SQS `SentTimestamp`. Files named `<TAIL>_raw_*.json` for
+    tails not in `--tail-icao` are skipped without being read.
 - `--firehose-folder` — ADS-B firehose files: one report each, carrying `icao` (hex),
   Unix `timestamp`, `latitude`, `longitude`, `altitude` (feet).
 - `--tail-icao` — CSV `tail_number,icao_hex`. POS files key on tail; this maps them to the hex
