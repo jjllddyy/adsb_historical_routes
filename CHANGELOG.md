@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`flown_routes` schema v2**: `flights` (MULTILINESTRING Z) and `tracks_full` (MULTILINESTRING ZM) are split at the date line (±180°, lat/Z/M interpolated), so QGIS no longer draws a crossing flight across the whole map. A line that does not cross is one part with its exact coordinates. `gpkg_to_kml.py` reads v1 and v2, and the KML is unchanged. 0 of 7,125 VIV and 0 of 51,345 LAN flights cross today.
 - `gpkg_writer.py` writes and reads MULTILINESTRING (`encode_multilinestring`).
 
+### Fixed
+
+- **POS/firehose merge drops repeated and impossible fixes.** The LATAM ACARS feed delivers every report twice (two ground addresses), which wrote duplicate points; and about 1 report in 770 is not where the ADS-B track says the aircraft is (e.g. 435 km away 4½ min after an ADS-B fix), which drew a spike and inflated `distance_km`. An extra fix with the same time as an accepted one is now dropped, as is one that would need more than 1,300 km/h from the previous accepted point or to the next ADS-B point. Both counts are printed after the integration line.
+
 ## [1.3.1] - 2026-10-30 (gpkg-output branch)
 
 ### Added

@@ -45,8 +45,8 @@ def summarize(path: str, top: int = 25) -> str:
         "SELECT count(*), count(DISTINCT aircraft_id), sum(duration_min), sum(distance_km) "
         "FROM flights").fetchone()
     w("")
-    w(f"Flights: {n}  aircraft: {aircraft}  block-to-block hours: {(minutes or 0) / 60:,.0f}  "
-      f"flown km: {km or 0:,.0f}")
+    w(f"Flights: {n}  aircraft: {aircraft}  track hours (first to last point): "
+      f"{(minutes or 0) / 60:,.0f}  flown km: {km or 0:,.0f}")
     n_days = conn.execute("SELECT count(DISTINCT flight_date) FROM flights").fetchone()[0]
     w(f"Days with flights: {n_days}  mean flights/day: {n / n_days if n_days else 0:.0f}")
     suspect = conn.execute("SELECT count(*) FROM flights WHERE suspect_od = 1").fetchone()[0]

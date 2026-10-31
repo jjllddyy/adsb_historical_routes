@@ -376,6 +376,9 @@ feed — `--integrate-pos true` fills those gaps with measured fixes instead of 
 - For each flight, POS/firehose fixes that fall inside its own `[takeoff, landing]` window and
   land in a gap ≥ `--stitch-gap-min` minutes are merged in. ADS-B is authoritative: an extra fix
   within 30 s of an ADS-B point is dropped as redundant, so dense stretches aren't fragmented.
+  A fix repeated at the same time is dropped, and so is one that would need more than
+  1,300 km/h from the previous accepted point or to the next ADS-B point (it is not this
+  aircraft at that time). The run log prints both counts.
 - **Source-marked rendering:** ADS-B keeps the flight color, ACARS-POS portions draw in
   `--pos-color` (orange), firehose portions in `--firehose-color` (green). Because these are real
   data, the gray inferred connector is **not** drawn where a source fills the gap.

@@ -57,7 +57,7 @@ def test_load_firehose_points_uses_icao_and_unix_ts(ahr, tmp_path):
 def test_merge_keeps_adsb_and_fills_gaps(ahr, make_track_point, utc):
     adsb = [make_track_point(utc + timedelta(minutes=i), 0.0, i * 0.1, 10000.0) for i in range(3)]
     # one extra fix inside the (later) gap, one nearly coincident with an ADS-B fix
-    gap_fill = make_track_point(utc + timedelta(minutes=20), 0.0, 5.0, 11000.0)
+    gap_fill = make_track_point(utc + timedelta(minutes=20), 0.0, 2.0, 11000.0)  # ~670 km/h
     gap_fill.source = "POS"
     dup = make_track_point(utc + timedelta(seconds=5), 0.0, 0.0, 10000.0)
     dup.source = "POS"
@@ -66,6 +66,49 @@ def test_merge_keeps_adsb_and_fills_gaps(ahr, make_track_point, utc):
     assert sources.count("POS") == 1               # near-duplicate dropped, gap-fill kept
     assert "POS" in sources and "ADSB" in sources
     assert merged == sorted(merged, key=lambda p: p.datetime)  # chronological
+
+
+def _pos(make_track_point, t, lat, lon):
+    p = make_track_point(t, lat, lon, 11000.0)
+    p.source = "POS"
+    return p
+
+
+def test_merge_drops_repeated_reports(ahr, make_track_point, utc):
+    # The LATAM feed delivers each report twice (two ground addresses).
+    adsb = [make_track_point(utc, 0.0, 0.0), make_track_point(utc + timedelta(minutes=30), 0.0, 3.0)]
+    a = _pos(make_track_point, utc + timedelta(minutes=15), 0.0, 1.5)
+    b = _pos(make_track_point, utc + timedelta(minutes=15), 0.0, 1.5)
+    stats = {}
+    merged = ahr.merge_track_with_sources(adsb, [a, b], min_fill_gap_seconds=300, stats=stats)
+    assert [p.source for p in merged] == ["ADSB", "POS", "ADSB"]
+    assert stats == {"duplicate": 1}
+
+
+def test_merge_drops_fix_that_needs_an_impossible_speed(ahr, make_track_point, utc):
+    # 4.5 min after an ADS-B fix, a report ~435 km away (5,800 km/h): another flight's report.
+    adsb = [make_track_point(utc, -22.676, -47.167, 5240.0),
+            make_track_point(utc + timedelta(minutes=8), -22.245, -47.769, 8670.0)]
+    bad = _pos(make_track_point, utc + timedelta(seconds=270), -19.99, -50.225)
+    good = _pos(make_track_point, utc + timedelta(minutes=4), -22.46, -47.47)
+    stats = {}
+    merged = ahr.merge_track_with_sources(adsb, [bad, good], min_fill_gap_seconds=300,
+                                          stats=stats)
+    assert [(p.lat, p.source) for p in merged] == [
+        (-22.676, "ADSB"), (-22.46, "POS"), (-22.245, "ADSB")]
+    assert stats == {"implausible": 1}
+
+
+def test_merge_checks_speed_against_the_previous_accepted_fix(ahr, make_track_point, utc):
+    # Beyond the ADS-B end: each fix is checked against the last accepted one.
+    adsb = [make_track_point(utc, 0.0, 0.0)]
+    near = _pos(make_track_point, utc + timedelta(minutes=10), 0.0, 1.0)    # ~670 km/h
+    jump = _pos(make_track_point, utc + timedelta(minutes=12), 0.0, 4.0)    # ~10,000 km/h
+    later = _pos(make_track_point, utc + timedelta(minutes=20), 0.0, 2.0)   # ~670 km/h from near
+    stats = {}
+    merged = ahr.merge_track_with_sources(adsb, [near, jump, later], stats=stats)
+    assert [p.lon for p in merged] == [0.0, 1.0, 2.0]
+    assert stats == {"implausible": 1}
 
 
 # ---- enrichment (post-detection, per-flight, interior only) ---------------

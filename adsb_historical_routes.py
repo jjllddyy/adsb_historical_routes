@@ -785,9 +785,26 @@ def load_position_sources(pos_folder: Optional[str], firehose_folder: Optional[s
     return combined
 
 
+# An extra fix that would need a faster ground speed than this from the previous accepted
+# point, or to the next ADS-B point, is not this aircraft at that time (e.g. a POS report of
+# another flight) and is dropped. Airliners stay well under it even in a strong jet stream.
+MAX_FIX_SPEED_KMH = 1300.0
+
+
+def _too_fast(a: Optional["TrackPoint"], b: Optional["TrackPoint"]) -> bool:
+    if a is None or b is None:
+        return False
+    km = haversine_distance(a.lat, a.lon, b.lat, b.lon)
+    secs = abs((b.datetime - a.datetime).total_seconds())
+    if secs == 0:
+        return km > 1.0
+    return km / secs * 3600.0 > MAX_FIX_SPEED_KMH
+
+
 def merge_track_with_sources(adsb_points: List["TrackPoint"], extra_points: List["TrackPoint"],
                              dedup_seconds: float = 30.0,
-                             min_fill_gap_seconds: float = 120.0) -> List["TrackPoint"]:
+                             min_fill_gap_seconds: float = 120.0,
+                             stats: Optional[Dict[str, int]] = None) -> List["TrackPoint"]:
     """Merge ADS-B points with extra (POS/firehose) fixes, sorted by time.
 
     ADS-B is authoritative where present. An extra fix is kept only when it adds real
@@ -796,7 +813,12 @@ def merge_track_with_sources(adsb_points: List["TrackPoint"], extra_points: List
     * dropped if within ``dedup_seconds`` of an ADS-B point (already covered);
     * between two ADS-B points, kept only if that ADS-B gap is >= ``min_fill_gap_seconds``
       (a genuine gap worth filling, not sub-minute jitter);
-    * beyond either ADS-B track end, kept (extends coverage where ADS-B never saw it).
+    * beyond either ADS-B track end, kept (extends coverage where ADS-B never saw it);
+    * dropped if another extra fix has the same time (feeds deliver some reports twice);
+    * dropped if reaching it from the previous accepted point, or the next ADS-B point from
+      it, needs more than ``MAX_FIX_SPEED_KMH``: it cannot be this aircraft at that time.
+
+    ``stats`` (optional) counts ``duplicate`` and ``implausible`` drops.
     """
     if not extra_points:
         return sorted(adsb_points, key=lambda p: p.datetime)
@@ -817,12 +839,29 @@ def merge_track_with_sources(adsb_points: List["TrackPoint"], extra_points: List
                 kept.append(e)  # fills a genuine ADS-B gap
         else:
             kept.append(e)      # extends beyond an ADS-B track end
-    return sorted(adsb_sorted + kept, key=lambda p: p.datetime)
+    accepted: List["TrackPoint"] = []
+    for e in sorted(kept, key=lambda p: p.datetime):
+        if accepted and e.datetime == accepted[-1].datetime:
+            if stats is not None:
+                stats["duplicate"] = stats.get("duplicate", 0) + 1
+            continue
+        i = bisect.bisect_left(adsb_times, e.datetime)
+        prev = adsb_sorted[i - 1] if i > 0 else None
+        if accepted and (prev is None or accepted[-1].datetime > prev.datetime):
+            prev = accepted[-1]
+        nxt = adsb_sorted[i] if i < len(adsb_sorted) else None
+        if _too_fast(prev, e) or _too_fast(e, nxt):
+            if stats is not None:
+                stats["implausible"] = stats.get("implausible", 0) + 1
+            continue
+        accepted.append(e)
+    return sorted(adsb_sorted + accepted, key=lambda p: p.datetime)
 
 
 def enrich_segments_with_sources(segments: List["FlightSegment"],
                                  pos_index: Dict[Tuple[str, str], List["TrackPoint"]],
-                                 min_fill_gap_seconds: float = 300.0) -> Tuple[int, int]:
+                                 min_fill_gap_seconds: float = 300.0,
+                                 stats: Optional[Dict[str, int]] = None) -> Tuple[int, int]:
     """Fill each detected flight's interior ADS-B gaps with real POS/firehose fixes.
 
     For every segment, gathers extra fixes for its aircraft (hex) that fall strictly inside
@@ -830,7 +869,7 @@ def enrich_segments_with_sources(segments: List["FlightSegment"],
     only gaps >= ``min_fill_gap_seconds`` are filled). Because the window is bounded by the
     flight's own first/last ADS-B fix, origin/destination and timing are unchanged -- this
     only densifies flights already detected from ADS-B. Mutates segments in place; returns
-    (flights_enriched, fixes_added).
+    (flights_enriched, fixes_added); ``stats`` collects the merge's drop counts.
     """
     flights_enriched = fixes_added = 0
     if not pos_index:
@@ -844,7 +883,8 @@ def enrich_segments_with_sources(segments: List["FlightSegment"],
                   if t0 <= e.datetime <= t1]
         if not extras:
             continue
-        merged = merge_track_with_sources(seg.points, extras, min_fill_gap_seconds=min_fill_gap_seconds)
+        merged = merge_track_with_sources(seg.points, extras,
+                                          min_fill_gap_seconds=min_fill_gap_seconds, stats=stats)
         added = len(merged) - len(seg.points)
         if added <= 0:
             continue
@@ -2610,11 +2650,17 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
     # straight-line inference). Detection/route-matching above is unchanged -- ADS-B alone
     # decides the flights; the extra sources only densify the ones already found.
     if integrate_pos and pos_index:
+        merge_stats: Dict[str, int] = {}
         n_flights_enriched, n_fixes_added = enrich_segments_with_sources(
-            final_segments, pos_index, min_fill_gap_seconds=stitch_gap_min * 60.0)
+            final_segments, pos_index, min_fill_gap_seconds=stitch_gap_min * 60.0,
+            stats=merge_stats)
         print(f"\nPosition-source integration: filled {n_fixes_added} real fix(es) into "
               f"{n_flights_enriched} of {len(final_segments)} flights "
               f"(gaps >= {stitch_gap_min:.0f} min, within each flight's own time window)")
+        if merge_stats:
+            print(f"  Dropped {merge_stats.get('duplicate', 0)} duplicate fix(es) and "
+                  f"{merge_stats.get('implausible', 0)} implausible fix(es) (would need "
+                  f"> {MAX_FIX_SPEED_KMH:.0f} km/h to or from the ADS-B track)")
 
     # Flight identity, measured gaps and the origin/destination plausibility check.
     repeats = annotate_flights(final_segments, gap_min=stitch_gap_min,
