@@ -266,3 +266,198 @@ def test_backward_extension_observes_the_origin(ahr, make_segment, net, ctx):
     stats = ahr.extend_ends_with_pos(s, ahr.FixSeries(before), None, None, ctx)
     assert (s.origin.code, s.orig_source) == ("AAA", "pos_observed")
     assert s.takeoff_time == T0 and stats["before_km"] > 300
+
+
+# ---- F4 / F5 / F8: rotation, planned legs and the evidence order ---------------------
+
+def _leg(ahr, digits, orig, dest, sched, tail="XAAAA", ambiguous=False, key=None,
+         carrier="TAM"):
+    return ahr.PlannedLeg(key or f"{sched:%Y-%m-%d}_{carrier}{digits}_{orig}-{dest}", "ofp",
+                          carrier, f"{carrier}{digits}", digits, tail, orig, dest,
+                          sched, ambiguous)
+
+
+def _legs(*legs):
+    by_tail = {}
+    for lg in legs:
+        by_tail.setdefault(lg.tail, []).append(lg)
+    return by_tail
+
+
+def _guessed_bbb(ahr, make_segment, net, start=T0):
+    """AAA->? lost 30 min out; 1.4.0 route time said BBB."""
+    s = _seg(ahr, make_segment, net, start, 30, (0, 0), (0, 2.5), orig="AAA", dest="BBB")
+    s.registration = "XA-AAA"
+    s.dest_source, s.dest_candidates = "route_time", ["BBB", "DDD"]
+    return s
+
+
+def _observed(ahr, make_segment, net, start, a, b, orig, dest, minutes=72):
+    s = _seg(ahr, make_segment, net, start, minutes, a, b, orig=orig, dest=dest)
+    s.registration = "XA-AAA"
+    return s
+
+
+@pytest.fixture
+def rctx(ahr, net):
+    return ahr.EvidenceContext(net["airports"], net["routes"], ahr.PRESETS["permissive"],
+                               ahr.EvidenceOptions(rotation_endpoints=True))
+
+
+def test_rotation_from_an_observed_neighbour(ahr, make_segment, net, rctx):
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    f2 = _observed(ahr, make_segment, net, T0 + timedelta(hours=2), (0, 6), (0, 0), "DDD", "AAA")
+    ahr.resolve_endpoints([f1, f2], rctx)
+    assert (f1.destination.code, f1.dest_source) == ("DDD", "rotation")
+    assert f1.dest_free == ("DDD", "rotation")
+    assert f1.evidence_changes == [{"feature": "F4", "endpoint": "dest", "before": "BBB",
+                                    "after": "DDD", "source": "rotation"}]
+    assert (f2.orig_source, f2.dest_source) == ("observed", "observed")
+
+
+def test_rotation_chained_from_an_inferred_neighbour(ahr, make_segment, net, rctx):
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    # picked up 890 km south of AAA, where no route or corridor leads: no rescue
+    f2 = _seg(ahr, make_segment, net, T0 + timedelta(hours=2), 60, (-8.0, 0), (0, 0), dest="AAA")
+    f2.registration = "XA-AAA"
+    ahr.resolve_endpoints([f1, f2], rctx)
+    assert (f1.destination.code, f1.dest_source) == ("BBB", "route_time")
+    assert (f2.origin.code, f2.orig_source) == ("BBB", "rotation_chained")
+
+
+def test_rotation_conflict_keeps_observed_ends(ahr, make_segment, net, rctx):
+    f1 = _observed(ahr, make_segment, net, T0, (0, 0), (0, 5), "AAA", "BBB", minutes=60)
+    f2 = _observed(ahr, make_segment, net, T0 + timedelta(hours=2), (0, 6), (0, 0), "DDD", "AAA")
+    ahr.resolve_endpoints([f1, f2], rctx)
+    assert f1.destination.code == "BBB" and f2.origin.code == "DDD"
+    assert f1.endpoint_conflict and f2.endpoint_conflict
+
+
+def test_rotation_gap_too_long(ahr, make_segment, net, rctx):
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    f2 = _observed(ahr, make_segment, net, T0 + timedelta(hours=20), (0, 6), (0, 0), "DDD", "AAA")
+    ahr.resolve_endpoints([f1, f2], rctx)
+    assert (f1.destination.code, f1.dest_source) == ("BBB", "route_time")
+    assert not f1.endpoint_conflict
+
+
+def test_rotation_off_changes_nothing(ahr, make_segment, net):
+    ctx = ahr.EvidenceContext(net["airports"], net["routes"], ahr.PRESETS["permissive"],
+                              ahr.EvidenceOptions())
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    f2 = _observed(ahr, make_segment, net, T0 + timedelta(hours=2), (0, 6), (0, 0), "DDD", "AAA")
+    ahr.resolve_endpoints([f1, f2], ctx)
+    assert (f1.destination.code, f1.dest_source) == ("BBB", "route_time")
+
+
+@pytest.fixture
+def pctx(ahr, net):
+    return ahr.EvidenceContext(net["airports"], net["routes"], ahr.PRESETS["permissive"],
+                               ahr.EvidenceOptions(planned_legs=["legs.csv"]))
+
+
+def test_planned_rule1_flight_number(ahr, make_segment, net, pctx):
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    f1.flight_number, f1.flight_number_source = "JJ1234", "acars_fi"
+    leg = _leg(ahr, "1234", "AAA", "DDD", T0)
+    ahr.resolve_endpoints([f1], pctx, _legs(leg))
+    assert (f1.destination.code, f1.dest_source) == ("DDD", "planned:ofp:fn")
+    assert f1.planned_leg_key == leg.leg_key and f1.planned_rule == 1
+    assert f1.dest_free == ("BBB", "route_time")          # what the plan-free logic said
+    assert f1.flight_number == "JJ1234"                   # the ACARS number stays
+
+
+def test_planned_rule2_tail_time_and_one_observed_end(ahr, make_segment, net, pctx):
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    ahr.resolve_endpoints([f1], pctx, _legs(_leg(ahr, "1234", "AAA", "DDD",
+                                                 T0 - timedelta(minutes=30))))
+    assert (f1.destination.code, f1.dest_source) == ("DDD", "planned:ofp:tail")
+    assert (f1.flight_number, f1.flight_number_source) == ("TAM1234", "planned:ofp")
+
+
+def test_planned_rule2_needs_a_matching_observed_end(ahr, make_segment, net, pctx):
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    ahr.resolve_endpoints([f1], pctx, _legs(_leg(ahr, "1234", "CCC", "DDD", T0)))
+    assert f1.dest_source == "route_time" and f1.planned_leg_key is None
+
+
+def test_planned_ambiguous_row_never_matches(ahr, make_segment, net, pctx):
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    f1.flight_number, f1.flight_number_source = "JJ1234", "acars_fi"
+    ahr.resolve_endpoints([f1], pctx, _legs(_leg(ahr, "1234", "AAA", "DDD", T0,
+                                                 ambiguous=True)))
+    assert f1.dest_source == "route_time" and f1.planned_leg_key is None
+
+
+def test_planned_leg_claimed_by_two_flights_is_not_used(ahr, make_segment, net, pctx):
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    f2 = _guessed_bbb(ahr, make_segment, net, start=T0 + timedelta(hours=3))
+    ahr.resolve_endpoints([f1, f2], pctx, _legs(_leg(ahr, "1234", "AAA", "DDD", T0)))
+    assert f1.planned_leg_key is None and f2.planned_leg_key is None
+
+
+def test_planned_leg_outside_the_window(ahr, make_segment, net, pctx):
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    f1.flight_number, f1.flight_number_source = "JJ1234", "acars_fi"
+    ahr.resolve_endpoints([f1], pctx, _legs(_leg(ahr, "1234", "AAA", "DDD",
+                                                 T0 + timedelta(minutes=61))))
+    assert f1.planned_leg_key is None
+
+
+def test_planned_never_overrides_an_observed_end(ahr, make_segment, net, pctx):
+    f1 = _observed(ahr, make_segment, net, T0, (0, 0), (0, 5), "AAA", "BBB", minutes=60)
+    f1.flight_number, f1.flight_number_source = "JJ1234", "acars_fi"
+    ahr.resolve_endpoints([f1], pctx, _legs(_leg(ahr, "1234", "AAA", "DDD", T0)))
+    assert (f1.destination.code, f1.dest_source) == ("BBB", "observed")
+    assert f1.endpoint_conflict and f1.planned_leg_key is not None
+
+
+def test_order_rule1_beats_rotation(ahr, make_segment, net):
+    ctx = ahr.EvidenceContext(net["airports"], net["routes"], ahr.PRESETS["permissive"],
+                              ahr.EvidenceOptions(rotation_endpoints=True, planned_legs=["x"]))
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    f1.flight_number, f1.flight_number_source = "JJ1234", "acars_fi"
+    f2 = _observed(ahr, make_segment, net, T0 + timedelta(hours=2), (4, 2), (0, 0), "CCC", "AAA")
+    ahr.resolve_endpoints([f1, f2], ctx, _legs(_leg(ahr, "1234", "AAA", "DDD", T0)))
+    assert (f1.destination.code, f1.dest_source) == ("DDD", "planned:ofp:fn")
+    assert f1.dest_free == ("CCC", "rotation")
+
+
+def test_order_rotation_beats_rule2(ahr, make_segment, net):
+    ctx = ahr.EvidenceContext(net["airports"], net["routes"], ahr.PRESETS["permissive"],
+                              ahr.EvidenceOptions(rotation_endpoints=True, planned_legs=["x"]))
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    f2 = _observed(ahr, make_segment, net, T0 + timedelta(hours=2), (4, 2), (0, 0), "CCC", "AAA")
+    ahr.resolve_endpoints([f1, f2], ctx, _legs(_leg(ahr, "1234", "AAA", "DDD", T0)))
+    assert (f1.destination.code, f1.dest_source) == ("CCC", "rotation")
+
+
+def test_no_number_no_leg_flight_is_unchanged(ahr, make_segment, net):
+    ctx = ahr.EvidenceContext(net["airports"], net["routes"], ahr.PRESETS["permissive"],
+                              ahr.EvidenceOptions(acars_identity=True, planned_legs=["x"]))
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    before = (f1.origin.code, f1.destination.code, f1.orig_source, f1.dest_source,
+              list(f1.dest_candidates), len(f1.points), f1.takeoff_time, f1.landing_time)
+    ahr.assign_flight_numbers([f1], {})
+    ahr.resolve_endpoints([f1], ctx, _legs(_leg(ahr, "1234", "CCC", "DDD", T0)))
+    assert (f1.origin.code, f1.destination.code, f1.orig_source, f1.dest_source,
+            list(f1.dest_candidates), len(f1.points), f1.takeoff_time, f1.landing_time) == before
+    assert f1.flight_number is None and f1.planned_leg_key is None
+    assert not f1.endpoint_conflict
+
+
+def test_load_planned_legs(ahr, tmp_path):
+    a = tmp_path / "a.csv"
+    a.write_text("leg_key,source,carrier_icao,flight_number,flight_digits,tail,orig,dest,"
+                 "sched_dep_utc,ofp_date,ambiguous\n"
+                 "k1,ofp,TAM,TAM3036,3036,PRMAG,SBSP,SBCF,2026-07-14T11:00:00Z,2026-07-14,0\n"
+                 "k2,ofp,TAM,TAM0036,0036,PR-MAG,SBCF,SBSP,2026-07-15T11:00:00Z,2026-07-15,1\n")
+    b = tmp_path / "b.csv"
+    b.write_text(a.read_text().splitlines()[0] + "\n"
+                 "k3,cirium_flight,LAN,LAN800,800,CCBMD,SCEL,SAEZ,2026-07-16T01:00:00Z,,0\n")
+    by_tail, info = ahr.load_planned_legs([str(a), str(b)])
+    assert [lg.leg_key for lg in by_tail["PRMAG"]] == ["k1", "k2"]
+    assert by_tail["PRMAG"][1].digits == "36" and by_tail["PRMAG"][1].ambiguous
+    assert by_tail["CCBMD"][0].source == "cirium_flight"
+    assert info == [{"file": "a.csv", "rows": 2, "from": "2026-07-14", "to": "2026-07-15"},
+                    {"file": "b.csv", "rows": 1, "from": "2026-07-16", "to": "2026-07-16"}]

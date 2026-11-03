@@ -24,9 +24,10 @@ import subprocess
 import tempfile
 import time
 import urllib.parse
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from dataclasses import dataclass, replace
 from typing import Any, List, Tuple, Dict, Optional, Sequence, Set
+import copy
 import csv
 import re
 
@@ -1919,6 +1920,274 @@ def extend_ends_with_pos(seg: FlightSegment, fixes: List[TrackPoint],
             refresh_segment(seg)
             _redetect_end(seg, "origin", ctx, feature)
     return stats
+
+
+# ---- F5: planned legs ------------------------------------------------------------
+
+PlannedLeg = namedtuple("PlannedLeg", "leg_key source carrier flight_number digits tail "
+                                      "orig dest sched_dep ambiguous")
+# A flight matches a leg when it takes off within [sched_dep - 60 min, sched_dep + 8 h]
+# (direct_detect's window: the first fix can be well after the real takeoff).
+PLANNED_EARLY_MIN = 60.0
+PLANNED_LATE_H = 8.0
+
+
+def _norm_tail(tail: Optional[str]) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (tail or "").upper())
+
+
+def load_planned_legs(paths: Sequence[str]) -> Tuple[Dict[str, List[PlannedLeg]],
+                                                     List[Dict[str, Any]]]:
+    """Read planned-leg CSVs (``leg_key,source,carrier_icao,flight_number,flight_digits,
+    tail,orig,dest,sched_dep_utc,ofp_date,ambiguous``) into {tail: legs by sched_dep}.
+
+    Also returns, per file, its name, row count and first / last scheduled date (for meta).
+    """
+    by_tail: Dict[str, List[PlannedLeg]] = defaultdict(list)
+    info = []
+    for path in paths:
+        n, dates = 0, []
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                try:
+                    sched = datetime.fromisoformat(
+                        row["sched_dep_utc"].strip().replace("Z", "+00:00"))
+                except (KeyError, ValueError):
+                    continue
+                if sched.tzinfo is None:
+                    sched = sched.replace(tzinfo=timezone.utc)
+                fd = (row.get("flight_digits") or "").strip()
+                digits = str(int(fd)) if fd.isdigit() else _digits(row.get("flight_number"))
+                leg = PlannedLeg(row.get("leg_key", ""), (row.get("source") or "plan").strip(),
+                                 (row.get("carrier_icao") or "").strip(),
+                                 (row.get("flight_number") or "").strip(), digits,
+                                 _norm_tail(row.get("tail")), (row.get("orig") or "").strip(),
+                                 (row.get("dest") or "").strip(), sched,
+                                 (row.get("ambiguous") or "0").strip() not in ("", "0"))
+                if leg.tail:
+                    by_tail[leg.tail].append(leg)
+                    n += 1
+                    dates.append(sched.strftime("%Y-%m-%d"))
+        info.append({"file": os.path.basename(path), "rows": n,
+                     "from": min(dates) if dates else "", "to": max(dates) if dates else ""})
+    for legs in by_tail.values():
+        legs.sort(key=lambda lg: lg.sched_dep)
+    return dict(by_tail), info
+
+
+def _flight_tail(seg: FlightSegment) -> str:
+    return _norm_tail(seg.registration)
+
+
+def _legs_in_window(seg: FlightSegment, legs: List[PlannedLeg]) -> List[PlannedLeg]:
+    t = seg.takeoff_time
+    lo = t - timedelta(hours=PLANNED_LATE_H)
+    hi = t + timedelta(minutes=PLANNED_EARLY_MIN)
+    return [lg for lg in legs if lo <= lg.sched_dep <= hi and not lg.ambiguous]
+
+
+def _end_code(seg: FlightSegment, end: str) -> Optional[str]:
+    ap = seg.origin if end == "origin" else seg.destination
+    return ap.code if ap else None
+
+
+def _end_source(seg: FlightSegment, end: str) -> Optional[str]:
+    return seg.orig_source if end == "origin" else seg.dest_source
+
+
+def _end_candidates(seg: FlightSegment, end: str) -> List[str]:
+    return seg.orig_candidates if end == "origin" else seg.dest_candidates
+
+
+def match_planned_legs(flights: List[FlightSegment],
+                       legs_by_tail: Dict[str, List[PlannedLeg]]) -> None:
+    """F5: give each flight at most one planned leg (``planned_leg``, ``planned_rule``).
+
+    Rule 1: same tail, takeoff in the leg's window and the leg's ``flight_digits`` equal to
+    the flight's ACARS number. Rule 2 (flights without a number): same tail, the window,
+    and one observed end equal to the leg's. A match needs one candidate leg for the flight,
+    and no other flight with that leg as a candidate under the same rule. Rule 1 runs first;
+    its legs are not offered to rule 2. Rows marked ``ambiguous`` never match.
+    """
+    for f in flights:
+        f.planned_leg, f.planned_rule = None, None
+    taken: Set[str] = set()
+    for rule in (1, 2):
+        cands: Dict[int, List[PlannedLeg]] = {}
+        claims: Dict[str, int] = defaultdict(int)
+        for f in flights:
+            if f.planned_leg is not None or not f.points:
+                continue
+            window = [lg for lg in _legs_in_window(f, legs_by_tail.get(_flight_tail(f), []))
+                      if lg.leg_key not in taken]
+            if rule == 1:
+                if getattr(f, "flight_number_source", None) != "acars_fi":
+                    continue
+                digits = _digits(f.flight_number)
+                found = [lg for lg in window if digits and lg.digits == digits]
+            else:
+                if getattr(f, "flight_number", None):
+                    continue
+                found = [lg for lg in window
+                         if (f.orig_source in OBSERVED_SOURCES and _end_code(f, "origin") == lg.orig)
+                         or (f.dest_source in OBSERVED_SOURCES and _end_code(f, "dest") == lg.dest)]
+            if found:
+                cands[id(f)] = found
+                for lg in found:
+                    claims[lg.leg_key] += 1
+        for f in flights:
+            found = cands.get(id(f))
+            if found and len(found) == 1 and claims[found[0].leg_key] == 1:
+                f.planned_leg, f.planned_rule = found[0], rule
+                taken.add(found[0].leg_key)
+
+
+# ---- F4 / F8: rotation and the evidence order -------------------------------------
+
+def _ground_gap_h(earlier: FlightSegment, later: FlightSegment) -> float:
+    return (later.takeoff_time - earlier.landing_time).total_seconds() / 3600.0
+
+
+def _resolve(flights: List[FlightSegment], ctx: EvidenceContext, use_planned: bool
+             ) -> List[Dict[str, Optional[Tuple[Optional[str], str, List[str]]]]]:
+    """Each end's (code, source, candidates) by the evidence order (request F8).
+
+    1 observed (ADS-B), 2 pos_observed, 3 planned rule 1, 4 rotation from an observed
+    neighbour, 5 planned rule 2, 6 the 1.4.0 rescue (route time, geometry, bearing join),
+    then rotation_chained from a neighbour whose end is itself inferred. Ends with nothing
+    are None. ``flights`` are one aircraft's, in time order.
+    """
+    rotation = ctx.options.rotation_endpoints
+    max_gap = ctx.options.rotation_max_gap_h
+    other = {"origin": "dest", "dest": "origin"}
+
+    def neighbour(i: int, end: str) -> Optional[FlightSegment]:
+        j = i + 1 if end == "dest" else i - 1
+        if not 0 <= j < len(flights):
+            return None
+        a, b = (flights[i], flights[j]) if end == "dest" else (flights[j], flights[i])
+        return flights[j] if 0.0 <= _ground_gap_h(a, b) <= max_gap else None
+
+    state = []
+    for i, f in enumerate(flights):
+        ends: Dict[str, Optional[Tuple[Optional[str], str, List[str]]]] = {}
+        for end in ("origin", "dest"):
+            code, src, cands = _end_code(f, end), _end_source(f, end), _end_candidates(f, end)
+            if src in OBSERVED_SOURCES:
+                ends[end] = (code, src, cands)
+                continue
+            leg_end = None
+            if use_planned and f.planned_leg is not None:
+                leg_end = f.planned_leg.orig if end == "origin" else f.planned_leg.dest
+            pick = None
+            if leg_end and f.planned_rule == 1:
+                pick = (leg_end, f"planned:{f.planned_leg.source}:fn", cands)
+            if pick is None and rotation:
+                nb = neighbour(i, end)
+                o = other[end]
+                if nb is not None and _end_source(nb, o) in OBSERVED_SOURCES:
+                    nb_code = _end_code(nb, o)
+                    own_other = (_end_code(f, o) if _end_source(f, o) in OBSERVED_SOURCES
+                                 else None)
+                    if nb_code and nb_code != own_other:
+                        pick = (nb_code, "rotation", cands)
+            if pick is None and leg_end and f.planned_rule == 2:
+                pick = (leg_end, f"planned:{f.planned_leg.source}:tail", cands)
+            if pick is None and code is not None:
+                pick = (code, src, cands)
+            ends[end] = pick
+        state.append(ends)
+
+    rescued: Dict[Tuple[int, str, str], Optional[Tuple[str, str, List[str]]]] = {}
+
+    def rescue(i: int, end: str, anchor: str):
+        key = (i, end, anchor)
+        if key not in rescued:
+            tmp = copy.copy(flights[i])
+            if end == "dest":
+                tmp.origin, tmp.destination = ctx.airports_dict.get(anchor), None
+            else:
+                tmp.origin, tmp.destination = None, ctx.airports_dict.get(anchor)
+            rescued[key] = None
+            if (tmp.origin or tmp.destination) and ctx.rescue(tmp):
+                rescued[key] = (_end_code(tmp, end), _end_source(tmp, end),
+                                _end_candidates(tmp, end))
+        return rescued[key]
+
+    changed = True
+    while changed:
+        changed = False
+        for i, f in enumerate(flights):
+            for end in ("origin", "dest"):
+                if state[i][end] is not None:
+                    continue
+                o = other[end]
+                anchor = state[i][o][0] if state[i][o] else None
+                pick = rescue(i, end, anchor) if anchor else None
+                if pick is None and rotation:
+                    nb = neighbour(i, end)
+                    j = i + 1 if end == "dest" else i - 1
+                    if nb is not None and state[j][o] is not None and state[j][o][0] != anchor:
+                        pick = (state[j][o][0], "rotation_chained", _end_candidates(f, end))
+                if pick is not None:
+                    state[i][end] = pick
+                    changed = True
+    return state
+
+
+def resolve_endpoints(flights: List[FlightSegment], ctx: EvidenceContext,
+                      legs_by_tail: Optional[Dict[str, List[PlannedLeg]]] = None) -> None:
+    """Apply rotation (F4), planned legs (F5) and the evidence order (F8) to one aircraft.
+
+    Sets each end's airport and ``*_source``, ``orig_free`` / ``dest_free`` (the answer
+    without planned legs, as (code, source)), ``planned_leg_key``, ``endpoint_conflict``
+    (an observed end that rotation or the planned leg contradicts) and, for flights with
+    no ACARS number, the planned leg's flight number. Observed ends never change.
+    """
+    flights.sort(key=lambda s: s.takeoff_time)
+    for f in flights:
+        f.endpoint_conflict = False
+        f.planned_leg_key = None
+        if not hasattr(f, "flight_number"):
+            f.flight_number, f.flight_number_source, f.flight_number_conflict = None, None, False
+    use_planned = bool(ctx.options.planned_legs and legs_by_tail)
+    if use_planned:
+        match_planned_legs(flights, legs_by_tail)
+    else:
+        for f in flights:
+            f.planned_leg, f.planned_rule = None, None
+    free = _resolve(flights, ctx, use_planned=False)
+    final = _resolve(flights, ctx, use_planned=True) if use_planned else free
+    for i, f in enumerate(flights):
+        for end in ("origin", "dest"):
+            pf = free[i][end]
+            setattr(f, "orig_free" if end == "origin" else "dest_free",
+                    (pf[0], pf[1]) if pf else (None, "unresolved"))
+            pick = final[i][end]
+            before = _end_code(f, end)
+            code, src, cands = pick if pick else (None, None, [])
+            attr, skey = ("origin", "orig") if end == "origin" else ("destination", "dest")
+            setattr(f, attr, ctx.airports_dict.get(code) if code else None)
+            setattr(f, skey + "_source", src)
+            setattr(f, skey + "_candidates", cands)
+            if src and (src.startswith("rotation") or src.startswith("planned:")):
+                note_change(f, "F4" if src.startswith("rotation") else "F5", end, before,
+                            code, src)
+        f.is_complete = f.origin is not None and f.destination is not None
+        leg = f.planned_leg
+        if leg is not None:
+            f.planned_leg_key = leg.leg_key
+            if not f.flight_number:
+                f.flight_number, f.flight_number_source = leg.flight_number, f"planned:{leg.source}"
+            for end, leg_code in (("origin", leg.orig), ("dest", leg.dest)):
+                if _end_source(f, end) in OBSERVED_SOURCES and _end_code(f, end) != leg_code:
+                    f.endpoint_conflict = True
+    if ctx.options.rotation_endpoints:
+        for a, b in zip(flights, flights[1:]):
+            if (a.dest_source in OBSERVED_SOURCES and b.orig_source in OBSERVED_SOURCES
+                    and 0.0 <= _ground_gap_h(a, b) <= ctx.options.rotation_max_gap_h
+                    and a.destination.code != b.origin.code):
+                a.endpoint_conflict = b.endpoint_conflict = True
 
 
 class DiagnosticsRecorder:
