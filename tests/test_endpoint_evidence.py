@@ -160,3 +160,109 @@ def test_no_pos_no_flight_number(ahr, make_segment, net):
     ahr.assign_flight_numbers([s], {})
     assert (s.flight_number, s.flight_number_source, s.flight_number_conflict) == \
         (None, None, False)
+
+
+# ---- F2: POS before / after the ADS-B ends ----------------------------------------
+
+@pytest.fixture
+def ctx(ahr, net):
+    return ahr.EvidenceContext(net["airports"], net["routes"], ahr.PRESETS["permissive"],
+                               ahr.EvidenceOptions(pos_extend_ends=True))
+
+
+def _toward_ddd(ahr, minutes, fi="JJ1234", alt_ft=33000, last_low=True):
+    """POS fixes AAA->DDD (72 min) at the given minutes; the 72-min one low over DDD."""
+    out = []
+    for m in minutes:
+        low = last_low and m == 72
+        out.append(_fix(ahr, T0 + timedelta(minutes=m), 0.0, 6.0 * m / 72,
+                        alt_ft=1000 if low else alt_ft, fi=fi))
+    return out
+
+
+def _lost_at_30(ahr, make_segment, net):
+    """AAA->DDD whose ADS-B ends 30 min out; 1.4.0 guessed BBB by route time."""
+    s = _seg(ahr, make_segment, net, T0, 30, (0, 0), (0, 2.5), orig="AAA", dest="BBB")
+    s.dest_source, s.dest_candidates = "route_time", ["BBB", "DDD"]
+    return s
+
+
+def test_extend_to_an_observed_end(ahr, make_segment, net, ctx):
+    s = _lost_at_30(ahr, make_segment, net)
+    fixes = ahr.FixSeries(_toward_ddd(ahr, range(36, 73, 6)))
+    stats = ahr.extend_ends_with_pos(s, fixes, None, None, ctx)
+    assert s.destination.code == "DDD" and s.dest_source == "pos_observed"
+    assert s.dest_candidates == []
+    assert s.points[-1].source == "POS" and s.landing_time == T0 + timedelta(minutes=72)
+    assert s.flight_duration == pytest.approx(72.0)
+    assert stats["after_km"] == pytest.approx(3.5 * 111.2, rel=0.01)
+    assert stats["before_km"] == 0.0
+    assert s.evidence_changes == [{"feature": "F2", "endpoint": "dest", "before": "BBB",
+                                   "after": "DDD", "source": "pos_observed"}]
+
+
+def test_extension_stops_at_a_speed_jump(ahr, make_segment, net, ctx):
+    s = _lost_at_30(ahr, make_segment, net)
+    fixes = _toward_ddd(ahr, range(36, 73, 6))
+    fixes[2] = _fix(ahr, fixes[2].datetime, 9.0, 3.5, fi="JJ1234")   # 1,000 km off the line
+    ahr.extend_ends_with_pos(s, ahr.FixSeries(fixes), None, None, ctx)
+    assert s.landing_time == T0 + timedelta(minutes=42)
+    assert s.dest_source != "pos_observed"
+
+
+def test_extension_stops_at_a_gap(ahr, make_segment, net, ctx):
+    s = _lost_at_30(ahr, make_segment, net)
+    fixes = _toward_ddd(ahr, [36, 42, 48] + [72])    # 24-min gap is fine...
+    ahr.extend_ends_with_pos(s, ahr.FixSeries(fixes), None, None, ctx)
+    assert s.dest_source == "pos_observed"
+    s2 = _lost_at_30(ahr, make_segment, net)
+    ctx.options.pos_extend_max_gap_min = 20.0        # ...but not over a 20-min limit
+    ahr.extend_ends_with_pos(s2, ahr.FixSeries(fixes), None, None, ctx)
+    assert s2.landing_time == T0 + timedelta(minutes=48)
+
+
+def test_extension_stops_at_the_neighbour_window(ahr, make_segment, net, ctx):
+    s = _lost_at_30(ahr, make_segment, net)
+    fixes = ahr.FixSeries(_toward_ddd(ahr, range(36, 73, 6)))
+    ahr.extend_ends_with_pos(s, fixes, None, T0 + timedelta(minutes=50), ctx)
+    assert s.landing_time == T0 + timedelta(minutes=48)
+
+
+def test_extension_stops_at_a_flight_number_change(ahr, make_segment, net, ctx):
+    s = _lost_at_30(ahr, make_segment, net)
+    inside = [_fix(ahr, T0 + timedelta(minutes=20), 0.0, 1.67, fi="JJ1234")]
+    after = _toward_ddd(ahr, [36, 42]) + _toward_ddd(ahr, [48, 54], fi="JJ5555")
+    ahr.extend_ends_with_pos(s, ahr.FixSeries(inside + after), None, None, ctx)
+    assert s.landing_time == T0 + timedelta(minutes=42)
+
+
+def test_observed_end_is_not_extended(ahr, make_segment, net, ctx):
+    s = _seg(ahr, make_segment, net, T0, 72, (0, 0), (0, 6.0), orig="AAA", dest="DDD")
+    later = [_fix(ahr, T0 + timedelta(minutes=m), 0.0, 6.0 - (m - 100) / 20, fi="JJ9")
+             for m in (100, 106)]
+    n = len(s.points)
+    ahr.extend_ends_with_pos(s, ahr.FixSeries(later), None, None, ctx)
+    assert len(s.points) == n and s.dest_source == "observed"
+
+
+def test_extension_reruns_the_rescue_on_the_longer_track(ahr, make_segment, net, ctx):
+    # POS carries the track to 70 min, still at cruise: no airport seen, but route time
+    # on the longer track now fits DDD (72 min) and not BBB (60 min)
+    s = _lost_at_30(ahr, make_segment, net)
+    fixes = _toward_ddd(ahr, range(36, 71, 6), last_low=False) + \
+        [_fix(ahr, T0 + timedelta(minutes=70), 0.0, 5.83, alt_ft=20000, fi="JJ1234")]
+    ahr.extend_ends_with_pos(s, ahr.FixSeries(fixes), None, None, ctx)
+    assert (s.destination.code, s.dest_source) == ("DDD", "route_time")
+    assert s.evidence_changes[0]["after"] == "DDD"
+
+
+def test_backward_extension_observes_the_origin(ahr, make_segment, net, ctx):
+    # ADS-B picks the flight up 40 min out of AAA; POS covers the climb-out
+    s = _seg(ahr, make_segment, net, T0 + timedelta(minutes=40), 32, (0, 3.33), (0, 6.0),
+             dest="DDD")
+    before = [_fix(ahr, T0, 0.0, 0.0, alt_ft=900, fi="JJ1234")] + \
+        [_fix(ahr, T0 + timedelta(minutes=m), 0.0, 6.0 * m / 72, fi="JJ1234")
+         for m in (6, 12, 18, 24, 30)]
+    stats = ahr.extend_ends_with_pos(s, ahr.FixSeries(before), None, None, ctx)
+    assert (s.origin.code, s.orig_source) == ("AAA", "pos_observed")
+    assert s.takeoff_time == T0 and stats["before_km"] > 300

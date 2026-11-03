@@ -1734,6 +1734,193 @@ def assign_flight_numbers(segments: List[FlightSegment],
         seg.flight_number_conflict = len(counts) > 1
 
 
+@dataclass
+class EvidenceOptions:
+    """The endpoint-evidence switches (request F1-F9). All off = the 1.4.0 build."""
+    acars_identity: bool = False          # F1
+    pos_extend_ends: bool = False         # F2
+    pos_extend_max_gap_min: float = 60.0
+    pos_only_flights: bool = False        # F3
+    pos_fleets: str = "mapped"            # mapped | all
+    rotation_endpoints: bool = False      # F4
+    rotation_max_gap_h: float = 18.0
+    planned_legs: Sequence[str] = ()      # F5
+    recover_dropped: bool = False         # F9
+
+    def any(self) -> bool:
+        return bool(self.acars_identity or self.pos_extend_ends or self.pos_only_flights
+                    or self.rotation_endpoints or self.planned_legs or self.recover_dropped)
+
+
+class EvidenceContext:
+    """What the evidence stage needs besides the flights: airports, routes and presets."""
+
+    def __init__(self, airports: List[Airport], routes_dict: Dict[Tuple[str, str], float],
+                 preset: ConfidencePreset, options: EvidenceOptions):
+        self.airports = airports
+        self.airports_dict = {a.code: a for a in airports}
+        self.routes_dict = routes_dict
+        self.preset = preset
+        self.options = options
+
+    def airport_at(self, p: TrackPoint) -> Optional[Airport]:
+        """The airport a fix is at (radius and height as for ADS-B detection), or None."""
+        return find_nearest_airport(p.lat, p.lon, p.alt, self.airports,
+                                    max_distance_km=self.preset.airport_radius_km,
+                                    max_alt_diff_ft=3000.0, lenient=True)
+
+    def rescue(self, seg: FlightSegment) -> str:
+        """1.4.0's last-chance rescue (route time, then geometry) of one missing end."""
+        pr = self.preset
+        return try_recover_endpoint(
+            seg, self.routes_dict, self.airports_dict, rt_rescue=pr.route_time_rescue,
+            geom_rescue=pr.geometry_rescue, route_tol=min(pr.route_time_tolerance + 0.1, 0.7),
+            corridor_xt=pr.corridor_cross_track_km, corridor_slack=pr.corridor_along_slack,
+            dir_aware=pr.direction_aware_rescue, corridor_gate=pr.geometry_rescue)
+
+
+def refresh_segment(seg: FlightSegment) -> None:
+    """Recompute a segment's times, duration, height and distance after its points change."""
+    pts = seg.points
+    seg.takeoff_time, seg.landing_time = pts[0].datetime, pts[-1].datetime
+    seg.flight_duration = (seg.landing_time - seg.takeoff_time).total_seconds() / 60
+    seg.takeoff_date_str = seg.takeoff_time.strftime('%Y-%m-%d')
+    seg.max_altitude = max(p.alt for p in pts)
+    seg.total_distance = seg.calculate_total_distance()
+    seg.is_complete = seg.origin is not None and seg.destination is not None
+
+
+def note_change(seg: FlightSegment, feature: str, endpoint: str, before: Optional[str],
+                after: Optional[str], source: str) -> None:
+    """Remember an endpoint the evidence stage changed (one diagnostics row each)."""
+    if before == after:
+        return
+    if not hasattr(seg, "evidence_changes"):
+        seg.evidence_changes = []
+    seg.evidence_changes.append({"feature": feature, "endpoint": endpoint, "before": before,
+                                 "after": after, "source": source})
+
+
+# A gap longer than this that the aircraft crosses slower than GROUND_STOP_MAX_SPEED_KMH
+# had it on the ground in between (an unseen landing and takeoff).
+GROUND_STOP_MIN_GAP_MIN = 20.0
+GROUND_STOP_MAX_SPEED_KMH = 150.0
+
+
+def _is_ground_stop(a: TrackPoint, b: TrackPoint) -> bool:
+    gap_h = abs((b.datetime - a.datetime).total_seconds()) / 3600.0
+    return (gap_h * 60.0 > GROUND_STOP_MIN_GAP_MIN
+            and haversine_distance(a.lat, a.lon, b.lat, b.lon) / gap_h < GROUND_STOP_MAX_SPEED_KMH)
+
+
+def _digits(flight_number: Optional[str]) -> Optional[str]:
+    sp = split_flight_number(flight_number)
+    return sp[1] if sp else None
+
+
+def _window_flight_digits(fixes: List[TrackPoint], t0: datetime, t1: datetime) -> Optional[str]:
+    counts: Dict[str, int] = {}
+    for p in _fixes_between(fixes, t0, t1):
+        d = _digits(p.flight_number)
+        if d:
+            counts[d] = counts.get(d, 0) + 1
+    return max(counts, key=lambda k: counts[k]) if counts else None
+
+
+def _walk_pos(anchor: TrackPoint, candidates: List[TrackPoint], ctx: EvidenceContext,
+              digits: Optional[str]) -> List[TrackPoint]:
+    """POS fixes continuing a track from ``anchor`` (``candidates`` in walking order).
+
+    Each step must stay within --pos-extend-max-gap-min and MAX_FIX_SPEED_KMH and must not
+    cross a ground stop or a change of FI flight number (when the flight has one). The walk
+    ends at the first fix seen at an airport.
+    """
+    taken: List[TrackPoint] = []
+    prev = anchor
+    for f in candidates:
+        if f.datetime == prev.datetime:
+            continue
+        if abs((f.datetime - prev.datetime).total_seconds()) / 60.0 > \
+                ctx.options.pos_extend_max_gap_min:
+            break
+        if _too_fast(prev, f) or _is_ground_stop(prev, f):
+            break
+        fd = _digits(f.flight_number)
+        if digits and fd and fd != digits:
+            break
+        taken.append(f)
+        prev = f
+        if ctx.airport_at(f) is not None:
+            break
+    return taken
+
+
+def _path_km(points: List[TrackPoint]) -> float:
+    return sum(haversine_distance(a.lat, a.lon, b.lat, b.lon) for a, b in zip(points, points[1:]))
+
+
+def _redetect_end(seg: FlightSegment, end: str, ctx: EvidenceContext, feature: str) -> None:
+    """After an end moved: observed if its fix is at an airport, else re-run the rescue."""
+    p = seg.points[0] if end == "origin" else seg.points[-1]
+    attr = "origin" if end == "origin" else "destination"
+    skey = "orig" if end == "origin" else "dest"
+    old = (getattr(seg, attr), getattr(seg, skey + "_source"), getattr(seg, skey + "_candidates"))
+    before = old[0].code if old[0] else None
+    ap = ctx.airport_at(p)
+    if ap is not None:
+        setattr(seg, attr, ap)
+        setattr(seg, skey + "_source", "pos_observed")
+        setattr(seg, skey + "_candidates", [])
+    else:
+        setattr(seg, attr, None)
+        if not ctx.rescue(seg):
+            setattr(seg, attr, old[0])
+            setattr(seg, skey + "_source", old[1])
+            setattr(seg, skey + "_candidates", old[2])
+    seg.is_complete = seg.origin is not None and seg.destination is not None
+    now = getattr(seg, attr)
+    note_change(seg, feature, end, before, now.code if now else None,
+                getattr(seg, skey + "_source") or "unresolved")
+
+
+def extend_ends_with_pos(seg: FlightSegment, fixes: List[TrackPoint],
+                         lo: Optional[datetime], hi: Optional[datetime],
+                         ctx: EvidenceContext, feature: str = "F2") -> Dict[str, float]:
+    """F2: carry a flight's ends that were not seen at an airport on with POS fixes.
+
+    Fixes strictly between ``lo`` / ``hi`` (the neighbouring flights' windows) and the
+    flight's first / last point are walked outward (see ``_walk_pos``); then that end is
+    re-detected (``pos_observed`` when the last fix is at an airport, otherwise the 1.4.0
+    rescue re-runs on the longer track). Returns the km added before and after.
+    """
+    stats = {"before_km": 0.0, "after_km": 0.0}
+    if not fixes or not seg.points:
+        return stats
+    times = getattr(fixes, "times", None) or [p.datetime for p in fixes]
+    digits = _window_flight_digits(fixes, seg.points[0].datetime, seg.points[-1].datetime)
+    if seg.dest_source not in OBSERVED_SOURCES:
+        last = seg.points[-1]
+        i = bisect.bisect_right(times, last.datetime)
+        j = bisect.bisect_left(times, hi) if hi is not None else len(fixes)
+        taken = _walk_pos(last, fixes[i:j], ctx, digits)
+        if taken:
+            stats["after_km"] = _path_km([last] + taken)
+            seg.points = seg.points + taken
+            refresh_segment(seg)
+            _redetect_end(seg, "dest", ctx, feature)
+    if seg.orig_source not in OBSERVED_SOURCES:
+        first = seg.points[0]
+        i = bisect.bisect_left(times, first.datetime)
+        j = bisect.bisect_right(times, lo) if lo is not None else 0
+        taken = _walk_pos(first, fixes[j:i][::-1], ctx, digits)
+        if taken:
+            stats["before_km"] = _path_km([first] + taken)
+            seg.points = taken[::-1] + seg.points
+            refresh_segment(seg)
+            _redetect_end(seg, "origin", ctx, feature)
+    return stats
+
+
 class DiagnosticsRecorder:
     """Buffers per-segment diagnostic rows and writes them as a CSV sidecar to the output KML."""
 
