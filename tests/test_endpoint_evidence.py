@@ -120,9 +120,9 @@ def test_pos_loader_keeps_flight_number_and_registration(ahr, tmp_path):
     unmapped = {}
     idx = ahr.load_pos_points(str(tmp_path), {"XAAAA": "ABC101"}, unmapped=unmapped)
     (tp,) = idx[("ABC101", "2026-10-01")]
-    assert (tp.flight_number, tp.registration) == ("JJ1234", "XAAAA")
+    assert (tp.flight_number, tp.registration) == ("JJ1234", "XA-AAA")
     (cc,) = unmapped[("CCBMD", "2026-10-01")]
-    assert (cc.flight_number, cc.registration, cc.source) == ("LA800", "CCBMD", "POS")
+    assert (cc.flight_number, cc.registration, cc.source) == ("LA800", "CC-BMD", "POS")
 
 
 def test_pos_loader_skips_unmapped_files_unless_asked(ahr, tmp_path):
@@ -461,3 +461,138 @@ def test_load_planned_legs(ahr, tmp_path):
     assert by_tail["CCBMD"][0].source == "cirium_flight"
     assert info == [{"file": "a.csv", "rows": 2, "from": "2026-07-14", "to": "2026-07-15"},
                     {"file": "b.csv", "rows": 1, "from": "2026-07-16", "to": "2026-07-16"}]
+
+
+# ---- F3: POS-only flights; F9: dropped segments; the whole stage --------------------
+
+def _session(ahr, start, a, b, minutes=60, step=6, fi="JJ1236", reg="XA-AAA"):
+    """POS fixes a->b, low over both airports."""
+    out = []
+    for m in range(0, minutes + 1, step):
+        f = m / minutes
+        alt = 1000 if m in (0, minutes) else 33000
+        out.append(_fix(ahr, start + timedelta(minutes=m), a[0] + (b[0] - a[0]) * f,
+                        a[1] + (b[1] - a[1]) * f, alt_ft=alt, fi=fi, reg=reg))
+    return out
+
+
+def test_pos_sessions_split_at_ground_stop_and_gap(ahr, ctx):
+    fixes = (_session(ahr, T0, (0, 0), (4, 2)) +
+             _session(ahr, T0 + timedelta(minutes=100), (4, 2), (0, 0)) +   # 40 min on ground
+             _session(ahr, T0 + timedelta(hours=6), (0, 0), (0, 5)))
+    sessions = ahr.pos_sessions(fixes, ctx)
+    assert [len(x) for x in sessions] == [11, 11, 11]
+
+
+def test_pos_sessions_split_at_a_flight_number_change(ahr, ctx):
+    a = _session(ahr, T0, (0, 0), (4, 2))
+    b = _session(ahr, T0 + timedelta(minutes=66), (4, 2), (0, 0), fi="JJ1237")
+    b[0] = _fix(ahr, b[0].datetime, 3.9, 2.0, alt_ft=20000, fi="JJ1237")   # no ground stop seen
+    assert [len(x) for x in ahr.pos_sessions(a + b, ctx)] == [11, 11]
+
+
+def _stage(ahr, net, **opts):
+    return ahr.EvidenceContext(net["airports"], net["routes"], ahr.PRESETS["permissive"],
+                               ahr.EvidenceOptions(**opts))
+
+
+def test_session_becomes_a_pos_only_flight(ahr, net):
+    ctx = _stage(ahr, net, pos_only_flights=True)
+    pos = {"ABC101": ahr.FixSeries(_session(ahr, T0, (0, 0), (4, 2)))}
+    flights, report = ahr.run_endpoint_evidence({}, {}, pos, ctx, mapped={"ABC101"},
+                                                registrations={"ABC101": "XA-AAA"})
+    (f,) = flights
+    assert (f.origin.code, f.destination.code) == ("AAA", "CCC")
+    assert (f.orig_source, f.dest_source, f.disposition) == ("pos_observed", "pos_observed",
+                                                              "pos_only")
+    assert f.aircraft_id == "ABC101" and f.registration == "XA-AAA" and f.hex_known
+    assert {p.source for p in f.points} == {"POS"} and len(f.points) == 11
+    assert report["pos_only"]["kept"] == 1
+
+
+def test_unmapped_fleet_only_with_all(ahr, net):
+    pos = {"CCBMD": ahr.FixSeries(_session(ahr, T0, (0, 0), (0, 5), fi="LA800",
+                                           reg="CC-BMD"))}
+    flights, _ = ahr.run_endpoint_evidence({}, {}, pos, _stage(ahr, net, pos_only_flights=True),
+                                           mapped=set(), registrations={})
+    assert flights == []
+    flights, report = ahr.run_endpoint_evidence(
+        {}, {}, pos, _stage(ahr, net, pos_only_flights=True, pos_fleets="all"),
+        mapped=set(), registrations={})
+    (f,) = flights
+    assert (f.aircraft_id, f.registration, f.hex_known) == ("CCBMD", "CC-BMD", False)
+    assert report["pos_only"]["by_prefix"] == {"CC": 1}
+
+
+def test_pos_inside_an_adsb_flight_is_not_a_pos_only_flight(ahr, make_segment, net):
+    s = _seg(ahr, make_segment, net, T0, 60, (0, 0), (4, 2), orig="AAA", dest="CCC")
+    s.disposition = "kept_complete"
+    pos = {"ABC101": ahr.FixSeries(_session(ahr, T0, (0, 0), (4, 2)))}
+    flights, _ = ahr.run_endpoint_evidence({"ABC101": [s]}, {}, pos,
+                                           _stage(ahr, net, pos_only_flights=True),
+                                           mapped={"ABC101"}, registrations={})
+    assert flights == [s]
+
+
+def _dropped_no_airport(ahr, make_segment, net):
+    """ADS-B saw only 20 min of cruise between AAA and DDD: 1.4.0 dropped it."""
+    s = _seg(ahr, make_segment, net, T0 + timedelta(minutes=25), 20, (0, 2.08), (0, 3.75))
+    s.disposition = "dropped_unjoined"
+    row = {"disposition": "dropped_unjoined", "drop_reason": "no_airport_match"}
+    return s, row
+
+
+def test_dropped_segment_recovered_by_pos(ahr, make_segment, net):
+    seg, row = _dropped_no_airport(ahr, make_segment, net)
+    pos = {"ABC101": ahr.FixSeries(_toward_ddd(ahr, [0, 6, 12, 18, 50, 56, 62, 68, 72]))}
+    pos["ABC101"][0] = _fix(ahr, T0, 0.0, 0.0, alt_ft=900, fi="JJ1234")
+    ctx = _stage(ahr, net, pos_extend_ends=True, recover_dropped=True)
+    flights, report = ahr.run_endpoint_evidence({}, {"ABC101": [(seg, row)]}, pos, ctx,
+                                                mapped={"ABC101"}, registrations={})
+    assert flights == [seg]
+    assert (seg.origin.code, seg.destination.code) == ("AAA", "DDD")
+    assert seg.disposition == "kept_recovered"
+    assert row["disposition"] == "kept_recovered" and row["drop_reason"] == ""
+    assert report["recovered"] == {"no_airport_match": 1}
+    assert report["still_dropped"] == {}
+
+
+def test_dropped_segment_without_evidence_stays_dropped(ahr, make_segment, net):
+    seg, row = _dropped_no_airport(ahr, make_segment, net)
+    ctx = _stage(ahr, net, pos_extend_ends=True, recover_dropped=True)
+    flights, report = ahr.run_endpoint_evidence({}, {"ABC101": [(seg, row)]}, {}, ctx,
+                                                mapped={"ABC101"}, registrations={})
+    assert flights == [] and row["disposition"] == "dropped_unjoined"
+    assert report["still_dropped"] == {"no_airport_match": 1}
+
+
+def test_dropped_segment_not_recovered_when_flag_off(ahr, make_segment, net):
+    seg, row = _dropped_no_airport(ahr, make_segment, net)
+    pos = {"ABC101": ahr.FixSeries(_toward_ddd(ahr, [0, 6, 12, 18, 50, 56, 62, 68, 72]))}
+    pos["ABC101"][0] = _fix(ahr, T0, 0.0, 0.0, alt_ft=900, fi="JJ1234")
+    flights, _ = ahr.run_endpoint_evidence({}, {"ABC101": [(seg, row)]}, pos,
+                                           _stage(ahr, net, pos_extend_ends=True),
+                                           mapped={"ABC101"}, registrations={})
+    assert flights == [] and seg.origin is None
+
+
+def test_kept_flight_made_invalid_by_rotation_keeps_its_1_4_0_ends(ahr, make_segment, net):
+    # origin inferred AAA; the next flight leaves from AAA too, so rotation would make it
+    # AAA->AAA: the flight keeps the 1.4.0 answer instead of being lost
+    s = _seg(ahr, make_segment, net, T0, 50, (0, 1.0), (0, 5.0), dest="BBB")
+    s.origin, s.orig_source, s.is_complete = net["by_code"]["AAA"], "route_time", True
+    s.destination, s.dest_source = net["by_code"]["BBB"], "route_time"
+    s.disposition = "kept_rescued"
+    nxt = _seg(ahr, make_segment, net, T0 + timedelta(hours=2), 60, (0, 0), (0, 5),
+               orig="AAA", dest="BBB")
+    nxt.disposition = "kept_complete"
+    prev = _seg(ahr, make_segment, net, T0 - timedelta(hours=2), 60, (0, 5), (0, 0),
+                orig="BBB", dest="AAA")
+    prev.disposition = "kept_complete"
+    flights, _ = ahr.run_endpoint_evidence({"ABC101": [prev, s, nxt]}, {}, {},
+                                           _stage(ahr, net, rotation_endpoints=True),
+                                           mapped={"ABC101"}, registrations={})
+    assert s in flights
+    assert (s.origin.code, s.destination.code) == ("AAA", "BBB")
+    assert (s.orig_source, s.dest_source) == ("route_time", "route_time")
+    assert s.endpoint_conflict

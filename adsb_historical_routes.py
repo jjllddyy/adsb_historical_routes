@@ -36,7 +36,7 @@ import re
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gpkg_writer  # noqa: E402
 
-TOOL_VERSION = "1.4.0"
+TOOL_VERSION = "1.5.0"
 
 
 @dataclass(frozen=True)
@@ -365,6 +365,15 @@ def calculate_groundspeed(p1: TrackPoint, p2: TrackPoint) -> float:
         speed_kmh = distance_km / time_hours
         return speed_kmh * 0.539957
     return 0
+
+
+def load_airports_files(paths: Sequence[str]) -> List[Airport]:
+    """Airports from one or more CSVs; a code in a later file replaces the earlier one."""
+    by_code: Dict[str, Airport] = {}
+    for path in paths:
+        for a in load_airports_csv(path):
+            by_code[a.code] = a
+    return list(by_code.values())
 
 
 def load_airports_csv(filepath: str) -> List[Airport]:
@@ -748,7 +757,7 @@ def load_pos_points(folder: str, tail_to_hex: Dict[str, str],
                 continue
             fi = _ACARS_FI_RE.search(body)
             tp.flight_number = (fi.group(1) or None) if fi else None
-            tp.registration = tail
+            tp.registration = _ACARS_REG_RE.search(body).group(1).upper()
             if hexc:
                 idx[(hexc, ts[:10])].append(tp)
             else:
@@ -813,14 +822,19 @@ def load_firehose_points(folder: str) -> Dict[Tuple[str, str], List["TrackPoint"
 
 
 def load_position_sources(pos_folder: Optional[str], firehose_folder: Optional[str],
-                          tail_icao_path: Optional[str]) -> Dict[Tuple[str, str], List["TrackPoint"]]:
-    """Load and combine ACARS POS + firehose fixes, keyed by (hex, 'YYYY-MM-DD')."""
+                          tail_icao_path: Optional[str],
+                          unmapped: Optional[Dict[Tuple[str, str], List["TrackPoint"]]] = None,
+                          ) -> Dict[Tuple[str, str], List["TrackPoint"]]:
+    """Load and combine ACARS POS + firehose fixes, keyed by (hex, 'YYYY-MM-DD').
+
+    ``unmapped`` (optional) also collects the POS of tails not in the map (see
+    load_pos_points)."""
     tail_to_hex = load_tail_to_hex(tail_icao_path) if tail_icao_path else {}
     combined: Dict[Tuple[str, str], List["TrackPoint"]] = defaultdict(list)
     if pos_folder:
         if not tail_to_hex:
             print("  Warning: POS folder given but no tail<->hex map; ACARS reports cannot be keyed to hex.")
-        for k, v in load_pos_points(pos_folder, tail_to_hex).items():
+        for k, v in load_pos_points(pos_folder, tail_to_hex, unmapped=unmapped).items():
             combined[k].extend(v)
     if firehose_folder:
         for k, v in load_firehose_points(firehose_folder).items():
@@ -1377,11 +1391,14 @@ def combine_segments_intelligently(segments: List["FlightSegment"], airports: Li
                                    max_join_gap_hours: float = None,
                                    recorder: Optional["DiagnosticsRecorder"] = None,
                                    raw_idx_by_segment: Optional[Dict[int, int]] = None,
+                                   dropped: Optional[List[Tuple["FlightSegment", Dict]]] = None,
                                    ) -> List["FlightSegment"]:
     """Intelligently combine segments using the preset's join knobs.
 
     Backward-compat: if ``preset`` is None, uses the legacy hardcoded values.
     The optional ``recorder`` and ``raw_idx_by_segment`` enable diagnostics CSV output.
+    ``dropped`` (optional) receives each dropped segment with its diagnostics row (or
+    an empty dict without a recorder), for the evidence stage.
     """
     if not segments:
         return []
@@ -1627,9 +1644,13 @@ def combine_segments_intelligently(segments: List["FlightSegment"], airports: Li
                 keep(current, "kept_rescued", rm3, 1 + len(joined_idxs), absorbed_rows, row)
                 i += 1
                 continue
-            record_outcome(current, "dropped_unjoined",
+            drop_row = record_outcome(current, "dropped_unjoined",
                            drop_reason="no_airport_match" if not current.origin or not current.destination else "invalid",
                            joined_with=joined_with_final)
+            if dropped is not None:
+                dropped.append((current, drop_row if drop_row is not None else {
+                    "drop_reason": "no_airport_match" if not current.origin
+                    or not current.destination else "invalid"}))
 
         i += 1
 
@@ -2190,6 +2211,464 @@ def resolve_endpoints(flights: List[FlightSegment], ctx: EvidenceContext,
                 a.endpoint_conflict = b.endpoint_conflict = True
 
 
+# ---- F3: POS-only flights; the evidence stage ------------------------------------
+
+# KML style of a flight built from POS alone (no KML placemark to copy one from).
+POS_ONLY_STYLE = ("ff00a5ff", "2", "ff")
+
+
+def pos_sessions(fixes: List[TrackPoint], ctx: EvidenceContext) -> List[List[TrackPoint]]:
+    """Cut one aircraft's POS fixes (time order) into airborne sessions.
+
+    A session ends at a gap over --pos-extend-max-gap-min, at a ground stop, or where the
+    FI flight number changes (when both fixes carry one). A fix that would need more than
+    MAX_FIX_SPEED_KMH from the previous one is skipped as a report of another aircraft.
+    """
+    sessions: List[List[TrackPoint]] = []
+    cur: List[TrackPoint] = []
+    max_gap = ctx.options.pos_extend_max_gap_min
+    for f in fixes:
+        if cur:
+            prev = cur[-1]
+            if f.datetime == prev.datetime:
+                continue
+            gap_min = (f.datetime - prev.datetime).total_seconds() / 60.0
+            if gap_min <= max_gap and _too_fast(prev, f):
+                if len(cur) == 1:
+                    cur = [f]       # the lone earlier fix was the stray one
+                continue
+            pd, fd = _digits(prev.flight_number), _digits(f.flight_number)
+            if gap_min > max_gap or _is_ground_stop(prev, f) or (pd and fd and pd != fd):
+                sessions.append(cur)
+                cur = []
+        cur.append(f)
+    if cur:
+        sessions.append(cur)
+    return sessions
+
+
+def make_pos_only_flight(fixes: List[TrackPoint], key: str, hex_known: bool,
+                         registration: Optional[str], ctx: EvidenceContext) -> FlightSegment:
+    """A flight from one POS session; an end at an airport is ``pos_observed``."""
+    seg = FlightSegment(key, registration or fixes[0].registration or key, list(fixes),
+                        None, None, *POS_ONLY_STYLE, source_file="POS")
+    seg.hex_known = hex_known
+    for end, p in (("origin", fixes[0]), ("dest", fixes[-1])):
+        ap = ctx.airport_at(p)
+        if ap is not None:
+            if end == "origin":
+                seg.origin, seg.orig_source = ap, "pos_observed"
+            else:
+                seg.destination, seg.dest_source = ap, "pos_observed"
+    seg.is_complete = seg.origin is not None and seg.destination is not None
+    seg.disposition, seg.rescue_method, seg.joined_segment_count = "pos_only", "none", 1
+    return seg
+
+
+def registration_prefix(reg: Optional[str]) -> str:
+    """``CC-BMD`` -> ``CC``; ``N540LA`` -> ``N``; ``PRMBA`` -> ``PR``."""
+    reg = (reg or "").upper()
+    if "-" in reg:
+        return reg.split("-")[0]
+    return reg[:1] if reg.startswith("N") else reg[:2]
+
+
+def _outside_windows(fixes: List[TrackPoint], windows: List[Tuple[datetime, datetime]]
+                     ) -> List[TrackPoint]:
+    """The fixes not inside any [start, end] window (windows may overlap)."""
+    windows = sorted(windows)
+    starts = [w[0] for w in windows]
+    reach, run = [], None        # reach[i] = latest end among windows[0..i]
+    for _, b in windows:
+        run = b if run is None or b > run else run
+        reach.append(run)
+    out = []
+    for p in fixes:
+        i = bisect.bisect_right(starts, p.datetime) - 1
+        if i < 0 or reach[i] < p.datetime:
+            out.append(p)
+    return out
+
+
+def _new_report() -> Dict[str, Any]:
+    return {"extended": {"flights": 0, "origin": 0, "dest": 0, "before_km": 0.0,
+                         "after_km": 0.0, "endpoints_changed": 0},
+            "recovered": defaultdict(int), "still_dropped": defaultdict(int),
+            "pos_only": {"kept": 0, "dropped": defaultdict(int), "by_prefix": defaultdict(int),
+                         "by_month": defaultdict(int), "spacing_min": []},
+            "prefix_table": defaultdict(lambda: defaultdict(int)),
+            "agreement": defaultdict(lambda: defaultdict(lambda: [0, 0])),
+            "agreement_1_4_0": defaultdict(lambda: defaultdict(lambda: [0, 0])),
+            "contradicted": defaultdict(int)}
+
+
+def _finish_report(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Plain dicts (JSON-ready); POS-only fix spacing reduced to its median."""
+    po = report["pos_only"]
+    gaps = sorted(po.pop("spacing_min"))
+    po["median_spacing_min"] = round(gaps[len(gaps) // 2], 1) if gaps else None
+
+    def plain(v):
+        if isinstance(v, dict):
+            return {k: plain(x) for k, x in sorted(v.items())}
+        return v
+    return plain(report)
+
+
+def run_endpoint_evidence(kept_by_aircraft: Dict[str, List[FlightSegment]],
+                          dropped_by_aircraft: Dict[str, List[Tuple[FlightSegment, Dict]]],
+                          pos_by_aircraft: Dict[str, List[TrackPoint]],
+                          ctx: EvidenceContext, mapped: Set[str],
+                          registrations: Dict[str, str],
+                          legs_by_tail: Optional[Dict[str, List[PlannedLeg]]] = None,
+                          recorder: Optional["DiagnosticsRecorder"] = None
+                          ) -> Tuple[List[FlightSegment], Dict[str, Any]]:
+    """The evidence stage, per aircraft (hex, else registration), after 1.4.0's combine.
+
+    ``kept_by_aircraft``: 1.4.0's flights; ``dropped_by_aircraft``: its dropped segments
+    with their diagnostics rows. In order: F2 extends open ends with POS (kept flights and,
+    with F9, dropped segments; every ADS-B segment bounds its neighbours); F3 cuts the POS
+    no segment covers into sessions; F1 numbers the flights; F4/F5/F8 resolve the ends.
+    A 1.4.0 flight the new evidence would make invalid keeps its 1.4.0 ends (and gets
+    ``endpoint_conflict``). Returns the flights to keep and the evidence report.
+    """
+    opts = ctx.options
+    report = _new_report()
+    keys = set(kept_by_aircraft) | set(dropped_by_aircraft)
+    done = 0
+    if opts.pos_only_flights:
+        keys |= {k for k in pos_by_aircraft if k in mapped or opts.pos_fleets == "all"}
+    out: List[FlightSegment] = []
+    for key in sorted(keys):
+        kept = list(kept_by_aircraft.get(key, []))
+        dropped = list(dropped_by_aircraft.get(key, []))
+        fixes = pos_by_aircraft.get(key) or FixSeries([])
+        recovering = dropped if opts.recover_dropped else []
+        open_ids = {id(s) for s in kept} | {id(s) for s, _ in recovering}
+        snapshot = {id(s): (s.origin, s.destination, s.orig_source, s.dest_source,
+                            s.orig_candidates, s.dest_candidates) for s in kept}
+        adsb = sorted(kept + [s for s, _ in dropped], key=lambda s: s.takeoff_time)
+
+        if opts.pos_extend_ends and fixes:
+            for i, s in enumerate(adsb):
+                if id(s) not in open_ids:
+                    continue
+                lo = adsb[i - 1].landing_time if i > 0 else None
+                hi = adsb[i + 1].takeoff_time if i + 1 < len(adsb) else None
+                st = extend_ends_with_pos(s, fixes, lo, hi, ctx)
+                if st["before_km"] or st["after_km"]:
+                    ext = report["extended"]
+                    ext["flights"] += 1
+                    ext["origin"] += 1 if st["before_km"] else 0
+                    ext["dest"] += 1 if st["after_km"] else 0
+                    ext["before_km"] += st["before_km"]
+                    ext["after_km"] += st["after_km"]
+                    ext["endpoints_changed"] += sum(
+                        1 for c in getattr(s, "evidence_changes", []) if c["feature"] == "F2")
+
+        pos_only: List[FlightSegment] = []
+        if opts.pos_only_flights and fixes and (key in mapped or opts.pos_fleets == "all"):
+            free = _outside_windows(fixes, [(s.points[0].datetime, s.points[-1].datetime)
+                                            for s in adsb])
+            for sess in pos_sessions(free, ctx):
+                if len(sess) >= 2:
+                    reg = registrations.get(key) or (kept[0].registration if kept else None)
+                    pos_only.append(make_pos_only_flight(sess, key, key in mapped, reg, ctx))
+
+        flights = kept + [s for s, _ in recovering] + pos_only
+        if opts.acars_identity:
+            assign_flight_numbers(flights, {key: fixes})
+        resolve_endpoints(flights, ctx, legs_by_tail)
+
+        for s in kept:
+            if not s.is_valid_flight():
+                (s.origin, s.destination, s.orig_source, s.dest_source,
+                 s.orig_candidates, s.dest_candidates) = snapshot[id(s)]
+                s.is_complete = True
+                s.endpoint_conflict = True
+                s.evidence_changes = [c for c in getattr(s, "evidence_changes", [])
+                                      if c["feature"] == "F2"]
+            out.append(s)
+        for s, row in recovering:
+            reason = row.get("drop_reason") or "invalid"
+            if s.is_complete and s.is_valid_flight():
+                s.disposition, s.rescue_method = "kept_recovered", "none"
+                s.joined_segment_count = len([x for x in (row.get(
+                    "joined_with_segment_idx") or "").split(",") if x]) or 1
+                row["disposition"], row["drop_reason"] = "kept_recovered", ""
+                row["_flight"], row["_flight_row"] = s, True
+                report["recovered"][reason] += 1
+                out.append(s)
+            else:
+                report["still_dropped"][reason] += 1
+        for f in pos_only:
+            po = report["pos_only"]
+            if f.is_complete and f.is_valid_flight():
+                po["kept"] += 1
+                po["by_prefix"][registration_prefix(f.registration)] += 1
+                po["by_month"][f.takeoff_date_str[:7]] += 1
+                po["spacing_min"].extend((b.datetime - a.datetime).total_seconds() / 60.0
+                                         for a, b in zip(f.points, f.points[1:]))
+                out.append(f)
+                disp, why = "pos_only", ""
+            else:
+                why = "unresolved" if not f.is_complete else "invalid"
+                po["dropped"][why] += 1
+                disp = "dropped_pos_only"
+            if recorder is not None:
+                row = recorder.record_outcome(f, segment_idx=-1, disposition=disp,
+                                              drop_reason=why, airports=ctx.airports)
+                if disp == "pos_only":
+                    row["_flight"], row["_flight_row"] = f, True
+
+        for f in flights:
+            leg = getattr(f, "planned_leg", None)
+            if leg is None or f.planned_rule != 1:
+                continue
+            sp = split_flight_number(f.flight_number) if f.flight_number_source == "acars_fi" \
+                else None
+            if sp:
+                report["prefix_table"][sp[0]][leg.carrier] += 1
+            snap = snapshot.get(id(f))
+            for k, (end, leg_code) in enumerate((("origin", leg.orig), ("dest", leg.dest))):
+                code, src = f.orig_free if end == "origin" else f.dest_free
+                report["agreement"][end][src][0 if code == leg_code else 1] += 1
+                if snap is None:
+                    continue
+                old_ap, old_src = snap[k], snap[2 + k] or "unresolved"
+                old = old_ap.code if old_ap else None
+                report["agreement_1_4_0"][end][old_src][0 if old == leg_code else 1] += 1
+                if old != leg_code and old_src not in OBSERVED_SOURCES:
+                    # a 1.4.0 guess the plan contradicts: what the plan-free evidence did
+                    report["contradicted"]["total"] += 1
+                    report["contradicted"]["free_now_agrees" if code == leg_code else
+                                           "free_changed_still_differs" if code != old else
+                                           "unchanged"] += 1
+        out[done:] = sorted(out[done:], key=lambda f: f.takeoff_time)
+        done = len(out)
+    return out, _finish_report(report)
+
+
+def validate_evidence_options(opts: EvidenceOptions, integrate_pos: bool,
+                              pos_folder: Optional[str]) -> Optional[str]:
+    """An error message for evidence switches that cannot work as given, else None."""
+    needs_pos = [name for name, on in (("--acars-identity", opts.acars_identity),
+                                       ("--pos-extend-ends", opts.pos_extend_ends),
+                                       ("--pos-only-flights", opts.pos_only_flights)) if on]
+    if needs_pos and not (integrate_pos and pos_folder):
+        return f"{', '.join(needs_pos)} need --integrate-pos true and --pos-folder"
+    for path in opts.planned_legs:
+        if not os.path.exists(path):
+            return f"planned-legs file not found: {path}"
+    if opts.pos_extend_max_gap_min <= 0 or opts.rotation_max_gap_h <= 0:
+        return "--pos-extend-max-gap-min and --rotation-max-gap-h must be > 0"
+    return None
+
+
+def evidence_options_meta(opts: EvidenceOptions) -> Dict[str, Any]:
+    """The evidence switches as recorded in ``meta.evidence_options``."""
+    return {"acars_identity": opts.acars_identity, "pos_extend_ends": opts.pos_extend_ends,
+            "pos_extend_max_gap_min": opts.pos_extend_max_gap_min,
+            "pos_only_flights": opts.pos_only_flights, "pos_fleets": opts.pos_fleets,
+            "rotation_endpoints": opts.rotation_endpoints,
+            "rotation_max_gap_h": opts.rotation_max_gap_h,
+            "planned_legs": [os.path.basename(x) for x in opts.planned_legs],
+            "recover_dropped": opts.recover_dropped}
+
+
+def endpoint_counts_meta(flights: List[FlightSegment]) -> Dict[str, str]:
+    """Per-source endpoint counts, confidence, flight-number share and flights by
+    sources / disposition, as JSON meta values (and for the evidence report)."""
+    by_src: Dict[str, Dict[str, int]] = {"origin": defaultdict(int), "dest": defaultdict(int)}
+    conf: Dict[str, int] = defaultdict(int)
+    by_sd: Dict[str, int] = defaultdict(int)
+    numbered: Dict[str, int] = defaultdict(int)
+    conflicts = 0
+    for f in flights:
+        by_src["origin"][f.orig_source or "unresolved"] += 1
+        by_src["dest"][f.dest_source or "unresolved"] += 1
+        conf[endpoint_confidence(f.orig_source, f.dest_source,
+                                 f.orig_candidates, f.dest_candidates)] += 1
+        present = {p.source for p in f.points}
+        srcs = ",".join([x for x in SOURCE_ORDER if x in present]
+                        + sorted(present - set(SOURCE_ORDER)))
+        by_sd[f"{srcs}|{f.disposition}"] += 1
+        numbered[getattr(f, "flight_number_source", None) or "none"] += 1
+        conflicts += 1 if getattr(f, "endpoint_conflict", False) else 0
+    return {
+        "endpoint_sources": json.dumps({k: dict(sorted(v.items())) for k, v in by_src.items()}),
+        "endpoint_confidence": json.dumps(dict(sorted(conf.items()))),
+        "flights_by_sources_disposition": json.dumps(dict(sorted(by_sd.items()))),
+        "flight_number_sources": json.dumps(dict(sorted(numbered.items()))),
+        "endpoint_conflict_count": str(conflicts),
+    }
+
+
+def run_evidence_stage(opts: EvidenceOptions,
+                       kept_by_aircraft: Dict[str, List[FlightSegment]],
+                       dropped_by_aircraft: Dict[str, List[Tuple[FlightSegment, Dict]]],
+                       pos_index: Dict[Tuple[str, str], List[TrackPoint]],
+                       unmapped_pos: Dict[Tuple[str, str], List[TrackPoint]],
+                       airports: List[Airport], routes_dict: Dict[Tuple[str, str], float],
+                       preset: ConfidencePreset, tail_icao_path: Optional[str],
+                       all_segments: List[FlightSegment],
+                       recorder: Optional["DiagnosticsRecorder"]
+                       ) -> Tuple[List[FlightSegment], Dict[str, Any], Dict[str, str]]:
+    """Load the planned legs, index POS by aircraft and run run_endpoint_evidence; print
+    what it did. Returns the flights, the report and the meta values to add."""
+    ctx = EvidenceContext(airports, routes_dict, preset, opts)
+    meta: Dict[str, str] = {}
+    legs_by_tail = None
+    print("\nEndpoint evidence: " + ", ".join(
+        k for k, v in evidence_options_meta(opts).items() if v is True or
+        (k == "planned_legs" and v)) or "none")
+    if opts.planned_legs:
+        legs_by_tail, legs_info = load_planned_legs(opts.planned_legs)
+        for x in legs_info:
+            print(f"  Planned legs {x['file']}: {x['rows']} legs, {x['from']} -> {x['to']}")
+        codes = {a.code for a in airports}
+        missing: Dict[str, int] = defaultdict(int)
+        for legs in legs_by_tail.values():
+            for lg in legs:
+                for c in (lg.orig, lg.dest):
+                    if c and c not in codes:
+                        missing[c] += 1
+        if missing:
+            print(f"  Warning: {len(missing)} planned-leg airport(s) are not in the airport "
+                  "list, so no flight can end there: " + ", ".join(
+                      f"{c} ({n})" for c, n in sorted(missing.items(), key=lambda x: -x[1])))
+        meta["planned_legs"] = json.dumps(legs_info)
+        meta["planned_leg_airports_missing"] = json.dumps(dict(sorted(missing.items())))
+    tail_to_hex = load_tail_to_hex(tail_icao_path) if tail_icao_path else {}
+    mapped = set(tail_to_hex.values())
+    registrations: Dict[str, str] = {}
+    for tail, hexc in tail_to_hex.items():
+        registrations.setdefault(hexc, tail)
+    for seg in all_segments:
+        registrations[seg.aircraft_id] = seg.registration
+    pos_by_aircraft = index_pos_by_aircraft(pos_index, unmapped_pos)
+    t0 = time.time()
+    flights, report = run_endpoint_evidence(kept_by_aircraft, dropped_by_aircraft,
+                                            pos_by_aircraft, ctx, mapped, registrations,
+                                            legs_by_tail, recorder)
+    if recorder is not None:
+        for f in flights:
+            for change in getattr(f, "evidence_changes", []):
+                recorder.record_evidence(f, change, airports)
+    ext, po = report["extended"], report["pos_only"]
+    print(f"  F2 extended {ext['flights']} flight(s) with POS ({ext['origin']} origins, "
+          f"{ext['dest']} destinations; +{ext['before_km']:,.0f} / +{ext['after_km']:,.0f} km), "
+          f"changing {ext['endpoints_changed']} endpoint(s)")
+    print(f"  F3 POS-only flights: {po['kept']} kept, "
+          f"{sum(po['dropped'].values())} session(s) dropped {po['dropped']}")
+    print(f"  F9 recovered {report['recovered']}, still dropped {report['still_dropped']}")
+    if report["prefix_table"]:
+        print(f"  Flight-number prefixes (ACARS -> plan): {report['prefix_table']}")
+    print(f"  Evidence stage: {len(flights)} flights in {time.time() - t0:.0f}s")
+    meta["evidence_report"] = json.dumps(report)
+    meta["flight_number_prefixes"] = json.dumps(report["prefix_table"])
+    return flights, report, meta
+
+
+def _md_table(header: Sequence[str], rows: List[Sequence[Any]]) -> List[str]:
+    out = ["| " + " | ".join(header) + " |",
+           "|" + "|".join("---" if i == 0 else "---:" for i in range(len(header))) + "|"]
+    out += ["| " + " | ".join(str(c) for c in r) + " |" for r in rows]
+    return out
+
+
+def evidence_report_markdown(gpkg_path: str, opts: EvidenceOptions, meta: Dict[str, str],
+                             report: Dict[str, Any]) -> str:
+    """The ``<stem>_evidence_report.md`` written next to the GeoPackage (request §6.3)."""
+    w: List[str] = [f"# Endpoint evidence report: {os.path.basename(gpkg_path)}", "",
+                    f"Tool {TOOL_VERSION}, flown_routes v{FLOWN_SCHEMA_VERSION}. Options: "
+                    f"`{json.dumps(evidence_options_meta(opts))}`", ""]
+    total = sum(json.loads(meta.get("endpoint_confidence", "{}")).values())
+
+    def pct(n):
+        return f"{100.0 * n / total:.1f}%" if total else "-"
+    w += ["## Flights by sources and disposition", ""]
+    sd = json.loads(meta.get("flights_by_sources_disposition", "{}"))
+    w += _md_table(["sources", "disposition", "flights", "share"],
+                   [(k.split("|")[0], k.split("|")[1], n, pct(n))
+                    for k, n in sorted(sd.items(), key=lambda x: -x[1])])
+    w += ["", "## Endpoints by source", ""]
+    es = json.loads(meta.get("endpoint_sources", "{}"))
+    srcs = sorted(set(es.get("origin", {})) | set(es.get("dest", {})),
+                  key=lambda k: -(es.get("origin", {}).get(k, 0) + es.get("dest", {}).get(k, 0)))
+    w += _md_table(["source", "origins", "destinations"],
+                   [(k, es.get("origin", {}).get(k, 0), es.get("dest", {}).get(k, 0))
+                    for k in srcs])
+    w += ["", "## Endpoint confidence (the lower end of each flight)", ""]
+    w += _md_table(["confidence", "flights", "share"],
+                   [(k, n, pct(n)) for k, n in json.loads(
+                       meta.get("endpoint_confidence", "{}")).items()])
+    fn = json.loads(meta.get("flight_number_sources", "{}"))
+    w += ["", "## Flight numbers", ""]
+    w += _md_table(["flight_number_source", "flights", "share"],
+                   [(k, n, pct(n)) for k, n in sorted(fn.items(), key=lambda x: -x[1])])
+    w += ["", f"Endpoint conflicts: {meta.get('endpoint_conflict_count', '0')} flights.", ""]
+    if report["prefix_table"]:
+        w += ["Flight-number prefixes learned from rule-1 matches (ACARS FI -> plan carrier):", ""]
+        w += _md_table(["FI prefix", "plan carrier", "matches"],
+                       [(a, b, n) for a, d in report["prefix_table"].items()
+                        for b, n in sorted(d.items(), key=lambda x: -x[1])])
+        w += [""]
+    po = report["pos_only"]
+    w += ["## POS-only flights (F3)", "",
+          f"Kept {po['kept']}; sessions dropped: {po['dropped'] or 'none'}; median spacing "
+          f"between fixes {po['median_spacing_min']} min.", ""]
+    w += _md_table(["registration prefix", "flights"],
+                   sorted(po["by_prefix"].items(), key=lambda x: -x[1]))
+    w += [""] + _md_table(["month", "flights"], sorted(po["by_month"].items()))
+    ext = report["extended"]
+    w += ["", "## Flights extended by POS (F2)", "",
+          f"{ext['flights']} flights: {ext['origin']} origins (+{ext['before_km']:,.0f} km), "
+          f"{ext['dest']} destinations (+{ext['after_km']:,.0f} km); "
+          f"{ext['endpoints_changed']} endpoints changed.", "",
+          "## Dropped segments recovered (F9)", ""]
+    reasons = sorted(set(report["recovered"]) | set(report["still_dropped"]))
+    w += _md_table(["1.4.0 drop reason", "recovered", "still dropped"],
+                   [(r, report["recovered"].get(r, 0), report["still_dropped"].get(r, 0))
+                    for r in reasons])
+    w += ["", "## Agreement with planned legs (rule 1 matches)", "",
+          "How often the plan-free answer (`orig_free` / `dest_free`) equals the planned leg, "
+          "by the evidence that produced it. This is the accuracy of the OFP-free logic.", ""]
+    rows = []
+    for end in ("origin", "dest"):
+        for src, (agree, disagree) in sorted(report["agreement"].get(end, {}).items(),
+                                            key=lambda x: -sum(x[1])):
+            n = agree + disagree
+            rows.append((end, src, n, agree, f"{100.0 * agree / n:.1f}%" if n else "-"))
+    w += _md_table(["end", "free source", "flights", "agree", "agree %"], rows)
+    rows = []
+    for end in ("origin", "dest"):
+        for src, (agree, disagree) in sorted(report["agreement_1_4_0"].get(end, {}).items(),
+                                            key=lambda x: -sum(x[1])):
+            n = agree + disagree
+            rows.append((end, src, n, agree, f"{100.0 * agree / n:.1f}%" if n else "-"))
+    if rows:
+        w += ["", "The same ADS-B flights as 1.4.0 labelled them (its source and answer):", ""]
+        w += _md_table(["end", "1.4.0 source", "flights", "agree", "agree %"], rows)
+    c = report["contradicted"]
+    if c:
+        w += ["", f"1.4.0 inferred ends the plan contradicts: {c.get('total', 0)}; the "
+              f"plan-free evidence now agrees with the plan on {c.get('free_now_agrees', 0)}, "
+              f"changes but still differs on {c.get('free_changed_still_differs', 0)}, "
+              f"leaves {c.get('unchanged', 0)} unchanged."]
+    if meta.get("planned_legs"):
+        w += ["", "## Planned-leg files", ""]
+        w += _md_table(["file", "legs", "from", "to"],
+                       [(x["file"], x["rows"], x["from"], x["to"])
+                        for x in json.loads(meta["planned_legs"])])
+        missing = json.loads(meta.get("planned_leg_airports_missing", "{}"))
+        if missing:
+            w += ["", "Planned-leg airports missing from the airport list: " + ", ".join(
+                f"{c} ({n})" for c, n in sorted(missing.items(), key=lambda x: -x[1]))]
+    w += ["", f"POS folder read in {meta.get('pos_read_seconds', '?')} s.", ""]
+    return "\n".join(w)
+
+
 class DiagnosticsRecorder:
     """Buffers per-segment diagnostic rows and writes them as a CSV sidecar to the output KML."""
 
@@ -2204,6 +2683,8 @@ class DiagnosticsRecorder:
         # Filled by link_flights() for the final row of each kept flight and for every
         # fragment absorbed into it; empty for dropped segments.
         "flight_id", "od_gc_km", "od_distance_ratio", "suspect_od",
+        # v3: one ``phase = evidence`` row per endpoint the evidence stage changed.
+        "evidence_feature", "evidence_source", "endpoint", "before_code", "after_code",
     ]
 
     def __init__(self, output_kml_path: str, preset_name: str):
@@ -2280,6 +2761,11 @@ class DiagnosticsRecorder:
             "od_gc_km": "",
             "od_distance_ratio": "",
             "suspect_od": "",
+            "evidence_feature": "",
+            "evidence_source": "",
+            "endpoint": "",
+            "before_code": "",
+            "after_code": "",
         }
 
     def record_raw(self, segment: "FlightSegment", segment_idx: int, airports: List["Airport"]) -> None:
@@ -2296,6 +2782,19 @@ class DiagnosticsRecorder:
         row["rescue_method"] = rescue_method
         self.rows.append(row)
         return row
+
+    def record_evidence(self, segment: "FlightSegment", change: Dict[str, Any],
+                        airports: List["Airport"]) -> None:
+        """One ``evidence`` row: an endpoint F2 / F4 / F5 changed (before -> after)."""
+        row = self._build_row("evidence", segment, -1, airports)
+        row["disposition"] = getattr(segment, "disposition", "")
+        row["evidence_feature"] = change["feature"]
+        row["evidence_source"] = change["source"]
+        row["endpoint"] = change["endpoint"]
+        row["before_code"] = change["before"] or ""
+        row["after_code"] = change["after"] or ""
+        row["_flight"] = segment
+        self.rows.append(row)
 
     def link_flights(self) -> None:
         """Copy each kept flight's id and O/D check onto the rows tied to it (``_flight``).
@@ -3076,7 +3575,7 @@ def load_flown_gpkg(path: str) -> Tuple[Dict[str, str], List[FlightSegment]]:
             if srcs is not None and len(srcs) != len(verts):
                 raise ValueError(f"{flight_id}: track_points/tracks_full point counts differ")
             segments.append(StoredFlight(
-                flight_id, aircraft_id, registration, origin, dest, color,
+                flight_id, aircraft_id or registration, registration, origin, dest, color,
                 _style_width_text(width),
                 format(int(round(opacity * 255)), "02x") if opacity is not None else "ff",
                 source_file or "", verts, srcs, distance_km))
@@ -3217,6 +3716,7 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
                      suspect_od_ratio: float = SUSPECT_OD_RATIO,
                      takeoff_from: Optional[str] = None,
                      takeoff_to: Optional[str] = None,
+                     evidence: Optional[EvidenceOptions] = None,
                      argv: Optional[List[str]] = None):
     """Main processing pipeline driven by a ConfidencePreset.
 
@@ -3227,7 +3727,11 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
     ``output_file`` become the first/last flight dates; a ``.gpkg`` ``output_file`` names the
     GeoPackage. ``takeoff_from``/``takeoff_to`` (``YYYY-MM-DD``, inclusive) keep only flights
     whose UTC takeoff date is in range. The diagnostics CSV is always written.
+    ``evidence`` switches on the endpoint-evidence stage (run_endpoint_evidence); with
+    every switch off the build is 1.4.0's.
     """
+    evidence = evidence or EvidenceOptions()
+    use_evidence = evidence.any()
     output_file = kml_output_path(output_file)
     routes_dict = {(r.origin, r.destination): r.avg_time_min for r in routes}
     recorder = DiagnosticsRecorder(output_file, preset_name=preset.name)
@@ -3238,11 +3742,23 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
 
     # Optional extra position sources (ACARS POS + ADS-B firehose), keyed by (hex, date).
     pos_index: Dict[Tuple[str, str], List[TrackPoint]] = {}
+    unmapped_pos: Optional[Dict[Tuple[str, str], List[TrackPoint]]] = (
+        {} if use_evidence and evidence.pos_only_flights and evidence.pos_fleets == "all"
+        else None)
+    pos_read_seconds = 0.0
     if integrate_pos:
         print("\nLoading extra position sources (this reads many small files)...")
-        pos_index = load_position_sources(pos_folder, firehose_folder, tail_icao_path)
+        t_read = time.time()
+        pos_index = load_position_sources(pos_folder, firehose_folder, tail_icao_path,
+                                          unmapped=unmapped_pos)
+        pos_read_seconds = time.time() - t_read
         print(f"  Loaded {sum(len(v) for v in pos_index.values())} extra fixes "
               f"across {len(pos_index)} aircraft-days")
+        if unmapped_pos is not None:
+            print(f"  ...and {sum(len(v) for v in unmapped_pos.values())} POS fixes of "
+                  f"{len({k for k, _ in unmapped_pos})} registrations not in the tail map")
+        if use_evidence:
+            print(f"  Position sources read in {pos_read_seconds:.0f}s")
 
     kml_files = sorted(kml_files)
 
@@ -3292,18 +3808,32 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
         segments_by_aircraft[seg.aircraft_id].append(seg)
 
     final_segments: List[FlightSegment] = []
+    kept_by_aircraft: Dict[str, List[FlightSegment]] = {}
+    dropped_by_aircraft: Dict[str, List[Tuple[FlightSegment, Dict]]] = {}
     for aircraft_id, segments in segments_by_aircraft.items():
         print(f"\n  Aircraft {aircraft_id}: {len(segments)} raw segments")
+        dropped: Optional[List[Tuple[FlightSegment, Dict]]] = [] if use_evidence else None
         combined = combine_segments_intelligently(
             segments, airports, routes_dict,
             preset=preset, recorder=recorder,
-            raw_idx_by_segment=raw_idx_by_segment
+            raw_idx_by_segment=raw_idx_by_segment, dropped=dropped
         )
         complete_valid = [s for s in combined if s.is_complete and s.is_valid_flight()]
         print(f"    Final valid flights: {len(complete_valid)}")
         final_segments.extend(complete_valid)
+        kept_by_aircraft[aircraft_id] = complete_valid
+        if dropped:
+            dropped_by_aircraft[aircraft_id] = dropped
 
     print(f"\n\nTOTAL VALID COMPLETE FLIGHTS: {len(final_segments)}")
+
+    evidence_report: Optional[Dict[str, Any]] = None
+    evidence_meta: Dict[str, str] = {}
+    if use_evidence:
+        final_segments, evidence_report, evidence_meta = run_evidence_stage(
+            evidence, kept_by_aircraft, dropped_by_aircraft, pos_index, unmapped_pos or {},
+            airports, routes_dict, preset, tail_icao_path, all_segments, recorder)
+        evidence_meta["pos_read_seconds"] = f"{pos_read_seconds:.1f}"
 
     # Keep only flights whose UTC takeoff date is inside --takeoff-from/--takeoff-to.
     if takeoff_from or takeoff_to:
@@ -3341,6 +3871,8 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
               f"second); suffixed _2, _3, ...")
     suspect = [s for s in final_segments if s.suspect_od]
     recorder.link_flights()
+    if use_evidence:
+        evidence_meta.update(endpoint_counts_meta(final_segments))
 
     # Name outputs from the actual first/last flight (UTC takeoff) dates.
     flight_dates = sorted(s.takeoff_date_str for s in final_segments)
@@ -3393,7 +3925,11 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
             "flight_count": str(len(final_segments)),
             "suspect_od_ratio": str(suspect_od_ratio),
             "suspect_od_count": str(len(suspect)),
+            "evidence_options": json.dumps(evidence_options_meta(evidence)),
         }
+        if use_evidence:
+            meta.update(evidence_meta)
+            meta.update(endpoint_counts_meta(final_segments))
         print(f"\nWriting GeoPackage{' (temporary, for KML)' if not keep_gpkg else ''}...")
         t0 = time.time()
         gpkg_counts = write_flown_gpkg(
@@ -3426,6 +3962,12 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
                     os.remove(gpkg_path)
 
     recorder.write_csv()
+    if use_evidence and keep_gpkg:
+        report_path = os.path.splitext(gpkg_path)[0] + "_evidence_report.md"
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(evidence_report_markdown(gpkg_path, evidence, evidence_meta,
+                                             evidence_report))
+        print(f"Evidence report written to: {report_path}")
 
     print("\n" + "=" * 60)
     print("FLIGHT PARSING SUMMARY")
@@ -3465,8 +4007,9 @@ def main():
     input_group.add_argument('--kml-folder', 
                             help='Folder containing KML files to process')
     
-    parser.add_argument('--airports', required=True,
-                       help='CSV file containing airport data')
+    parser.add_argument('--airports', required=True, nargs='+',
+                       help='CSV file(s) containing airport data; an airport code in a later '
+                            'file replaces the same code in an earlier one')
     parser.add_argument('--routes', required=True,
                        help='CSV file containing route times')
     parser.add_argument('--output', required=True,
@@ -3555,6 +4098,43 @@ def main():
     parser.add_argument('--firehose-color', default='ff00ff00', dest='firehose_color',
                        help='KML AABBGGRR colour for firehose-sourced track portions (default: ff00ff00, green).')
 
+    # Endpoint evidence (flown_routes v3): each switch is off by default; all off = 1.4.0.
+    ev = parser.add_argument_group('endpoint evidence (each optional, off by default)')
+    ev.add_argument('--acars-identity', choices=['true', 'false'], default='false',
+                    dest='acars_identity',
+                    help='F1: give each flight the ACARS FI flight number of the POS reports '
+                         'in its time window (needs --integrate-pos true and --pos-folder)')
+    ev.add_argument('--pos-extend-ends', choices=['true', 'false'], default='false',
+                    dest='pos_extend_ends',
+                    help='F2: carry flight ends that ADS-B did not see at an airport on with '
+                         'POS fixes, then re-detect them (needs --integrate-pos true)')
+    ev.add_argument('--pos-extend-max-gap-min', type=float, default=60.0,
+                    dest='pos_extend_max_gap_min',
+                    help='Longest gap between consecutive POS fixes in an extension or a '
+                         'POS-only session, minutes (default 60)')
+    ev.add_argument('--pos-only-flights', choices=['true', 'false'], default='false',
+                    dest='pos_only_flights',
+                    help='F3: build flights from airborne POS sessions that no ADS-B segment '
+                         'covers (needs --integrate-pos true)')
+    ev.add_argument('--pos-fleets', choices=['mapped', 'all'], default='mapped',
+                    dest='pos_fleets',
+                    help='F3: POS-only flights for tail-map aircraft only (mapped, default) or '
+                         'for every registration in the POS folder (all; reads every file)')
+    ev.add_argument('--rotation-endpoints', choices=['true', 'false'], default='false',
+                    dest='rotation_endpoints',
+                    help="F4: fill an end not seen at an airport from the aircraft's "
+                         'neighbouring flight when that end was observed')
+    ev.add_argument('--rotation-max-gap-h', type=float, default=18.0,
+                    dest='rotation_max_gap_h',
+                    help='F4: longest ground gap between neighbouring flights, hours (default 18)')
+    ev.add_argument('--planned-legs', nargs='+', default=None, dest='planned_legs',
+                    metavar='CSV',
+                    help='F5: planned-leg CSV(s) (OFP or schedule; see docs/GEOPACKAGE.md) '
+                         'used to confirm or fill endpoints and the flight number')
+    ev.add_argument('--recover-dropped', choices=['true', 'false'], default='false',
+                    dest='recover_dropped',
+                    help='F9: try the new evidence on segments 1.4.0 drops before dropping them')
+
     parser.add_argument('--color-mode', choices=['source', 'altitude'], default='source',
                         dest='color_mode',
                         help='Line coloring: source (per data source, default) or altitude '
@@ -3624,6 +4204,20 @@ def main():
     if qgz_error:
         print(f"Error: {qgz_error}")
         sys.exit(1)
+    evidence = EvidenceOptions(
+        acars_identity=args.acars_identity == 'true',
+        pos_extend_ends=args.pos_extend_ends == 'true',
+        pos_extend_max_gap_min=args.pos_extend_max_gap_min,
+        pos_only_flights=args.pos_only_flights == 'true',
+        pos_fleets=args.pos_fleets,
+        rotation_endpoints=args.rotation_endpoints == 'true',
+        rotation_max_gap_h=args.rotation_max_gap_h,
+        planned_legs=tuple(args.planned_legs or ()),
+        recover_dropped=args.recover_dropped == 'true')
+    evidence_error = validate_evidence_options(evidence, integrate_pos, args.pos_folder)
+    if evidence_error:
+        print(f"Error: {evidence_error}")
+        sys.exit(1)
 
     kml_files = []
     if args.kml_files:
@@ -3659,9 +4253,10 @@ def main():
             print("Error: No KML files left inside the takeoff date range")
             sys.exit(1)
 
-    if not os.path.exists(args.airports):
-        print(f"Error: Airports file not found: {args.airports}")
-        sys.exit(1)
+    for path in args.airports:
+        if not os.path.exists(path):
+            print(f"Error: Airports file not found: {path}")
+            sys.exit(1)
     
     if not os.path.exists(args.routes):
         print(f"Error: Routes file not found: {args.routes}")
@@ -3680,8 +4275,10 @@ def main():
         print(f"Error: Output directory is not writable: {out_dir}")
         sys.exit(1)
 
-    print(f"Loading airports from: {args.airports}")
-    airports = load_airports_csv(args.airports)
+    print(f"Loading airports from: {', '.join(args.airports)}")
+    airports = load_airports_files(args.airports)
+    if len(args.airports) > 1:
+        print(f"Loaded {len(airports)} airports from {len(args.airports)} files")
     
     if not airports:
         print("Error: No airports loaded!")
@@ -3743,6 +4340,7 @@ def main():
         suspect_od_ratio=args.suspect_od_ratio,
         takeoff_from=args.takeoff_from,
         takeoff_to=args.takeoff_to,
+        evidence=evidence,
         argv=sys.argv[1:],
     )
 
