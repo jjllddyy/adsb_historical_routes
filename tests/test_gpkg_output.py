@@ -96,7 +96,7 @@ class TestFlownSchema:
 
     def test_meta(self, built):
         meta = dict(built["conn"].execute("SELECT key, value FROM meta"))
-        assert meta["schema_name"] == "flown_routes" and meta["schema_version"] == "2"
+        assert meta["schema_name"] == "flown_routes" and meta["schema_version"] == "3"
         assert meta["tool"] == "adsb_historical_routes" and meta["airline"] == "TST"
         assert (meta["date_from"], meta["date_to"]) == ("2026-10-01", "2026-10-02")
         assert meta["source_count"] == "3"

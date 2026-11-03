@@ -181,8 +181,8 @@ def test_v1_file_still_exports(ahr, pacific, tmp_path):
 def test_unknown_schema_version_rejected(ahr, pacific, tmp_path):
     _run(pacific, tmp_path / "p.kml", "--format", "gpkg")
     conn = sqlite3.connect(str(tmp_path / "p.gpkg"))
-    conn.execute("UPDATE meta SET value = '3' WHERE key = 'schema_version'")
+    conn.execute("UPDATE meta SET value = '4' WHERE key = 'schema_version'")
     conn.commit()
     conn.close()
-    with pytest.raises(ValueError, match="unsupported flown_routes schema version 3"):
+    with pytest.raises(ValueError, match="unsupported flown_routes schema version 4"):
         ahr.load_flown_gpkg(str(tmp_path / "p.gpkg"))

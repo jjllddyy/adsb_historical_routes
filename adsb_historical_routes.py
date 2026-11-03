@@ -182,6 +182,13 @@ class FlightSegment:
         self.has_gaps = False
         self.gap_duration_min = 0
         self.max_altitude = 0
+        # Where each endpoint came from (flown_routes v3 ``*_source``): an airport given at
+        # detection was observed; a rescue or the evidence stage overwrites these. The
+        # candidates are the airports a route-time / geometry rescue accepted, best first.
+        self.orig_source = "observed" if origin is not None else None
+        self.dest_source = "observed" if destination is not None else None
+        self.orig_candidates: List[str] = []
+        self.dest_candidates: List[str] = []
         self.total_distance = 0
         
         if points:
@@ -1035,7 +1042,8 @@ def match_route_by_time_with_bearing(segment: "FlightSegment",
                                       tolerance: float = 0.4,
                                       bearing_tolerance_deg: float = 45.0,
                                       max_cross_track_km: Optional[float] = None,
-                                      along_slack: float = 1.15) -> Optional[str]:
+                                      along_slack: float = 1.15,
+                                      ranked: Optional[List[str]] = None) -> Optional[str]:
     """Match a missing destination by scheduled enroute time + direction from the origin.
 
     Requires the origin->candidate bearing to align with the segment's mean cruise bearing.
@@ -1051,6 +1059,8 @@ def match_route_by_time_with_bearing(segment: "FlightSegment",
     (``along_slack``, as in corridor geometry). Cross-track alone accepts a point on the
     great circle's extension: VIV MMSM departures last seen near Mazatlan, already 450 km
     past Leon, were labelled MMSM->MMLO because the short MMLO block time fit best.
+
+    ``ranked`` (optional) receives every destination that passed, closest time first.
     """
     if not segment.origin or not segment.points:
         return None
@@ -1059,6 +1069,7 @@ def match_route_by_time_with_bearing(segment: "FlightSegment",
     last = segment.points[-1]
     best_match = None
     best_diff = float("inf")
+    passed = []
 
     for (orig, dest), avg_time in routes_dict.items():
         if orig != segment.origin.code:
@@ -1085,10 +1096,13 @@ def match_route_by_time_with_bearing(segment: "FlightSegment",
                                          cand.lat, cand.lon) * along_slack):
                 continue
 
+        passed.append((time_diff, dest))
         if time_diff < best_diff:
             best_diff = time_diff
             best_match = dest
 
+    if ranked is not None:
+        ranked[:] = [d for _, d in sorted(passed, key=lambda x: x[0])]
     return best_match
 
 
@@ -1096,7 +1110,8 @@ def infer_endpoint_by_corridor(segment: "FlightSegment",
                                routes_dict: Dict[Tuple[str, str], float],
                                airports_dict: Dict[str, "Airport"],
                                max_cross_track_km: float,
-                               along_slack: float = 1.15
+                               along_slack: float = 1.15,
+                               ranked: Optional[List[str]] = None
                                ) -> Tuple[Optional[str], Optional[str]]:
     """Infer a single missing endpoint from route-network geometry (turn-robust).
 
@@ -1110,6 +1125,7 @@ def infer_endpoint_by_corridor(segment: "FlightSegment",
     test, it tolerates turns/deviations because it measures corridor cross-track distance.
 
     Returns (missing_airport_code, 'origin'|'dest'), or (None, None) if nothing qualifies.
+    ``ranked`` (optional) receives every airport inside the corridor, closest first.
     """
     if not segment.points:
         return (None, None)
@@ -1118,6 +1134,7 @@ def infer_endpoint_by_corridor(segment: "FlightSegment",
 
     def best_corridor_match(known_ap: "Airport", airborne, candidate_codes) -> Optional[str]:
         best_code, best_xt = None, float("inf")
+        passed = []
         for code in candidate_codes:
             cand = airports_dict.get(code)
             if cand is None:
@@ -1135,8 +1152,12 @@ def infer_endpoint_by_corridor(segment: "FlightSegment",
                 continue
             xt = abs(cross_track_km(airborne.lat, airborne.lon,
                                     known_ap.lat, known_ap.lon, cand.lat, cand.lon))
+            if xt <= max_cross_track_km:
+                passed.append((xt, code))
             if xt <= max_cross_track_km and xt < best_xt:
                 best_xt, best_code = xt, code
+        if ranked is not None:
+            ranked[:] = [c for _, c in sorted(passed, key=lambda x: x[0])]
         return best_code
 
     # Origin known, destination missing: airborne end is the last point.
@@ -1222,6 +1243,8 @@ def try_recover_endpoint(segment: "FlightSegment",
     Returns the rescue_method used ("route_time_forward" / "route_time_reverse" /
     "geometry_forward" / "geometry_reverse"), or "" if nothing matched. Only ever *fills*
     a missing endpoint; a segment that already has both airports is returned untouched.
+    The filled end's ``*_source`` becomes ``route_time`` / ``geometry`` and its
+    ``*_candidates`` every airport that rescue accepted, best first.
     """
     # Corridor gate for route-time: only trust a time+bearing match if the airborne endpoint
     # actually lies in the corridor toward that airport. Enabled for the geometry-aware presets
@@ -1233,21 +1256,25 @@ def try_recover_endpoint(segment: "FlightSegment",
     # Origin known, destination missing
     if segment.origin and not segment.destination:
         if rt_rescue:
+            ranked: List[str] = []
             dest_code = match_route_by_time_with_bearing(
                 segment, routes_dict, airports_dict, tolerance=route_tol, max_cross_track_km=mct,
-                along_slack=corridor_slack
+                along_slack=corridor_slack, ranked=ranked
             )
             if dest_code and dest_code in airports_dict:
                 segment.destination = airports_dict[dest_code]
                 segment.is_complete = True
+                segment.dest_source, segment.dest_candidates = "route_time", ranked
                 return "route_time_forward"
         if geom_rescue:
+            ranked = []
             code, which = infer_endpoint_by_corridor(
-                segment, routes_dict, airports_dict, corridor_xt, corridor_slack
+                segment, routes_dict, airports_dict, corridor_xt, corridor_slack, ranked=ranked
             )
             if which == "dest" and code in airports_dict:
                 segment.destination = airports_dict[code]
                 segment.is_complete = True
+                segment.dest_source, segment.dest_candidates = "geometry", ranked
                 return "geometry_forward"
 
     # Destination known, origin missing
@@ -1256,6 +1283,7 @@ def try_recover_endpoint(segment: "FlightSegment",
             first = segment.points[0] if segment.points else None
             seg_brg = mean_bearing(segment.points, window_minutes=15.0) if segment.points else 0.0
             best_orig, best_xt = None, float("inf")
+            passed = []
             for (orig, dest), avg_time in routes_dict.items():
                 if dest != segment.destination.code or orig not in airports_dict:
                     continue
@@ -1280,21 +1308,28 @@ def try_recover_endpoint(segment: "FlightSegment",
                             > haversine_distance(dest_ap.lat, dest_ap.lon, cand.lat, cand.lon)
                             * corridor_slack):
                         continue
+                    passed.append((xt, orig))
                     if xt < best_xt:
                         best_xt, best_orig = xt, orig
-                elif best_orig is None:
-                    best_orig = orig  # legacy: first time+bearing match
+                else:
+                    passed.append((0.0, orig))
+                    if best_orig is None:
+                        best_orig = orig  # legacy: first time+bearing match
             if best_orig:
                 segment.origin = airports_dict[best_orig]
                 segment.is_complete = True
+                segment.orig_source = "route_time"
+                segment.orig_candidates = [o for _, o in sorted(passed, key=lambda x: x[0])]
                 return "route_time_reverse"
         if geom_rescue:
+            ranked = []
             code, which = infer_endpoint_by_corridor(
-                segment, routes_dict, airports_dict, corridor_xt, corridor_slack
+                segment, routes_dict, airports_dict, corridor_xt, corridor_slack, ranked=ranked
             )
             if which == "origin" and code in airports_dict:
                 segment.origin = airports_dict[code]
                 segment.is_complete = True
+                segment.orig_source, segment.orig_candidates = "geometry", ranked
                 return "geometry_reverse"
 
     return ""
@@ -1407,6 +1442,7 @@ def combine_segments_intelligently(segments: List["FlightSegment"], airports: Li
                 break
 
             should_join = False
+            by_bearing = False  # Case 5's direction test passed (rescue_method bearing_join)
 
             # Case 1: both endpoints incomplete and close in space
             if not current.destination and not next_seg.origin:
@@ -1452,6 +1488,7 @@ def combine_segments_intelligently(segments: List["FlightSegment"], airports: Li
                     )
                     implied_speed = gap_dist / max(time_gap_h, 0.01)
                     if 200 <= implied_speed <= 1100:  # km/h, plausible cruise band
+                        by_bearing = True
                         should_join = True
                         if rescue_method == "none":
                             rescue_method = "bearing_join"
@@ -1488,6 +1525,20 @@ def combine_segments_intelligently(segments: List["FlightSegment"], airports: Li
                 current.source_file,
             )
             new_segment.has_gaps = current.has_gaps or next_seg.has_gaps
+            # Each end keeps the provenance of the fragment it came from; an end reached
+            # only across a bearing join is as good as that join.
+            if current.origin is not None:
+                new_segment.orig_source = current.orig_source
+                new_segment.orig_candidates = current.orig_candidates
+            elif next_seg.origin is not None:
+                new_segment.orig_source = next_seg.orig_source
+                new_segment.orig_candidates = next_seg.orig_candidates
+            if next_seg.destination is not None:
+                new_segment.dest_source = ("bearing_join" if by_bearing else next_seg.dest_source)
+                new_segment.dest_candidates = next_seg.dest_candidates
+            elif carried_dest is not None:
+                new_segment.dest_source = current.dest_source
+                new_segment.dest_candidates = current.dest_candidates
             joined_idxs.append(raw_idx(next_seg))
             # Record the consumed `next_seg` outcome before overwriting `current`
             absorbed_rows.append(record_outcome(next_seg, "kept_joined", joined_with=[base_idx],
@@ -1547,6 +1598,45 @@ def combine_segments_intelligently(segments: List["FlightSegment"], airports: Li
         i += 1
 
     return combined
+
+
+# ---------------------------------------------------------------------------
+# Endpoint evidence (flown_routes v3). Each endpoint carries where it came from
+# (``*_source``); see docs/GEOPACKAGE.md §7 for the evidence order and the values.
+# ---------------------------------------------------------------------------
+
+# Ends seen at the airport: by ADS-B at detection, or by a POS fix after --pos-extend-ends.
+OBSERVED_SOURCES = ("observed", "pos_observed")
+_CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
+
+
+def end_confidence(source: Optional[str], candidates: Sequence[str] = ()) -> str:
+    """``high`` / ``medium`` / ``low`` for one endpoint (request F6).
+
+    high: observed, or a planned leg matched on flight number (rule 1); medium: seen by
+    POS, rotation from an observed neighbour, or a planned leg matched on tail and one
+    observed end (rule 2); low: everything inferred (route time, geometry, bearing join,
+    chained rotation), and any end a rescue had more than one airport to choose from.
+    """
+    src = source or "unresolved"
+    if src == "observed" or (src.startswith("planned:") and src.endswith(":fn")):
+        level = "high"
+    elif src in ("pos_observed", "rotation") or (src.startswith("planned:")
+                                                and src.endswith(":tail")):
+        level = "medium"
+    else:
+        level = "low"
+    if len(candidates) > 1:
+        level = "low"
+    return level
+
+
+def endpoint_confidence(orig_source: Optional[str], dest_source: Optional[str],
+                        orig_candidates: Sequence[str] = (),
+                        dest_candidates: Sequence[str] = ()) -> str:
+    """A flight's ``endpoint_confidence``: the lower of its two ends."""
+    return min(end_confidence(orig_source, orig_candidates),
+               end_confidence(dest_source, dest_candidates), key=_CONFIDENCE_RANK.get)
 
 
 class DiagnosticsRecorder:
@@ -1972,9 +2062,10 @@ def create_output_kml(flight_segments: List[FlightSegment], output_file: str,
 # ---------------------------------------------------------------------------
 
 FLOWN_SCHEMA_NAME = "flown_routes"
-FLOWN_SCHEMA_VERSION = "2"
-# Versions load_flown_gpkg reads. v1 stored LINESTRINGs; v2 splits lines at the date line.
-FLOWN_READABLE_VERSIONS = ("1", "2")
+FLOWN_SCHEMA_VERSION = "3"
+# Versions load_flown_gpkg reads. v1 stored LINESTRINGs; v2 splits lines at the date line;
+# v3 adds the endpoint-evidence columns (and POS-only flights) to v2.
+FLOWN_READABLE_VERSIONS = ("1", "2", "3")
 SUSPECT_OD_RATIO = 2.5
 
 FLIGHTS_COLUMNS = [
@@ -1989,6 +2080,15 @@ FLIGHTS_COLUMNS = [
     ("sources", "TEXT"), ("source_file", "TEXT"), ("preset", "TEXT"),
     ("style_color", "TEXT"), ("style_width", "REAL"), ("style_opacity", "REAL"),
     ("od_gc_km", "REAL"), ("od_distance_ratio", "REAL"), ("suspect_od", "INTEGER"),
+    # v3: endpoint evidence
+    ("flight_number", "TEXT"), ("flight_number_source", "TEXT"),
+    ("flight_number_conflict", "INTEGER"),
+    ("orig_source", "TEXT"), ("dest_source", "TEXT"),
+    ("orig_free", "TEXT"), ("dest_free", "TEXT"),
+    ("orig_free_source", "TEXT"), ("dest_free_source", "TEXT"),
+    ("orig_candidates", "TEXT"), ("dest_candidates", "TEXT"),
+    ("endpoint_confidence", "TEXT"), ("endpoint_conflict", "INTEGER"),
+    ("planned_leg_key", "TEXT"), ("n_pos_fixes", "INTEGER"),
 ]
 TRACKS_FULL_COLUMNS = [
     ("flight_id", "TEXT"), ("city_pair", "TEXT"), ("group_key", "TEXT"),
@@ -2190,11 +2290,29 @@ def _encode_split_line(coords: List[Tuple[float, ...]], has_m: bool):
                                               has_z=True, has_m=has_m)
 
 
+def _evidence_values(seg: FlightSegment) -> Tuple[Any, ...]:
+    """The v3 ``flights`` columns of one flight, in FLIGHTS_COLUMNS order."""
+    osrc = seg.orig_source or "unresolved"
+    dsrc = seg.dest_source or "unresolved"
+    free_o = getattr(seg, "orig_free", None) or (seg.origin.code, osrc)
+    free_d = getattr(seg, "dest_free", None) or (seg.destination.code, dsrc)
+    return (
+        getattr(seg, "flight_number", None), getattr(seg, "flight_number_source", None),
+        1 if getattr(seg, "flight_number_conflict", False) else 0,
+        osrc, dsrc, free_o[0], free_d[0], free_o[1], free_d[1],
+        "|".join(seg.orig_candidates) or None, "|".join(seg.dest_candidates) or None,
+        endpoint_confidence(osrc, dsrc, seg.orig_candidates, seg.dest_candidates),
+        1 if getattr(seg, "endpoint_conflict", False) else 0,
+        getattr(seg, "planned_leg_key", None),
+        sum(1 for p in seg.points if p.source == "POS"),
+    )
+
+
 def write_flown_gpkg(path: str, segments: List[FlightSegment], *, airline: str,
                      preset_name: str, group_by: str, sample_minutes: float,
                      include_points: bool, diagnostics_rows: List[Dict[str, Any]],
                      meta: Dict[str, str]) -> Dict[str, int]:
-    """Write the ``flown_routes`` v2 GeoPackage for ``segments`` (annotated, in output order)."""
+    """Write the ``flown_routes`` v3 GeoPackage for ``segments`` (annotated, in output order)."""
     w = gpkg_writer.GeoPackageWriter(path)
     try:
         w.add_feature_table("flights", "MULTILINESTRING", FLIGHTS_COLUMNS, z=True,
@@ -2219,7 +2337,9 @@ def write_flown_gpkg(path: str, segments: List[FlightSegment], *, airline: str,
                                                 has_m=False)
                 present = {p.source for p in seg.points}
                 yield blob, bbox, (
-                    seg.flight_id, airline, seg.aircraft_id, seg.registration, None,
+                    seg.flight_id, airline,
+                    seg.aircraft_id if getattr(seg, "hex_known", True) else None,
+                    seg.registration, None,
                     seg.origin.code, seg.destination.code, seg.get_route_folder(),
                     _group_key(seg, group_by),
                     gpkg_writer.format_datetime(seg.takeoff_time),
@@ -2239,7 +2359,7 @@ def write_flown_gpkg(path: str, segments: List[FlightSegment], *, airline: str,
                                                                        seg.style_opacity or "")
                     else None,
                     seg.od_gc_km, seg.od_distance_ratio, 1 if seg.suspect_od else 0,
-                )
+                ) + _evidence_values(seg)
 
         def track_rows():
             for seg in segments:
@@ -2371,7 +2491,7 @@ class StoredFlight(FlightSegment):
 
 
 def load_flown_gpkg(path: str) -> Tuple[Dict[str, str], List[FlightSegment]]:
-    """Read a ``flown_routes`` v1 or v2 GeoPackage back as StoredFlights, in written order.
+    """Read a ``flown_routes`` v1-v3 GeoPackage back as StoredFlights, in written order.
 
     Points come from ``tracks_full`` (and per-point ``source`` from ``track_points`` when
     present; otherwise every point is ADS-B).
