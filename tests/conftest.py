@@ -159,3 +159,97 @@ def bci():
     sys.modules["build_cirium_inputs"] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _acars_pos_body(reg: str, flight: str, t: datetime, lat: float, lon: float, fl: int) -> str:
+    """A raw ACARS (ARINC 620) POS report as the LATAM feed delivers it."""
+    def ddmm(v, width):
+        deg = int(abs(v))
+        tenths = int(round((abs(v) - deg) * 600))
+        return f"{deg:0{width}d}{tenths:03d}"
+    ns = "S" if lat < 0 else "N"
+    ew = "W" if lon < 0 else "E"
+    return (f"QU CPYXXXX\r\n.SCLASLA {t:%d%H%M}\r\nFML\r\nFI {flight}/AN {reg}\r\n"
+            f"DT QXB GRU9 {t:%d%H%M} F90A\r\n"
+            f"-  POS{ns}{ddmm(lat, 2)}{ew}{ddmm(lon, 3)},WPT01,{t:%H%M%S},{fl},WPT02,"
+            f"{t:%H%M%S},WPT03,M53,19932,498/TS{t:%H%M%S},{t:%d%m%y}630D\r\n")
+
+
+def write_acars_pos(folder: Path, reg: str, flight: str, t: datetime, lat: float, lon: float,
+                    fl: int, n: int) -> Path:
+    """One POS report file, named ``<TAIL>_raw_<n>.json`` with the receive stamp in its uri."""
+    tail = reg.replace("-", "")
+    received = t + timedelta(seconds=20)
+    path = folder / f"{tail}_raw_{n:05d}.json"
+    path.write_text(json.dumps({
+        "body": _acars_pos_body(reg, flight, t, lat, lon, fl),
+        "uri": f"s3://bucket/acars/{tail}-{received:%Y%m%d%H%M%S}000.txt"}))
+    return path
+
+
+@pytest.fixture(scope="session")
+def evidence_fixture(tmp_path_factory):
+    """Synthetic LATAM-like inputs for the endpoint-evidence features (raw ACARS POS).
+
+    Airports AAA (0,0), BBB (0,5), CCC (4,2), DDD (0,6): BBB and DDD lie on one line from
+    AAA, the case where route time and geometry cannot tell the destination apart.
+
+    * ABC101 (XA-AAA, mapped), 10-01:
+      - 10:00 AAA->DDD, 72 min, JJ1234. ADS-B sees only the first 30 min; POS reports
+        every 6 min continue to DDD, the last one low over DDD.
+      - 13:00 DDD->AAA, 72 min, JJ1235, all ADS-B (POS inside the window too).
+      - 17:00 AAA->CCC, 60 min, JJ1236: POS only (no ADS-B).
+    * CC-BMD (not in the tail map), 10-01 11:00 AAA->BBB, 60 min, LA800: POS only.
+    * Planned legs for all four.
+    """
+    root = tmp_path_factory.mktemp("evidence_fixture")
+    kml_dir = root / "kml"
+    pos_dir = root / "pos"
+    kml_dir.mkdir()
+    pos_dir.mkdir()
+    AAA, BBB, CCC, DDD = (0.0, 0.0), (0.0, 5.0), (4.0, 2.0), (0.0, 6.0)
+    (root / "airports.csv").write_text(
+        "airport,latitude,longitude,elevation_ft\nAAA,0.0,0.0,100\nBBB,0.0,5.0,100\n"
+        "CCC,4.0,2.0,100\nDDD,0.0,6.0,100\n")
+    (root / "routes.csv").write_text(
+        "origin,destination,avg_enroute_min\nAAA,BBB,60\nBBB,AAA,60\nAAA,DDD,72\n"
+        "DDD,AAA,72\nAAA,CCC,60\nCCC,AAA,60\n")
+    (root / "tails.csv").write_text("tail_number,icao_hex\nXAAAA,ABC101\n")
+    d1 = datetime(2026, 10, 1, 10, 0, 0, tzinfo=timezone.utc)
+    _write_track_kml(kml_dir / "abc101_2026-10-01_baro_avg.kml", "XA-AAA", [
+        _flight_points(d1, 72, AAA, DDD, skip=(30, 73)),
+        _flight_points(d1 + timedelta(hours=3), 72, DDD, AAA),
+    ])
+    n = 0
+
+    def pos_along(reg, flight, start, minutes, a, b, from_min, to_min, step_min):
+        nonlocal n
+        for m in range(from_min, to_min + 1, step_min):
+            f = m / minutes
+            alt_ft = 33000 * min(1.0, f / 0.15, (1 - f) / 0.15)
+            fl = max(int(round(alt_ft / 100.0)), 10)
+            n += 1
+            write_acars_pos(pos_dir, reg, flight, start + timedelta(minutes=m),
+                            a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, fl, n)
+
+    pos_along("XA-AAA", "JJ1234", d1, 72, AAA, DDD, 36, 72, 6)
+    n += 1   # the feed delivers some reports twice
+    write_acars_pos(pos_dir, "XA-AAA", "JJ1234", d1 + timedelta(minutes=48),
+                    0.0, 4.0, 330, n)
+    pos_along("XA-AAA", "JJ1235", d1 + timedelta(hours=3), 72, DDD, AAA, 20, 50, 10)
+    pos_along("XA-AAA", "JJ1236", d1 + timedelta(hours=7), 60, AAA, CCC, 0, 60, 6)
+    pos_along("CC-BMD", "LA800", d1 + timedelta(hours=1), 60, AAA, BBB, 0, 60, 6)
+    (root / "legs.csv").write_text(
+        "leg_key,source,carrier_icao,flight_number,flight_digits,tail,orig,dest,"
+        "sched_dep_utc,ofp_date,ambiguous\n"
+        "2026-10-01_TAM1234_AAA-DDD_b0,ofp,TAM,TAM1234,1234,XAAAA,AAA,DDD,"
+        "2026-10-01T10:00:00Z,2026-10-01,0\n"
+        "2026-10-01_TAM1235_DDD-AAA_b0,ofp,TAM,TAM1235,1235,XAAAA,DDD,AAA,"
+        "2026-10-01T13:00:00Z,2026-10-01,0\n"
+        "2026-10-01_TAM1236_AAA-CCC_b0,ofp,TAM,TAM1236,1236,XAAAA,AAA,CCC,"
+        "2026-10-01T17:00:00Z,2026-10-01,0\n"
+        "2026-10-01_LAN800_AAA-BBB_b0,ofp,LAN,LAN800,800,CCBMD,AAA,BBB,"
+        "2026-10-01T11:00:00Z,2026-10-01,0\n")
+    return {"root": root, "kml_dir": kml_dir, "pos": pos_dir, "tails": root / "tails.csv",
+            "airports": root / "airports.csv", "routes": root / "routes.csv",
+            "legs": root / "legs.csv"}
