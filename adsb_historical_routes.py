@@ -158,6 +158,10 @@ class TrackPoint:
         # or "FIREHOSE" (ADS-B firehose feed). Used to colour the output and to treat
         # source-filled gaps as real (not inferred).
         self.source = source
+    # ACARS POS fixes only: the report's ``FI`` flight number and normalized registration
+    # (class defaults keep ADS-B points as small as before).
+    flight_number: Optional[str] = None
+    registration: Optional[str] = None
     
     def __repr__(self):
         return f"TrackPoint({self.timestamp}, {self.lat:.4f}, {self.lon:.4f}, {self.alt:.0f}m)"
@@ -635,6 +639,18 @@ _ACARS_POS_RE = re.compile(
 _ACARS_REG_RE = re.compile(r"/AN\s+\.?([A-Z0-9-]+)")
 _RECEIVED_RE = re.compile(r"-(\d{14})\d*\.txt$")
 _RAW_FILE_TAIL_RE = re.compile(r"^([A-Z0-9]+)_raw_")
+_ACARS_FI_RE = re.compile(r"FI\s+([A-Z0-9]*)/AN")
+_FLIGHT_NUMBER_RE = re.compile(r"^([A-Z]{3}|[A-Z0-9]{2})0*(\d{1,4})[A-Z]?$")
+
+
+def split_flight_number(raw: Optional[str]) -> Optional[Tuple[str, str]]:
+    """``(prefix, digits)`` of a flight number: ``JJ1234`` -> ``("JJ", "1234")``,
+    ``LAP0123`` -> ``("LAP", "123")``; None when it has no number. A 3-letter start is an
+    ICAO prefix, otherwise the first two characters are the IATA one (``4C``, ``L7``).
+    Leading zeros and a trailing suffix letter are dropped, so ACARS ``FI`` numbers and
+    planned-leg ``flight_digits`` compare on the digits alone."""
+    m = _FLIGHT_NUMBER_RE.match((raw or "").strip().upper())
+    return (m.group(1), str(int(m.group(2)))) if m else None
 
 
 def _acars_received_time(msg: dict) -> Optional[datetime]:
@@ -682,7 +698,9 @@ def _parse_acars_pos(msg: dict, body: str):
             int(m.group(8)) * 100.0)
 
 
-def load_pos_points(folder: str, tail_to_hex: Dict[str, str]) -> Dict[Tuple[str, str], List["TrackPoint"]]:
+def load_pos_points(folder: str, tail_to_hex: Dict[str, str],
+                    unmapped: Optional[Dict[Tuple[str, str], List["TrackPoint"]]] = None,
+                    ) -> Dict[Tuple[str, str], List["TrackPoint"]]:
     """Parse ACARS POS files into {(hex, 'YYYY-MM-DD'): [TrackPoint(source='POS'), ...]}.
 
     Each file is an SQS message. Two body formats are read:
@@ -692,14 +710,21 @@ def load_pos_points(folder: str, tail_to_hex: Dict[str, str]) -> Dict[Tuple[str,
       Position time = created_at date + freetext HHMMSS (UTC).
     * A raw ACARS ``POS`` report (``FI .../AN <reg>`` + ``-  POS<lat><lon>,...``); see
       :func:`_parse_acars_pos`. Files named ``<TAIL>_raw_*.json`` for tails not in the map
-      are skipped unread.
+      are skipped unread, unless ``unmapped`` is given: then every file is read and the
+      raw reports of unmapped tails go there, keyed ``(tail, 'YYYY-MM-DD')``.
+
+    Raw reports keep their ``FI`` flight number and registration on the TrackPoint. The
+    folder is listed once with ``os.scandir`` (it can hold millions of files).
     """
     idx: Dict[Tuple[str, str], List["TrackPoint"]] = defaultdict(list)
     if not folder or not os.path.isdir(folder):
         return idx
-    for fp in glob.glob(os.path.join(folder, "*.json")):
-        mt = _RAW_FILE_TAIL_RE.match(os.path.basename(fp))
-        if mt and mt.group(1) not in tail_to_hex:
+    for entry in os.scandir(folder):
+        if not entry.name.endswith(".json"):
+            continue
+        fp = entry.path
+        mt = _RAW_FILE_TAIL_RE.match(entry.name)
+        if unmapped is None and mt and mt.group(1) not in tail_to_hex:
             continue
         try:
             msg = json.load(open(fp))
@@ -710,14 +735,23 @@ def load_pos_points(folder: str, tail_to_hex: Dict[str, str]) -> Dict[Tuple[str,
         m = re.match(r"^\w+_Position=(\[.*\])\s*$", body, re.S)
         if not m:
             report = _parse_acars_pos(msg, body)
-            hexc = tail_to_hex.get(report[0]) if report else None
+            if not report:
+                continue
+            tail, ts, lat, lon, alt_ft = report
+            hexc = tail_to_hex.get(tail)
+            if not hexc and unmapped is None:
+                continue
+            try:
+                tp = TrackPoint(ts, lon, lat, alt_ft * 0.3048, source="POS")
+            except Exception:
+                continue
+            fi = _ACARS_FI_RE.search(body)
+            tp.flight_number = (fi.group(1) or None) if fi else None
+            tp.registration = tail
             if hexc:
-                tail, ts, lat, lon, alt_ft = report
-                try:
-                    tp = TrackPoint(ts, lon, lat, alt_ft * 0.3048, source="POS")
-                except Exception:
-                    continue
                 idx[(hexc, ts[:10])].append(tp)
+            else:
+                unmapped.setdefault((tail, ts[:10]), []).append(tp)
             continue
         try:
             reports = json.loads(m.group(1))
@@ -744,6 +778,7 @@ def load_pos_points(folder: str, tail_to_hex: Dict[str, str]) -> Dict[Tuple[str,
                 tp = TrackPoint(f"{date}T{hh}:{mi}:{ss}Z", ll[1], ll[0], alt_m, source="POS")
             except Exception:
                 continue
+            tp.registration = tail
             idx[(hexc, date)].append(tp)
     return idx
 
@@ -1637,6 +1672,66 @@ def endpoint_confidence(orig_source: Optional[str], dest_source: Optional[str],
     """A flight's ``endpoint_confidence``: the lower of its two ends."""
     return min(end_confidence(orig_source, orig_candidates),
                end_confidence(dest_source, dest_candidates), key=_CONFIDENCE_RANK.get)
+
+
+def index_pos_by_aircraft(*indexes: Dict[Tuple[str, str], List["TrackPoint"]]
+                          ) -> Dict[str, "FixSeries"]:
+    """{aircraft key: POS fixes in time order, one per timestamp} from (key, date) indexes.
+
+    The key is the ICAO hex for mapped tails and the normalized registration for the
+    others. Only ACARS POS fixes are kept; a report delivered twice appears once.
+    """
+    by_key: Dict[str, List["TrackPoint"]] = defaultdict(list)
+    for index in indexes:
+        for (key, _date), pts in index.items():
+            by_key[key].extend(p for p in pts if p.source == "POS")
+    out: Dict[str, List["TrackPoint"]] = {}
+    for key, pts in by_key.items():
+        pts.sort(key=lambda p: p.datetime)
+        out[key] = FixSeries(p for i, p in enumerate(pts)
+                             if i == 0 or p.datetime != pts[i - 1].datetime)
+    return out
+
+
+class FixSeries(list):
+    """One aircraft's POS fixes in time order, with their times for bisecting."""
+
+    def __init__(self, pts):
+        super().__init__(pts)
+        self.times = [p.datetime for p in self]
+
+
+def _fixes_between(fixes: List["TrackPoint"], t0: datetime, t1: datetime) -> List["TrackPoint"]:
+    """The fixes with t0 <= time <= t1 (``fixes`` in time order)."""
+    times = getattr(fixes, "times", None) or [p.datetime for p in fixes]
+    return fixes[bisect.bisect_left(times, t0):bisect.bisect_right(times, t1)]
+
+
+def assign_flight_numbers(segments: List[FlightSegment],
+                          pos_by_aircraft: Dict[str, List["TrackPoint"]]) -> None:
+    """F1: give each flight the ``FI`` flight number of the POS reports in its time window.
+
+    The number reported most often wins (ties: the earliest one); a second distinct number
+    in the same window sets ``flight_number_conflict`` (a probable mis-join). Flights with
+    no numbered report in their window keep ``flight_number`` None.
+    """
+    for seg in segments:
+        seg.flight_number = None
+        seg.flight_number_source = None
+        seg.flight_number_conflict = False
+        fixes = pos_by_aircraft.get(seg.aircraft_id)
+        if not fixes or not seg.points:
+            continue
+        counts: Dict[str, int] = {}
+        for p in _fixes_between(fixes, seg.points[0].datetime, seg.points[-1].datetime):
+            if p.flight_number and split_flight_number(p.flight_number):
+                counts[p.flight_number] = counts.get(p.flight_number, 0) + 1
+        if not counts:
+            continue
+        best = max(counts, key=lambda k: counts[k])   # first maximum = earliest seen
+        seg.flight_number = best
+        seg.flight_number_source = "acars_fi"
+        seg.flight_number_conflict = len(counts) > 1
 
 
 class DiagnosticsRecorder:

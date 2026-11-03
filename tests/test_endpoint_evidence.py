@@ -101,3 +101,62 @@ def test_join_carries_end_sources(ahr, make_segment, net):
 ])
 def test_endpoint_confidence(ahr, osrc, dsrc, ocand, dcand, expect):
     assert ahr.endpoint_confidence(osrc, dsrc, ocand, dcand) == expect
+
+
+# ---- F1: ACARS flight identity ---------------------------------------------------
+
+@pytest.mark.parametrize("raw,expect", [
+    ("JJ1234", ("JJ", "1234")), ("LAP0123", ("LAP", "123")), ("4C0123", ("4C", "123")),
+    ("L71234", ("L7", "1234")), ("JJ1234A", ("JJ", "1234")), ("", None), ("JJ", None),
+])
+def test_split_flight_number(ahr, raw, expect):
+    assert ahr.split_flight_number(raw) == expect
+
+
+def test_pos_loader_keeps_flight_number_and_registration(ahr, tmp_path):
+    from tests.conftest import write_acars_pos
+    write_acars_pos(tmp_path, "XA-AAA", "JJ1234", T0, -23.5, -46.5, 350, 1)
+    write_acars_pos(tmp_path, "CC-BMD", "LA800", T0, -33.0, -70.5, 360, 2)
+    unmapped = {}
+    idx = ahr.load_pos_points(str(tmp_path), {"XAAAA": "ABC101"}, unmapped=unmapped)
+    (tp,) = idx[("ABC101", "2026-10-01")]
+    assert (tp.flight_number, tp.registration) == ("JJ1234", "XAAAA")
+    (cc,) = unmapped[("CCBMD", "2026-10-01")]
+    assert (cc.flight_number, cc.registration, cc.source) == ("LA800", "CCBMD", "POS")
+
+
+def test_pos_loader_skips_unmapped_files_unless_asked(ahr, tmp_path):
+    from tests.conftest import write_acars_pos
+    write_acars_pos(tmp_path, "CC-BMD", "LA800", T0, -33.0, -70.5, 360, 2)
+    assert dict(ahr.load_pos_points(str(tmp_path), {"XAAAA": "ABC101"})) == {}
+
+
+def _fix(ahr, t, lat, lon, alt_ft=35000, fi=None, reg="XAAAA"):
+    p = ahr.TrackPoint(t.strftime("%Y-%m-%dT%H:%M:%SZ"), lon, lat, alt_ft * 0.3048, source="POS")
+    p.flight_number, p.registration = fi, reg
+    return p
+
+
+def test_flight_number_from_pos_in_window(ahr, make_segment, net):
+    s = _seg(ahr, make_segment, net, T0, 60, (0, 0), (0, 5), orig="AAA", dest="BBB")
+    fixes = [_fix(ahr, T0 + timedelta(minutes=m), 0, m / 12, fi="JJ1234") for m in (10, 20, 30)]
+    fixes.append(_fix(ahr, T0 + timedelta(minutes=90), 0, 5, fi="JJ7777"))   # after landing
+    ahr.assign_flight_numbers([s], {"ABC101": fixes})
+    assert (s.flight_number, s.flight_number_source, s.flight_number_conflict) == \
+        ("JJ1234", "acars_fi", False)
+
+
+def test_flight_number_conflict_keeps_majority(ahr, make_segment, net):
+    s = _seg(ahr, make_segment, net, T0, 60, (0, 0), (0, 5), orig="AAA", dest="BBB")
+    fixes = [_fix(ahr, T0 + timedelta(minutes=m), 0, m / 12, fi="JJ1234") for m in (10, 20, 30)]
+    fixes.append(_fix(ahr, T0 + timedelta(minutes=40), 0, 3.3, fi="JJ9999"))
+    fixes.append(_fix(ahr, T0 + timedelta(minutes=45), 0, 3.7, fi=None))   # no FI: ignored
+    ahr.assign_flight_numbers([s], {"ABC101": fixes})
+    assert (s.flight_number, s.flight_number_conflict) == ("JJ1234", True)
+
+
+def test_no_pos_no_flight_number(ahr, make_segment, net):
+    s = _seg(ahr, make_segment, net, T0, 60, (0, 0), (0, 5), orig="AAA", dest="BBB")
+    ahr.assign_flight_numbers([s], {})
+    assert (s.flight_number, s.flight_number_source, s.flight_number_conflict) == \
+        (None, None, False)
