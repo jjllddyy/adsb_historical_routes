@@ -2100,6 +2100,8 @@ def _resolve(flights: List[FlightSegment], ctx: EvidenceContext, use_planned: bo
             leg_end = None
             if use_planned and f.planned_leg is not None:
                 leg_end = f.planned_leg.orig if end == "origin" else f.planned_leg.dest
+                if leg_end not in ctx.airports_dict:
+                    leg_end = None      # not in the airport list: no flight can end there
             pick = None
             if leg_end and f.planned_rule == 1:
                 pick = (leg_end, f"planned:{f.planned_leg.source}:fn", cands)
@@ -2333,7 +2335,7 @@ def run_endpoint_evidence(kept_by_aircraft: Dict[str, List[FlightSegment]],
     ``endpoint_conflict``). Returns the flights to keep and the evidence report.
     """
     opts = ctx.options
-    report = _new_report()
+    dropped_items: List[Tuple[str, str, str]] = []   # (takeoff date, kind, reason)
     keys = set(kept_by_aircraft) | set(dropped_by_aircraft)
     done = 0
     if opts.pos_only_flights:
@@ -2345,8 +2347,9 @@ def run_endpoint_evidence(kept_by_aircraft: Dict[str, List[FlightSegment]],
         fixes = pos_by_aircraft.get(key) or FixSeries([])
         recovering = dropped if opts.recover_dropped else []
         open_ids = {id(s) for s in kept} | {id(s) for s, _ in recovering}
-        snapshot = {id(s): (s.origin, s.destination, s.orig_source, s.dest_source,
-                            s.orig_candidates, s.dest_candidates) for s in kept}
+        for s in kept:
+            s.ends_1_4_0 = (s.origin, s.destination, s.orig_source, s.dest_source,
+                            s.orig_candidates, s.dest_candidates)
         adsb = sorted(kept + [s for s, _ in dropped], key=lambda s: s.takeoff_time)
 
         if opts.pos_extend_ends and fixes:
@@ -2357,14 +2360,7 @@ def run_endpoint_evidence(kept_by_aircraft: Dict[str, List[FlightSegment]],
                 hi = adsb[i + 1].takeoff_time if i + 1 < len(adsb) else None
                 st = extend_ends_with_pos(s, fixes, lo, hi, ctx)
                 if st["before_km"] or st["after_km"]:
-                    ext = report["extended"]
-                    ext["flights"] += 1
-                    ext["origin"] += 1 if st["before_km"] else 0
-                    ext["dest"] += 1 if st["after_km"] else 0
-                    ext["before_km"] += st["before_km"]
-                    ext["after_km"] += st["after_km"]
-                    ext["endpoints_changed"] += sum(
-                        1 for c in getattr(s, "evidence_changes", []) if c["feature"] == "F2")
+                    s.f2_km = (st["before_km"], st["after_km"])
 
         pos_only: List[FlightSegment] = []
         if opts.pos_only_flights and fixes and (key in mapped or opts.pos_fleets == "all"):
@@ -2383,7 +2379,7 @@ def run_endpoint_evidence(kept_by_aircraft: Dict[str, List[FlightSegment]],
         for s in kept:
             if not s.is_valid_flight():
                 (s.origin, s.destination, s.orig_source, s.dest_source,
-                 s.orig_candidates, s.dest_candidates) = snapshot[id(s)]
+                 s.orig_candidates, s.dest_candidates) = s.ends_1_4_0
                 s.is_complete = True
                 s.endpoint_conflict = True
                 s.evidence_changes = [c for c in getattr(s, "evidence_changes", [])
@@ -2393,60 +2389,90 @@ def run_endpoint_evidence(kept_by_aircraft: Dict[str, List[FlightSegment]],
             reason = row.get("drop_reason") or "invalid"
             if s.is_complete and s.is_valid_flight():
                 s.disposition, s.rescue_method = "kept_recovered", "none"
+                s.recovered_reason = reason
                 s.joined_segment_count = len([x for x in (row.get(
                     "joined_with_segment_idx") or "").split(",") if x]) or 1
                 row["disposition"], row["drop_reason"] = "kept_recovered", ""
                 row["_flight"], row["_flight_row"] = s, True
-                report["recovered"][reason] += 1
                 out.append(s)
             else:
-                report["still_dropped"][reason] += 1
+                dropped_items.append((s.takeoff_date_str, "still_dropped", reason))
         for f in pos_only:
-            po = report["pos_only"]
             if f.is_complete and f.is_valid_flight():
-                po["kept"] += 1
-                po["by_prefix"][registration_prefix(f.registration)] += 1
-                po["by_month"][f.takeoff_date_str[:7]] += 1
-                po["spacing_min"].extend((b.datetime - a.datetime).total_seconds() / 60.0
-                                         for a, b in zip(f.points, f.points[1:]))
                 out.append(f)
                 disp, why = "pos_only", ""
             else:
                 why = "unresolved" if not f.is_complete else "invalid"
-                po["dropped"][why] += 1
+                dropped_items.append((f.takeoff_date_str, "pos_dropped", why))
                 disp = "dropped_pos_only"
             if recorder is not None:
                 row = recorder.record_outcome(f, segment_idx=-1, disposition=disp,
                                               drop_reason=why, airports=ctx.airports)
                 if disp == "pos_only":
                     row["_flight"], row["_flight_row"] = f, True
-
-        for f in flights:
-            leg = getattr(f, "planned_leg", None)
-            if leg is None or f.planned_rule != 1:
-                continue
-            sp = split_flight_number(f.flight_number) if f.flight_number_source == "acars_fi" \
-                else None
-            if sp:
-                report["prefix_table"][sp[0]][leg.carrier] += 1
-            snap = snapshot.get(id(f))
-            for k, (end, leg_code) in enumerate((("origin", leg.orig), ("dest", leg.dest))):
-                code, src = f.orig_free if end == "origin" else f.dest_free
-                report["agreement"][end][src][0 if code == leg_code else 1] += 1
-                if snap is None:
-                    continue
-                old_ap, old_src = snap[k], snap[2 + k] or "unresolved"
-                old = old_ap.code if old_ap else None
-                report["agreement_1_4_0"][end][old_src][0 if old == leg_code else 1] += 1
-                if old != leg_code and old_src not in OBSERVED_SOURCES:
-                    # a 1.4.0 guess the plan contradicts: what the plan-free evidence did
-                    report["contradicted"]["total"] += 1
-                    report["contradicted"]["free_now_agrees" if code == leg_code else
-                                           "free_changed_still_differs" if code != old else
-                                           "unchanged"] += 1
         out[done:] = sorted(out[done:], key=lambda f: f.takeoff_time)
         done = len(out)
-    return out, _finish_report(report)
+    report = build_evidence_report(out, dropped_items)
+    report["dropped_items"] = dropped_items
+    return out, report
+
+
+def build_evidence_report(flights: List[FlightSegment],
+                          dropped_items: Sequence[Tuple[str, str, str]],
+                          date_from: Optional[str] = None, date_to: Optional[str] = None
+                          ) -> Dict[str, Any]:
+    """The evidence report over ``flights`` (the ones kept) and the dropped segments and
+    POS sessions whose takeoff date is in [date_from, date_to] (request §6.3)."""
+    lo, hi = date_from or "0000-00-00", date_to or "9999-99-99"
+    report = _new_report()
+    ext, po = report["extended"], report["pos_only"]
+    for f in flights:
+        b, a = getattr(f, "f2_km", (0.0, 0.0))
+        if b or a:
+            ext["flights"] += 1
+            ext["origin"] += 1 if b else 0
+            ext["dest"] += 1 if a else 0
+            ext["before_km"] += b
+            ext["after_km"] += a
+            ext["endpoints_changed"] += sum(
+                1 for c in getattr(f, "evidence_changes", []) if c["feature"] == "F2")
+        if f.disposition == "kept_recovered":
+            report["recovered"][getattr(f, "recovered_reason", "invalid")] += 1
+        if f.disposition == "pos_only":
+            po["kept"] += 1
+            po["by_prefix"][registration_prefix(f.registration)] += 1
+            po["by_month"][f.takeoff_date_str[:7]] += 1
+            po["spacing_min"].extend((q.datetime - p.datetime).total_seconds() / 60.0
+                                     for p, q in zip(f.points, f.points[1:]))
+        leg = getattr(f, "planned_leg", None)
+        if leg is None or f.planned_rule != 1:
+            continue
+        sp = split_flight_number(f.flight_number) if f.flight_number_source == "acars_fi" \
+            else None
+        if sp:
+            report["prefix_table"][sp[0]][leg.carrier] += 1
+        snap = getattr(f, "ends_1_4_0", None)
+        for k, (end, leg_code) in enumerate((("origin", leg.orig), ("dest", leg.dest))):
+            code, src = f.orig_free if end == "origin" else f.dest_free
+            report["agreement"][end][src][0 if code == leg_code else 1] += 1
+            if snap is None:
+                continue
+            old_ap, old_src = snap[k], snap[2 + k] or "unresolved"
+            old = old_ap.code if old_ap else None
+            report["agreement_1_4_0"][end][old_src][0 if old == leg_code else 1] += 1
+            if old != leg_code and old_src not in OBSERVED_SOURCES:
+                # a 1.4.0 guess the plan contradicts: what the plan-free evidence did
+                report["contradicted"]["total"] += 1
+                report["contradicted"]["free_now_agrees" if code == leg_code else
+                                       "free_changed_still_differs" if code != old else
+                                       "unchanged"] += 1
+    for date, kind, reason in dropped_items:
+        if lo <= date <= hi:
+            if kind == "still_dropped":
+                report["still_dropped"][reason] += 1
+            else:
+                po["dropped"][reason] += 1
+    return _finish_report(report)
 
 
 def validate_evidence_options(opts: EvidenceOptions, integrate_pos: bool,
@@ -2555,6 +2581,12 @@ def run_evidence_stage(opts: EvidenceOptions,
         for f in flights:
             for change in getattr(f, "evidence_changes", []):
                 recorder.record_evidence(f, change, airports)
+    print(f"  Evidence stage: {len(flights)} flights in {time.time() - t0:.0f}s "
+          "(all dates; the report below counts the takeoff-date range only)")
+    return flights, report, meta
+
+
+def print_evidence_report(report: Dict[str, Any]) -> None:
     ext, po = report["extended"], report["pos_only"]
     print(f"  F2 extended {ext['flights']} flight(s) with POS ({ext['origin']} origins, "
           f"{ext['dest']} destinations; +{ext['before_km']:,.0f} / +{ext['after_km']:,.0f} km), "
@@ -2564,10 +2596,8 @@ def run_evidence_stage(opts: EvidenceOptions,
     print(f"  F9 recovered {report['recovered']}, still dropped {report['still_dropped']}")
     if report["prefix_table"]:
         print(f"  Flight-number prefixes (ACARS -> plan): {report['prefix_table']}")
-    print(f"  Evidence stage: {len(flights)} flights in {time.time() - t0:.0f}s")
-    meta["evidence_report"] = json.dumps(report)
-    meta["flight_number_prefixes"] = json.dumps(report["prefix_table"])
-    return flights, report, meta
+    if report["contradicted"]:
+        print(f"  1.4.0 inferred ends a rule-1 plan contradicts: {report['contradicted']}")
 
 
 def _md_table(header: Sequence[str], rows: List[Sequence[Any]]) -> List[str]:
@@ -3872,6 +3902,13 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
     suspect = [s for s in final_segments if s.suspect_od]
     recorder.link_flights()
     if use_evidence:
+        evidence_report = build_evidence_report(final_segments,
+                                                evidence_report["dropped_items"],
+                                                takeoff_from, takeoff_to)
+        print("\nEndpoint evidence, kept flights:")
+        print_evidence_report(evidence_report)
+        evidence_meta["evidence_report"] = json.dumps(evidence_report)
+        evidence_meta["flight_number_prefixes"] = json.dumps(evidence_report["prefix_table"])
         evidence_meta.update(endpoint_counts_meta(final_segments))
 
     # Name outputs from the actual first/last flight (UTC takeoff) dates.

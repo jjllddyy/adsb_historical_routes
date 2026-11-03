@@ -596,3 +596,23 @@ def test_kept_flight_made_invalid_by_rotation_keeps_its_1_4_0_ends(ahr, make_seg
     assert (s.origin.code, s.destination.code) == ("AAA", "BBB")
     assert (s.orig_source, s.dest_source) == ("route_time", "route_time")
     assert s.endpoint_conflict
+
+
+def test_planned_leg_airport_not_in_the_list_falls_through(ahr, make_segment, net, pctx):
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    f1.flight_number, f1.flight_number_source = "JJ1234", "acars_fi"
+    ahr.resolve_endpoints([f1], pctx, _legs(_leg(ahr, "1234", "AAA", "ZZZ", T0)))
+    assert (f1.destination.code, f1.dest_source) == ("BBB", "route_time")
+    assert f1.planned_leg_key is not None and f1.is_complete
+
+
+def test_report_follows_the_kept_flights(ahr, net):
+    ctx = _stage(ahr, net, pos_only_flights=True)
+    pos = {"ABC101": ahr.FixSeries(_session(ahr, T0, (0, 0), (4, 2)) +
+                                   _session(ahr, T0 + timedelta(days=2), (0, 0), (4, 2)))}
+    flights, report = ahr.run_endpoint_evidence({}, {}, pos, ctx, mapped={"ABC101"},
+                                                registrations={})
+    assert report["pos_only"]["kept"] == 2
+    kept = [f for f in flights if f.takeoff_date_str == "2026-10-01"]
+    again = ahr.build_evidence_report(kept, report["dropped_items"], "2026-10-01", "2026-10-01")
+    assert again["pos_only"]["kept"] == 1 and again["pos_only"]["by_month"] == {"2026-10": 1}

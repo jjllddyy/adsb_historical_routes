@@ -1,4 +1,4 @@
-# GeoPackage output (`flown_routes` v2)
+# GeoPackage output (`flown_routes` v3)
 
 `adsb_historical_routes.py` writes a GeoPackage as its primary output. It is the input for the
 QGIS route viewer (`~/Git/qgis`) and for `direct_detect` (`~/Git/analytics_tools/direct_detect`).
@@ -31,6 +31,8 @@ python3 adsb_historical_routes.py \
 | `--qgz` | off | Also write `<output base>.qgz`, the QGIS project, with `~/Git/qgis` `prepare` (§6). Needs `--navdb`; not allowed with `--format kml`. |
 | `--navdb`, `--company`, `--qgis-repo` | none, none, `$QGIS_REPO` or `~/Git/qgis` | The project's chart-layer navdb (required with `--qgz`, checked before the build), an optional `company_routes` GeoPackage, and the qgis checkout. |
 | `--takeoff-from`, `--takeoff-to` | none | Keep only flights whose UTC takeoff date is in the range (inclusive, `YYYY-MM-DD`). Daily KML files dated more than one day outside it are not read. Excluded flights stay in the diagnostics as `dropped_date_range`. |
+| `--airports A.csv [B.csv ...]` | | One or more airport files; a code in a later file replaces the same code in an earlier one (v3). |
+| Endpoint evidence | all off | `--acars-identity`, `--pos-extend-ends`, `--pos-only-flights`, `--pos-fleets`, `--rotation-endpoints`, `--planned-legs`, `--recover-dropped` and their limits: §7. With all of them off the flights are 1.4.0's. |
 
 - **Naming:** `{from}` and `{to}` in `--output` become the first and last flight dates (UTC takeoff).
   - `--output` may end in `.gpkg` to name the GeoPackage directly; the KML and CSV take the same stem (`x.gpkg`, `x.kml`, `x.kml.diagnostics.csv`).
@@ -58,17 +60,24 @@ copied onto every child table, so no filter ever needs a join.
 | Column | Notes |
 |---|---|
 | `flight_id` | `{aircraft_id}_{takeoff:%Y%m%dT%H%M%SZ}`; unique. A repeat (same aircraft, same takeoff second) gets `_2`. |
-| `airline`, `aircraft_id`, `registration` | `callsign` is reserved and stays null (spec §10). |
+| `airline`, `aircraft_id`, `registration` | `callsign` is reserved and stays null (spec §10). **v3:** `aircraft_id` (the ICAO hex) is null on POS-only flights of registrations not in the tail map (`--pos-fleets all`, for example CC-, HC-, N- aircraft); `registration` is then set and `flight_id` starts with the normalized registration (`CCBMD_…`). |
 | `origin`, `dest`, `city_pair`, `group_key` | `group_key` is the KML top folder: the destination, or the origin with `--group origin`. |
 | `takeoff_time`, `landing_time`, `flight_date` | |
 | `duration_min`, `distance_km`, `max_alt_ft` | `distance_km` is the flown distance along every point. |
 | `n_points_full`, `n_points_display` | |
 | `has_gaps`, `gap_duration_min` | Measured: point-to-point gaps longer than `--stitch-gap-min` in the full track. |
-| `disposition`, `rescue_method`, `joined_segment_count` | `kept_complete` / `kept_joined` / `kept_rescued`. `rescue_method` is null when none was used. |
+| `disposition`, `rescue_method`, `joined_segment_count` | `kept_complete` / `kept_joined` / `kept_rescued`; v3 adds `kept_recovered` (a segment 1.4.0 dropped, completed by the new evidence, §7.1 F9) and `pos_only` (§7.1 F3). `rescue_method` keeps its 1.4.0 meaning (the 1.4.0 rescue that ran) and is null when none was used; the `*_source` columns give the final answer. |
 | `sources` | For example `ADSB,FIREHOSE`. |
 | `source_file`, `preset` | |
 | `style_color`, `style_width`, `style_opacity` | The input KML's style, so the KML can be reproduced. The viewer ignores them. |
 | `od_gc_km`, `od_distance_ratio`, `suspect_od` | Great circle between the labelled airports; flown ÷ great circle; ratio > `--suspect-od-ratio` (§3). |
+| **v3:** `flight_number`, `flight_number_source`, `flight_number_conflict` | The ACARS `FI` number (`acars_fi`) or the planned leg's (`planned:<source>`); null without either. `flight_number_conflict = 1`: POS reports with two different numbers fell inside the flight (majority kept). |
+| **v3:** `orig_source`, `dest_source` | Where each end came from (§7.2). |
+| **v3:** `orig_free`, `dest_free`, `orig_free_source`, `dest_free_source` | The end the builder gives **without** planned legs, and its source. Equal to `origin` / `dest` unless a planned leg changed the end. |
+| **v3:** `orig_candidates`, `dest_candidates` | `\|`-separated airports a route-time / geometry rescue accepted for that end, best first; null when no rescue ran on it. |
+| **v3:** `endpoint_confidence` | `high` / `medium` / `low`: the lower of the two ends (§7.3). |
+| **v3:** `endpoint_conflict` | 1 when rotation or the planned leg contradicts an *observed* end (a probable missing leg, tail swap or diversion). Observed ends are never changed. Also 1 on a 1.4.0 flight whose new evidence would have made it invalid; it keeps its 1.4.0 ends. |
+| **v3:** `planned_leg_key`, `n_pos_fixes` | The matched planned leg; the number of POS points in the track. |
 
 Indexes: `flight_id` (unique), `city_pair`, `group_key`, `dest`, `origin`, `flight_date`,
 `registration`, `aircraft_id`.
@@ -86,9 +95,11 @@ Indexes: `flight_id` (unique), `city_pair`, `group_key`, `dest`, `origin`, `flig
 - **`diagnostics`**: the diagnostics CSV rows, typed.
   - `flight_id` is set on each kept flight's own row and on every `kept_joined` fragment absorbed into it.
   - `od_*` and `suspect_od` are set on the flight's own row.
+  - **v3:** `phase = evidence` rows, one per endpoint F2, F4 or F5 changed: `evidence_feature`, `evidence_source`, `endpoint` (`origin` / `dest`), `before_code`, `after_code`. POS-only flights and dropped POS sessions have `phase = final` rows (`pos_only` / `dropped_pos_only`, `segment_idx` -1).
 - **`meta`**: key/value rows.
-  - `schema_name` (`flown_routes`), `schema_version` (`1`), `tool`, `tool_version`, `created_utc`, `airline`, `date_from`, `date_to`, `argv` (JSON), `source_count`.
+  - `schema_name` (`flown_routes`), `schema_version` (`3`), `tool`, `tool_version`, `created_utc`, `airline`, `date_from`, `date_to`, `argv` (JSON), `source_count`.
   - Also `preset`, `group_by`, `sample_minutes`, `stitch_gap_min`, `integrate_pos`, `track_points`, `kml_params` (JSON), `flight_count`, `suspect_od_ratio` and `suspect_od_count`.
+  - **v3:** `evidence_options` (JSON, always). When the evidence stage ran: `planned_legs` (files, rows, date range), `planned_leg_airports_missing`, `flight_number_prefixes` (ACARS prefix → plan carrier, learned from rule-1 matches), `endpoint_sources`, `endpoint_confidence`, `flight_number_sources`, `flights_by_sources_disposition`, `endpoint_conflict_count`, `evidence_report` (the whole report as JSON) and `pos_read_seconds`.
 
 **Date line (v2).** `flights` and `tracks_full` are MULTILINESTRINGs. A line is cut where two
 consecutive vertices are more than 180° apart in longitude: one part ends at ±180 and the next
@@ -200,3 +211,66 @@ python3 gpkg_to_qgz.py out/lan.gpkg --navdb ~/Git/qgis/input/navdb_2610.gpkg \
   accepts flown `schema_version` "1" only. Until the qgis handoff lands, add the layers to QGIS
   directly (*Layer → Add Layer → Add Vector Layer…*).
 - `--navdb` (and `--company`, when given) must exist; this is checked before the long build starts.
+
+## 7. Endpoint evidence (v3)
+
+The core is unchanged: each aircraft's (ICAO hex) 24-hour ADS-B stream is cut into flights
+between airports by position, elevation and route time (1.4.0). The evidence stage then runs
+after the joins, per aircraft (hex, else registration), using whatever inputs exist. Every switch
+is optional and off by default; with all of them off the output is 1.4.0's (proven by
+`tests/test_v3_equivalence.py` against digests of the 1.4.0 output). **No flight needs a
+flight number or a planned leg**: their absence never drops, splits or downgrades a flight.
+
+### 7.1 Switches
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--acars-identity true` (F1) | off | Each flight gets the `FI` flight number of the POS reports inside its time window (same aircraft); the most frequent wins, a second number sets `flight_number_conflict`. Needs `--integrate-pos true --pos-folder`. |
+| `--pos-extend-ends true` (F2) | off | An end ADS-B did not see at an airport is carried on with POS fixes of the same aircraft, before the first or after the last ADS-B fix. Each step must be ≤ `--pos-extend-max-gap-min` (60) and ≤ 1,300 km/h; the walk stops at a ground stop (a gap over 20 min crossed slower than 150 km/h), at the neighbouring ADS-B segment, at a change of `FI` number (when the flight has one), and at the first fix seen at an airport. The end is then re-detected: `pos_observed` when that fix is within the airport radius and below the arrival / takeoff height (the same test as ADS-B detection); otherwise the 1.4.0 rescue re-runs on the longer track. |
+| `--pos-only-flights true` (F3) | off | POS fixes no ADS-B segment covers are cut into sessions (at a gap over `--pos-extend-max-gap-min`, a ground stop or an `FI` change) and each becomes a flight: `sources = POS`, `disposition = pos_only`. Fixes are never interpolated; `n_points_full` is the number of reports. |
+| `--pos-fleets mapped\|all` | `mapped` | `all` also builds POS-only flights for registrations not in the tail map, and reads every POS file (1.4.0 skips unmapped files by name). |
+| `--rotation-endpoints true` (F4) | off | An end not observed takes the neighbouring flight's observed end (next flight's origin for a destination, previous flight's destination for an origin) when the ground gap is 0 to `--rotation-max-gap-h` (18) hours and it differs from the flight's own observed other end. Ends with no other evidence may then chain from an inferred neighbour (`rotation_chained`). |
+| `--planned-legs A.csv [B.csv ...]` (F5) | none | Planned legs (OFP or schedule, columns below). Rule 1: same tail, `flight_digits` = the ACARS number, takeoff in `[sched_dep − 60 min, sched_dep + 8 h]`. Rule 2 (flights without a number): same tail, the window, and one observed end equal to the leg's. A match must be unique both ways (one candidate leg for the flight, no other flight with that leg as a candidate); `ambiguous = 1` rows never match. A matched leg fills ends that are not observed, fills `flight_number` when F1 found none, and writes `planned_leg_key`; it never overrides an observed end (a disagreement sets `endpoint_conflict`). Leg airports missing from the airport list are listed in the build log. |
+| `--recover-dropped true` (F9) | off | Segments 1.4.0 drops (`no_airport_match`, `invalid`) go through F2, F3's neighbours, F4 and F5 too; one that then has two airports and passes the 1.4.0 validity test is kept as `kept_recovered`, the rest stay dropped with their reason. |
+
+Planned-legs CSV (`tail` canonical: upper case, no hyphen; prefixes never matter, legs match on
+`flight_digits`):
+
+```
+leg_key,source,carrier_icao,flight_number,flight_digits,tail,orig,dest,sched_dep_utc,ofp_date,ambiguous
+2026-07-14_TAM3036_SBSP-SBCF_b2,ofp,TAM,TAM3036,3036,PRMAG,SBSP,SBCF,2026-07-14T11:00:00Z,2026-07-14,0
+```
+
+### 7.2 `orig_source` / `dest_source` and the evidence order
+
+The first that applies wins (request F8); every change is a `diagnostics` `evidence` row.
+
+| Order | Value | Meaning |
+|---|---|---|
+| 1 | `observed` | Seen at the airport by ADS-B (1.4.0 detection). |
+| 2 | `pos_observed` | Seen at the airport by a POS fix (F2 extension, or the end of a POS-only flight). |
+| 3 | `planned:<source>:fn` | Planned leg, rule 1 (flight number, tail, time). |
+| 4 | `rotation` | The aircraft's neighbouring flight's observed end (F4). |
+| 5 | `planned:<source>:tail` | Planned leg, rule 2 (tail, time, one observed end). |
+| 6 | `route_time`, `geometry`, `bearing_join` | The 1.4.0 rescue (route time + bearing + corridor; corridor geometry; an end reached across a Case-5 bearing join). |
+| 6 | `rotation_chained` | Rotation from a neighbour whose end is itself inferred; only for ends nothing else filled. |
+| – | `unresolved` | Nothing (only on dropped POS sessions; kept flights always have two ends). |
+
+`orig_free` / `dest_free` are the same order without rows 3 and 5. Use them, not `origin` /
+`dest`, whenever a planned-leg end would be counted as independent agreement with that same plan.
+
+### 7.3 `endpoint_confidence`
+
+Per end: `high` = `observed` or `planned:*:fn`; `medium` = `pos_observed`, `rotation` or
+`planned:*:tail`; `low` = row 6 sources, and any end whose rescue had more than one candidate
+airport (`*_candidates`). The flight's value is the lower of its two ends.
+
+### 7.4 Report
+
+With any switch on, the build writes `<gpkg stem>_evidence_report.md` next to the GeoPackage:
+flights by sources and disposition, endpoints by source and confidence, flight-number share and
+the learned prefix table, POS-only flights by registration prefix and month, F2 extensions and km
+gained, F9 recoveries per reason, and the **agreement table**: for flights matched to a planned
+leg on rule 1, how often `orig_free` / `dest_free` equal the leg, by the evidence that produced
+them (the accuracy of the plan-free logic), next to the same flights as 1.4.0 labelled them.
+`gpkg_summary.py` prints the same sections from the file.
