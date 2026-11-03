@@ -114,3 +114,15 @@ def test_report_counts_the_contradicted_1_4_0_guess(built):
     assert report["contradicted"] == {"total": 1, "free_now_agrees": 1}
     assert report["agreement_1_4_0"]["dest"]["route_time"] == [0, 1]
     assert report["agreement"]["dest"]["pos_observed"] == [3, 0]
+
+
+def test_gpkg_summary_v3_sections(built):
+    sys.path.insert(0, str(PROJECT_ROOT))
+    import gpkg_summary
+    text = gpkg_summary.summarize(str(built["gpkg"]))
+    assert "Endpoints by source (origin / dest):" in text
+    assert "  pos_observed" in text
+    assert "Endpoint confidence:" in text
+    assert "Flights with a flight number: 4 (100.0%)" in text
+    assert "POS-only flights by registration prefix:" in text and "  CC " in text
+    assert "Planned-leg agreement (rule 1, plan-free answer):" in text

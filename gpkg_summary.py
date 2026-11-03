@@ -25,6 +25,60 @@ def _pct(n: int, total: int) -> str:
     return f"{100.0 * n / total:.1f}%" if total else "-"
 
 
+def _evidence_sections(conn: sqlite3.Connection, meta: dict, n: int, w) -> None:
+    """flown_routes v3: endpoint provenance, confidence, flight numbers, POS-only flights
+    and (when the build ran the evidence stage) its report."""
+    w("")
+    w("Endpoints by source (origin / dest):")
+    o = dict(conn.execute("SELECT orig_source, count(*) FROM flights GROUP BY 1"))
+    d = dict(conn.execute("SELECT dest_source, count(*) FROM flights GROUP BY 1"))
+    for src in sorted(set(o) | set(d), key=lambda k: -(o.get(k, 0) + d.get(k, 0))):
+        w(f"  {src or '-':22s} {o.get(src, 0):8d} {d.get(src, 0):8d}")
+    w("Endpoint confidence:")
+    for c, k in conn.execute("SELECT endpoint_confidence, count(*) FROM flights GROUP BY 1 "
+                             "ORDER BY 2 DESC"):
+        w(f"  {c or '-':22s} {k:8d}  {_pct(k, n)}")
+    numbered = conn.execute("SELECT count(*) FROM flights WHERE flight_number IS NOT NULL"
+                            ).fetchone()[0]
+    w(f"Flights with a flight number: {numbered} ({_pct(numbered, n)})")
+    for src, k in conn.execute("SELECT flight_number_source, count(*) FROM flights WHERE "
+                               "flight_number IS NOT NULL GROUP BY 1 ORDER BY 2 DESC"):
+        w(f"  {src:22s} {k:8d}")
+    conflicts = conn.execute("SELECT count(*) FROM flights WHERE endpoint_conflict = 1"
+                             ).fetchone()[0]
+    planned = conn.execute("SELECT count(*) FROM flights WHERE planned_leg_key IS NOT NULL"
+                           ).fetchone()[0]
+    w(f"Endpoint conflicts: {conflicts}  matched to a planned leg: {planned} "
+      f"({_pct(planned, n)})")
+    rows = conn.execute("SELECT registration FROM flights WHERE disposition = 'pos_only'"
+                        ).fetchall()
+    if rows:
+        prefixes: dict = {}
+        for (reg,) in rows:
+            reg = (reg or "").upper()
+            p = reg.split("-")[0] if "-" in reg else (reg[:1] if reg.startswith("N") else reg[:2])
+            prefixes[p] = prefixes.get(p, 0) + 1
+        w(f"POS-only flights by registration prefix: {len(rows)} in total")
+        for p, k in sorted(prefixes.items(), key=lambda x: -x[1]):
+            w(f"  {p:22s} {k:8d}")
+    report = json.loads(meta.get("evidence_report") or "null")
+    if not report:
+        return
+    ext = report["extended"]
+    w(f"Extended by POS (F2): {ext['flights']} flights, {ext['origin']} origins "
+      f"(+{ext['before_km']:,.0f} km), {ext['dest']} destinations (+{ext['after_km']:,.0f} km), "
+      f"{ext['endpoints_changed']} endpoints changed")
+    w(f"Dropped segments recovered (F9): {report['recovered']}; still dropped: "
+      f"{report['still_dropped']}")
+    w("Planned-leg agreement (rule 1, plan-free answer):")
+    for end in ("origin", "dest"):
+        for src, (agree, disagree) in sorted(report["agreement"].get(end, {}).items(),
+                                            key=lambda x: -sum(x[1])):
+            w(f"  {end:6s} {src:22s} {agree + disagree:8d}  agree {_pct(agree, agree + disagree)}")
+    if report.get("contradicted"):
+        w(f"1.4.0 inferred ends the plan contradicts: {report['contradicted']}")
+
+
 def summarize(path: str, top: int = 25) -> str:
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     meta = dict(conn.execute("SELECT key, value FROM meta"))
@@ -81,6 +135,10 @@ def summarize(path: str, top: int = 25) -> str:
     for disp, k in conn.execute("SELECT disposition, count(*) FROM diagnostics "
                                 "WHERE phase = 'final' GROUP BY 1 ORDER BY 2 DESC"):
         w(f"  {disp or '-':20s} {k:8d}")
+
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(flights)")}
+    if "orig_source" in cols:
+        _evidence_sections(conn, meta, n, w)
 
     w("")
     w("Flights per month:")
