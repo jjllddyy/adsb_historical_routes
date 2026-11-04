@@ -275,6 +275,22 @@ records use the current `SPJC`. Add rows as new mismatches are found.
 | `--pos-color` | `ff00a5ff` | KML color (AABBGGRR) for ACARS-POS-sourced track portions (default orange). |
 | `--firehose-color` | `ff00ff00` | KML color (AABBGGRR) for firehose-sourced track portions (default green). |
 
+**Endpoint evidence** (v3, each optional and off by default; all off = the 1.4.0 output; see [docs/GEOPACKAGE.md §7](docs/GEOPACKAGE.md))
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--acars-identity` | `false` | F1: each flight gets the ACARS `FI` flight number of the POS reports in its window (`flights.flight_number`). Needs `--integrate-pos true`. |
+| `--pos-extend-ends` | `false` | F2: carry flight ends ADS-B did not see at an airport on with POS fixes, then re-detect them (`pos_observed`). |
+| `--pos-extend-max-gap-min` | `60` | Longest gap between POS fixes in an extension or a POS-only session. |
+| `--pos-only-flights` | `false` | F3: flights from airborne POS sessions no ADS-B segment covers (`disposition = pos_only`). |
+| `--pos-fleets` | `mapped` | `all` also builds POS-only flights for registrations not in `--tail-icao` (`aircraft_id` null). |
+| `--rotation-endpoints` | `false` | F4: an end not observed takes the aircraft's neighbouring flight's observed end. |
+| `--rotation-max-gap-h` | `18` | Longest ground gap for rotation. |
+| `--planned-legs CSV [CSV ...]` | *(none)* | F5: planned legs (OFP or schedule) confirm or fill ends and the flight number; never override an observed end. |
+| `--recover-dropped` | `false` | F9: try the new evidence on segments that would be dropped. |
+
+`--airports` accepts several files; a code in a later file replaces an earlier one.
+
 **Styling / display**
 
 | Parameter | Default | Description |
@@ -511,7 +527,7 @@ skipped (ground noise).
 placemarks; each `gx:coord` is `lon lat alt` (altitude in meters, preserved). Document title is the
 output filename stem + grouping mode (e.g. `lan_routes_2026_0601-0731_destination`).
 
-**Output GeoPackage** (`flown_routes` v2) — `flights` (one row per flight, sampled line),
+**Output GeoPackage** (`flown_routes` v3) — `flights` (one row per flight, sampled line, with each endpoint's source and confidence),
 `tracks_full` (every point, M = epoch seconds), both MULTILINESTRINGs split at the date line;
 optional `track_points`, `diagnostics`, `meta`. Opens directly in QGIS. Without re-running the
 builder you can rebuild the KML, build the QGIS project, or print a summary:

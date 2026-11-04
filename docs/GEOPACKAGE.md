@@ -109,7 +109,7 @@ This keeps QGIS (EPSG:3857 wraps longitudes) from drawing a crossing flight acro
 `track_points` is unchanged. The rule is the same as `company_route_extractor`'s
 `company_routes` v2. `gpkg_to_kml.py` reads v1 and v2; it rejoins the parts without the ±180
 vertices, so the KML is unchanged (byte-identical). Measured on 2026-10-30: 0 of 7,125 VIV flights
-and 0 of 51,345 LAN (LATAM Brasil) flights cross; the rule matters for VOI and long-haul fleets.
+and 0 of 51,345 LAN (LATAM Brasil) flights cross; the rule matters for VOI and long-haul fleets. The LAN v3 file (2026-11-03) has 122 crossing flights, all LATAM Chile POS-only flights over the Pacific.
 
 There are no gap-connector features: `--stitch-gaps` connectors are drawn only at KML export (§4.4).
 The altitude colour mode is also export-only (§4.6).

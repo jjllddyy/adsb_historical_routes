@@ -5,6 +5,28 @@ All notable changes to the Flight Route Splitter project will be documented in t
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-11-03 (endpoint-evidence branch)
+
+### Added
+
+- **Endpoint evidence** (request `docs/handoff/2026-11-03_endpoint_evidence_v3.md`), each switch optional and off by default:
+  - `--acars-identity` (F1): flight number from the ACARS `FI` of the POS reports in the flight's window; a second number sets `flight_number_conflict`.
+  - `--pos-extend-ends`, `--pos-extend-max-gap-min` (F2): carry ends ADS-B did not see at an airport on with POS, stopping at a speed jump, a gap, a ground stop, the neighbouring segment or an `FI` change; re-detect the end (`pos_observed`) or re-run the rescue on the longer track.
+  - `--pos-only-flights`, `--pos-fleets mapped|all` (F3): flights from POS sessions no ADS-B segment covers; `all` reads every POS file and includes registrations not in the tail map.
+  - `--rotation-endpoints`, `--rotation-max-gap-h` (F4): an end not observed takes the neighbouring flight's observed end; otherwise unfilled ends may chain (`rotation_chained`).
+  - `--planned-legs` (F5): match OFP / schedule legs on flight digits + tail + time (rule 1) or tail + time + one observed end (rule 2), uniquely both ways; fill ends that are not observed and the flight number; contradictions set `endpoint_conflict`. Leg airports missing from the airport list are warned about.
+  - `--recover-dropped` (F9): segments 1.4.0 drops are tried with the new evidence; recovered ones are `kept_recovered`.
+  - The evidence order (F8) per end, and `orig_free` / `dest_free`: the answer without planned legs.
+- `--airports` takes several files (F7); `input/lan_ofp_extra_airports.csv` (not committed) adds SGAS, SDSC, SCNT, LFBO, SBSJ, SPZO from `airport_lookup`.
+- `<gpkg stem>_evidence_report.md` next to the GeoPackage, and the same sections in `gpkg_summary.py`.
+- `tests/test_v3_equivalence.py`: with every switch off, the v2 columns, geometry, track points, diagnostics, meta and KML equal 1.4.0's (digests of the 1.4.0 output on the synthetic fixtures).
+- Handoff [`docs/handoff/direct_detect_flown_v3.md`](docs/handoff/direct_detect_flown_v3.md).
+
+### Changed
+
+- **`flown_routes` schema v3** (additive): `flights` gains `flight_number`, `flight_number_source`, `flight_number_conflict`, `orig_source`, `dest_source`, `orig_free`, `dest_free`, `orig_free_source`, `dest_free_source`, `orig_candidates`, `dest_candidates`, `endpoint_confidence`, `endpoint_conflict`, `planned_leg_key`, `n_pos_fixes`; `disposition` gains `kept_recovered` and `pos_only`; `aircraft_id` is null on POS-only flights of unmapped registrations. `diagnostics` gains `evidence` rows (`evidence_feature`, `evidence_source`, `endpoint`, `before_code`, `after_code`). The sources, candidates and confidence are filled in every build. `gpkg_to_kml.py` reads v1–v3.
+- The POS folder is listed with `os.scandir`; raw reports keep their `FI` number and registration.
+
 ## [1.4.0] - 2026-10-30 (gpkg-output branch)
 
 ### Added
