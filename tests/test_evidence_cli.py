@@ -126,3 +126,43 @@ def test_gpkg_summary_v3_sections(built):
     assert "Flights with a flight number: 4 (100.0%)" in text
     assert "POS-only flights by registration prefix:" in text and "  CC " in text
     assert "Planned-leg agreement (rule 1, plan-free answer):" in text
+
+
+def test_flightaware_identity_end_to_end(evidence_fixture, tmp_path):
+    # FlightAware fixes inside the truncated AAA->DDD flight name its destination
+    from datetime import datetime, timedelta, timezone
+    fh = tmp_path / "fa"
+    fh.mkdir()
+    t0 = datetime(2026, 10, 1, 10, 0, 0, tzinfo=timezone.utc)
+    for k, m in enumerate(range(2, 29, 3)):
+        (fh / f"XAAAA_{k:03d}.json").write_text(json.dumps({
+            "timestamp": str(int((t0 + timedelta(minutes=m, seconds=7)).timestamp())),
+            "icao": "ABC101", "reg": "XAAAA", "flight": "VIV1234", "orig": "AAA",
+            "dest": "DDD", "latitude": 0.0, "longitude": 6.0 * m / 72, "altitude": "30000",
+            "flight_id": "VIV1234-1790000000-airline-1p"}))
+    cmd = [sys.executable, str(SCRIPT), "--kml-folder", str(evidence_fixture["kml_dir"]),
+           "--airports", str(evidence_fixture["airports"]),
+           "--routes", str(evidence_fixture["routes"]), "--confidence", "permissive",
+           "--integrate-pos", "true", "--firehose-folder", str(fh),
+           "--flightaware-identity", "true", "--format", "gpkg",
+           "--output", str(tmp_path / "fa.gpkg")]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         universal_newlines=True, timeout=120)
+    assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-2000:]
+    conn = sqlite3.connect(str(tmp_path / "fa.gpkg"))
+    row = conn.execute("SELECT dest, dest_source, dest_free, flight_number, "
+                       "flight_number_source FROM flights WHERE flight_id = "
+                       "'ABC101_20261001T100000Z'").fetchone()
+    assert row == ("DDD", "flightaware", "BBB", "VIV1234", "flightaware")
+    report = json.loads(dict(conn.execute("SELECT key, value FROM meta"))["evidence_report"])
+    assert report["agreement_flightaware"]["dest"]["route_time"] == [0, 1]
+
+
+def test_flightaware_identity_needs_firehose(evidence_fixture, tmp_path):
+    cmd = [sys.executable, str(SCRIPT), "--kml-folder", str(evidence_fixture["kml_dir"]),
+           "--airports", str(evidence_fixture["airports"]),
+           "--routes", str(evidence_fixture["routes"]), "--flightaware-identity", "true",
+           "--output", str(tmp_path / "x.gpkg")]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         universal_newlines=True, timeout=60)
+    assert res.returncode == 1 and "--firehose-folder" in res.stdout

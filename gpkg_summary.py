@@ -75,6 +75,12 @@ def _evidence_sections(conn: sqlite3.Connection, meta: dict, n: int, w) -> None:
         for src, (agree, disagree) in sorted(report["agreement"].get(end, {}).items(),
                                             key=lambda x: -sum(x[1])):
             w(f"  {end:6s} {src:22s} {agree + disagree:8d}  agree {_pct(agree, agree + disagree)}")
+    if report.get("agreement_flightaware"):
+        w("FlightAware agreement (plan-free answer vs FlightAware's airport for the same fixes):")
+        for end in ("origin", "dest"):
+            for src, (agree, disagree) in sorted(report["agreement_flightaware"].get(end, {}).items(),
+                                                key=lambda x: -sum(x[1])):
+                w(f"  {end:6s} {src:22s} {agree + disagree:8d}  agree {_pct(agree, agree + disagree)}")
     if report.get("contradicted"):
         w(f"1.4.0 inferred ends the plan contradicts: {report['contradicted']}")
 

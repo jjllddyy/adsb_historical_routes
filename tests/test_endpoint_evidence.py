@@ -616,3 +616,93 @@ def test_report_follows_the_kept_flights(ahr, net):
     kept = [f for f in flights if f.takeoff_date_str == "2026-10-01"]
     again = ahr.build_evidence_report(kept, report["dropped_items"], "2026-10-01", "2026-10-01")
     assert again["pos_only"]["kept"] == 1 and again["pos_only"]["by_month"] == {"2026-10": 1}
+
+
+# ---- FlightAware identity: the FA flight whose fixes fall inside the flight --------
+
+def _fa_fix(ahr, t, lat, lon, fa_id="VIV2107-1790842198-airline-89p", flight="VIV2107",
+            orig="AAA", dest="DDD"):
+    p = ahr.TrackPoint(t.strftime("%Y-%m-%dT%H:%M:%SZ"), lon, lat, 10000.0, source="FIREHOSE")
+    p.fa_flight_id, p.flight_number, p.fa_orig, p.fa_dest = fa_id, flight, orig, dest
+    return p
+
+
+def test_firehose_loader_keeps_flightaware_identity(ahr, tmp_path):
+    import json
+    (tmp_path / "XAVXZ_033013_x.json").write_text(json.dumps({
+        "timestamp": "1791084560", "icao": "0D12AD", "reg": "XAVXZ", "flight": "VIV2107",
+        "orig": "MMVR", "dest": "MMUN", "latitude": 20.88, "longitude": -90.62,
+        "altitude": "36950", "flight_id": "VIV2107-1790842198-airline-89p"}))
+    (tp,) = next(iter(ahr.load_firehose_points(str(tmp_path)).values()))
+    assert (tp.fa_flight_id, tp.flight_number, tp.fa_orig, tp.fa_dest, tp.registration) == \
+        ("VIV2107-1790842198-airline-89p", "VIV2107", "MMVR", "MMUN", "XAVXZ")
+
+
+def test_flightaware_identity_majority_and_conflict(ahr, make_segment, net):
+    s = _seg(ahr, make_segment, net, T0, 60, (0, 0), (0, 5), orig="AAA")
+    fixes = [_fa_fix(ahr, T0 + timedelta(minutes=m), 0, m / 12) for m in (10, 20, 30)]
+    fixes.append(_fa_fix(ahr, T0 + timedelta(minutes=40), 0, 3.3, fa_id="other", flight="VIV9",
+                         orig="CCC", dest="BBB"))
+    fixes.append(_fa_fix(ahr, T0 + timedelta(minutes=90), 0, 5, fa_id="later"))  # after it
+    ahr.assign_flightaware_identity([s], {"ABC101": fixes})
+    assert s.fa_identity == ("VIV2107-1790842198-airline-89p", "VIV2107", "AAA", "DDD")
+    assert s.fa_conflict
+    assert (s.flight_number, s.flight_number_source) == ("VIV2107", "flightaware")
+
+
+def test_flightaware_placeholder_airports_are_ignored(ahr, make_segment, net):
+    s = _seg(ahr, make_segment, net, T0, 60, (0, 0), (0, 5), orig="AAA")
+    fixes = [_fa_fix(ahr, T0 + timedelta(minutes=m), 0, m / 12, dest="L 15.80283 -97.20202")
+             for m in (10, 20)]
+    ahr.assign_flightaware_identity([s], {"ABC101": fixes})
+    assert s.fa_identity[2:] == ("AAA", None)
+
+
+def _fa_ctx(ahr, net, **opts):
+    return ahr.EvidenceContext(net["airports"], net["routes"], ahr.PRESETS["permissive"],
+                               ahr.EvidenceOptions(flightaware_identity=True, **opts))
+
+
+def test_flightaware_fills_an_inferred_end(ahr, make_segment, net):
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    f1.fa_identity, f1.fa_conflict = ("fa1", "VIV2107", "AAA", "DDD"), False
+    ahr.resolve_endpoints([f1], _fa_ctx(ahr, net))
+    assert (f1.destination.code, f1.dest_source) == ("DDD", "flightaware")
+    assert f1.dest_free == ("BBB", "route_time")        # FlightAware is plan-derived
+    assert f1.evidence_changes[-1]["feature"] == "FA"
+    assert ahr.end_confidence("flightaware") == "high"
+
+
+def test_flightaware_never_overrides_an_observed_end(ahr, make_segment, net):
+    f1 = _observed(ahr, make_segment, net, T0, (0, 0), (0, 5), "AAA", "BBB", minutes=60)
+    f1.fa_identity, f1.fa_conflict = ("fa1", "VIV2107", "AAA", "DDD"), False
+    ahr.resolve_endpoints([f1], _fa_ctx(ahr, net))
+    assert (f1.destination.code, f1.dest_source) == ("BBB", "observed")
+    assert f1.endpoint_conflict
+
+
+def test_flightaware_airport_not_in_the_list_falls_through(ahr, make_segment, net):
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    f1.fa_identity, f1.fa_conflict = ("fa1", "VIV2107", "AAA", "ZZZ"), False
+    ahr.resolve_endpoints([f1], _fa_ctx(ahr, net))
+    assert (f1.destination.code, f1.dest_source) == ("BBB", "route_time")
+
+
+def test_flightaware_comes_before_rotation_and_plans(ahr, make_segment, net):
+    ctx = _fa_ctx(ahr, net, rotation_endpoints=True, planned_legs=["x"])
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    f1.flight_number, f1.flight_number_source = "JJ1234", "acars_fi"
+    f1.fa_identity, f1.fa_conflict = ("fa1", "VIV2107", "AAA", "DDD"), False
+    f2 = _observed(ahr, make_segment, net, T0 + timedelta(hours=2), (4, 2), (0, 0), "CCC", "AAA")
+    ahr.resolve_endpoints([f1, f2], ctx, _legs(_leg(ahr, "1234", "AAA", "BBB", T0)))
+    assert (f1.destination.code, f1.dest_source) == ("DDD", "flightaware")
+    assert f1.dest_free == ("CCC", "rotation")
+
+
+def test_flightaware_off_changes_nothing(ahr, make_segment, net):
+    f1 = _guessed_bbb(ahr, make_segment, net)
+    f1.fa_identity, f1.fa_conflict = ("fa1", "VIV2107", "AAA", "DDD"), False
+    ctx = ahr.EvidenceContext(net["airports"], net["routes"], ahr.PRESETS["permissive"],
+                              ahr.EvidenceOptions(rotation_endpoints=True))
+    ahr.resolve_endpoints([f1], ctx)
+    assert (f1.destination.code, f1.dest_source) == ("BBB", "route_time")

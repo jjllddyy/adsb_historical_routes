@@ -163,6 +163,10 @@ class TrackPoint:
     # (class defaults keep ADS-B points as small as before).
     flight_number: Optional[str] = None
     registration: Optional[str] = None
+    # FlightAware firehose fixes only: FA's flight id and its origin / destination airports.
+    fa_flight_id: Optional[str] = None
+    fa_orig: Optional[str] = None
+    fa_dest: Optional[str] = None
     
     def __repr__(self):
         return f"TrackPoint({self.timestamp}, {self.lat:.4f}, {self.lon:.4f}, {self.alt:.0f}m)"
@@ -797,7 +801,8 @@ def load_firehose_points(folder: str) -> Dict[Tuple[str, str], List["TrackPoint"
     """Parse ADS-B firehose files into {(hex, 'YYYY-MM-DD'): [TrackPoint(source='FIREHOSE')]}.
 
     Each file is one report with `icao` (hex), Unix `timestamp`, `latitude`, `longitude`,
-    and `altitude` (feet).
+    and `altitude` (feet). FlightAware reports may also carry `flight_id`, `flight` (or
+    `flight_number`), `orig`, `dest` and `reg`; they are kept on the TrackPoint.
     """
     idx: Dict[Tuple[str, str], List["TrackPoint"]] = defaultdict(list)
     if not folder or not os.path.isdir(folder):
@@ -817,6 +822,11 @@ def load_firehose_points(folder: str) -> Dict[Tuple[str, str], List["TrackPoint"
             tp = TrackPoint(dt.strftime("%Y-%m-%dT%H:%M:%SZ"), float(lon), float(lat), alt_m, source="FIREHOSE")
         except Exception:
             continue
+        tp.fa_flight_id = d.get("flight_id") or None
+        tp.flight_number = d.get("flight") or d.get("flight_number") or None
+        tp.fa_orig = d.get("orig") or None
+        tp.fa_dest = d.get("dest") or None
+        tp.registration = d.get("reg") or d.get("tail") or None
         idx[(hexc, dt.strftime("%Y-%m-%d"))].append(tp)
     return idx
 
@@ -1670,13 +1680,15 @@ _CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
 def end_confidence(source: Optional[str], candidates: Sequence[str] = ()) -> str:
     """``high`` / ``medium`` / ``low`` for one endpoint (request F6).
 
-    high: observed, or a planned leg matched on flight number (rule 1); medium: seen by
+    high: observed, FlightAware's airport for the fixes of this very flight, or a planned leg
+    matched on flight number (rule 1); medium: seen by
     POS, rotation from an observed neighbour, or a planned leg matched on tail and one
     observed end (rule 2); low: everything inferred (route time, geometry, bearing join,
     chained rotation), and any end a rescue had more than one airport to choose from.
     """
     src = source or "unresolved"
-    if src == "observed" or (src.startswith("planned:") and src.endswith(":fn")):
+    if src in ("observed", "flightaware") or (src.startswith("planned:")
+                                              and src.endswith(":fn")):
         level = "high"
     elif src in ("pos_observed", "rotation") or (src.startswith("planned:")
                                                 and src.endswith(":tail")):
@@ -1768,10 +1780,12 @@ class EvidenceOptions:
     rotation_max_gap_h: float = 18.0
     planned_legs: Sequence[str] = ()      # F5
     recover_dropped: bool = False         # F9
+    flightaware_identity: bool = False    # FlightAware orig / dest / flight of the fixes
 
     def any(self) -> bool:
         return bool(self.acars_identity or self.pos_extend_ends or self.pos_only_flights
-                    or self.rotation_endpoints or self.planned_legs or self.recover_dropped)
+                    or self.rotation_endpoints or self.planned_legs or self.recover_dropped
+                    or self.flightaware_identity)
 
 
 class EvidenceContext:
@@ -1821,6 +1835,53 @@ def note_change(seg: FlightSegment, feature: str, endpoint: str, before: Optiona
         seg.evidence_changes = []
     seg.evidence_changes.append({"feature": feature, "endpoint": endpoint, "before": before,
                                  "after": after, "source": source})
+
+
+_FA_AIRPORT_RE = re.compile(r"^[A-Z0-9]{3,4}$")
+
+
+def assign_flightaware_identity(segments: List[FlightSegment],
+                                fa_by_aircraft: Dict[str, List[TrackPoint]]) -> None:
+    """Give each flight the FlightAware flight whose fixes fall inside its time window.
+
+    ``fa_identity`` = (FA flight id, flight number, origin, destination) of the FA flight
+    with the most fixes in the window: its first valid ``orig`` and last valid ``dest`` (FA
+    updates the destination on a diversion). Placeholders such as ``L 15.80 -97.20`` are
+    not airports. A second FA flight in the window sets ``fa_conflict``. The FA number
+    becomes the flight number when ACARS gave none (``flight_number_source = flightaware``).
+    """
+    for seg in segments:
+        seg.fa_identity, seg.fa_conflict = None, False
+        fixes = fa_by_aircraft.get(seg.aircraft_id)
+        if not fixes or not seg.points:
+            continue
+        by_id: Dict[str, List[TrackPoint]] = {}
+        for p in _fixes_between(fixes, seg.points[0].datetime, seg.points[-1].datetime):
+            if p.fa_flight_id:
+                by_id.setdefault(p.fa_flight_id, []).append(p)
+        if not by_id:
+            continue
+        fa_id = max(by_id, key=lambda k: len(by_id[k]))   # first maximum = earliest seen
+        pts = by_id[fa_id]
+        orig = next((p.fa_orig for p in pts if _FA_AIRPORT_RE.match(p.fa_orig or "")), None)
+        dest = next((p.fa_dest for p in reversed(pts) if _FA_AIRPORT_RE.match(p.fa_dest or "")),
+                    None)
+        number = next((p.flight_number for p in pts if p.flight_number), None)
+        seg.fa_identity = (fa_id, number, orig, dest)
+        seg.fa_conflict = len(by_id) > 1
+        if number and not getattr(seg, "flight_number", None):
+            seg.flight_number, seg.flight_number_source = number, "flightaware"
+            seg.flight_number_conflict = getattr(seg, "flight_number_conflict", False)
+
+
+def index_fa_by_aircraft(*indexes: Dict[Tuple[str, str], List["TrackPoint"]]
+                         ) -> Dict[str, "FixSeries"]:
+    """{hex: FlightAware fixes (with an FA flight id) in time order} from (hex, date) indexes."""
+    by_key: Dict[str, List[TrackPoint]] = defaultdict(list)
+    for index in indexes:
+        for (key, _date), pts in index.items():
+            by_key[key].extend(p for p in pts if p.fa_flight_id)
+    return {k: FixSeries(sorted(v, key=lambda p: p.datetime)) for k, v in by_key.items()}
 
 
 # A gap longer than this that the aircraft crosses slower than GROUND_STOP_MAX_SPEED_KMH
@@ -2073,10 +2134,12 @@ def _resolve(flights: List[FlightSegment], ctx: EvidenceContext, use_planned: bo
              ) -> List[Dict[str, Optional[Tuple[Optional[str], str, List[str]]]]]:
     """Each end's (code, source, candidates) by the evidence order (request F8).
 
-    1 observed (ADS-B), 2 pos_observed, 3 planned rule 1, 4 rotation from an observed
-    neighbour, 5 planned rule 2, 6 the 1.4.0 rescue (route time, geometry, bearing join),
-    then rotation_chained from a neighbour whose end is itself inferred. Ends with nothing
-    are None. ``flights`` are one aircraft's, in time order.
+    1 observed (ADS-B), 2 pos_observed, then (with ``use_planned``) FlightAware's airport
+    for this flight's own fixes, 3 planned rule 1, 4 rotation from an observed neighbour,
+    5 planned rule 2, 6 the 1.4.0 rescue (route time, geometry, bearing join), then
+    rotation_chained from a neighbour whose end is itself inferred. Ends with nothing are
+    None. ``flights`` are one aircraft's, in time order. ``use_planned`` False gives the
+    plan-free answer (``*_free``): FlightAware's airports come from the filed plan too.
     """
     rotation = ctx.options.rotation_endpoints
     max_gap = ctx.options.rotation_max_gap_h
@@ -2096,6 +2159,13 @@ def _resolve(flights: List[FlightSegment], ctx: EvidenceContext, use_planned: bo
             code, src, cands = _end_code(f, end), _end_source(f, end), _end_candidates(f, end)
             if src in OBSERVED_SOURCES:
                 ends[end] = (code, src, cands)
+                continue
+            fa = getattr(f, "fa_identity", None) if use_planned else None
+            fa_end = (fa[2] if end == "origin" else fa[3]) if fa else None
+            if fa_end in ctx.airports_dict and fa_end != (
+                    _end_code(f, other[end]) if _end_source(f, other[end]) in OBSERVED_SOURCES
+                    else None):
+                ends[end] = (fa_end, "flightaware", cands)
                 continue
             leg_end = None
             if use_planned and f.planned_leg is not None:
@@ -2173,12 +2243,16 @@ def resolve_endpoints(flights: List[FlightSegment], ctx: EvidenceContext,
         f.planned_leg_key = None
         if not hasattr(f, "flight_number"):
             f.flight_number, f.flight_number_source, f.flight_number_conflict = None, None, False
-    use_planned = bool(ctx.options.planned_legs and legs_by_tail)
-    if use_planned:
+    use_legs = bool(ctx.options.planned_legs and legs_by_tail)
+    use_planned = use_legs or ctx.options.flightaware_identity
+    if use_legs:
         match_planned_legs(flights, legs_by_tail)
     else:
         for f in flights:
             f.planned_leg, f.planned_rule = None, None
+    if not ctx.options.flightaware_identity:
+        for f in flights:
+            f.fa_identity = None
     free = _resolve(flights, ctx, use_planned=False)
     final = _resolve(flights, ctx, use_planned=True) if use_planned else free
     for i, f in enumerate(flights):
@@ -2193,10 +2267,18 @@ def resolve_endpoints(flights: List[FlightSegment], ctx: EvidenceContext,
             setattr(f, attr, ctx.airports_dict.get(code) if code else None)
             setattr(f, skey + "_source", src)
             setattr(f, skey + "_candidates", cands)
-            if src and (src.startswith("rotation") or src.startswith("planned:")):
-                note_change(f, "F4" if src.startswith("rotation") else "F5", end, before,
-                            code, src)
+            if src and (src.startswith("rotation") or src.startswith("planned:")
+                        or src == "flightaware"):
+                feature = ("F4" if src.startswith("rotation") else
+                           "FA" if src == "flightaware" else "F5")
+                note_change(f, feature, end, before, code, src)
         f.is_complete = f.origin is not None and f.destination is not None
+        fa = getattr(f, "fa_identity", None)
+        if fa is not None:
+            for end, fa_code in (("origin", fa[2]), ("dest", fa[3])):
+                if (fa_code in ctx.airports_dict and _end_source(f, end) in OBSERVED_SOURCES
+                        and _end_code(f, end) != fa_code):
+                    f.endpoint_conflict = True
         leg = f.planned_leg
         if leg is not None:
             f.planned_leg_key = leg.leg_key
@@ -2301,6 +2383,8 @@ def _new_report() -> Dict[str, Any]:
             "prefix_table": defaultdict(lambda: defaultdict(int)),
             "agreement": defaultdict(lambda: defaultdict(lambda: [0, 0])),
             "agreement_1_4_0": defaultdict(lambda: defaultdict(lambda: [0, 0])),
+            "agreement_flightaware": defaultdict(lambda: defaultdict(lambda: [0, 0])),
+            "agreement_flightaware_1_4_0": defaultdict(lambda: defaultdict(lambda: [0, 0])),
             "contradicted": defaultdict(int)}
 
 
@@ -2323,7 +2407,8 @@ def run_endpoint_evidence(kept_by_aircraft: Dict[str, List[FlightSegment]],
                           ctx: EvidenceContext, mapped: Set[str],
                           registrations: Dict[str, str],
                           legs_by_tail: Optional[Dict[str, List[PlannedLeg]]] = None,
-                          recorder: Optional["DiagnosticsRecorder"] = None
+                          recorder: Optional["DiagnosticsRecorder"] = None,
+                          fa_by_aircraft: Optional[Dict[str, List[TrackPoint]]] = None,
                           ) -> Tuple[List[FlightSegment], Dict[str, Any]]:
     """The evidence stage, per aircraft (hex, else registration), after 1.4.0's combine.
 
@@ -2374,6 +2459,9 @@ def run_endpoint_evidence(kept_by_aircraft: Dict[str, List[FlightSegment]],
         flights = kept + [s for s, _ in recovering] + pos_only
         if opts.acars_identity:
             assign_flight_numbers(flights, {key: fixes})
+        if opts.flightaware_identity:
+            fa = (fa_by_aircraft or {}).get(key)
+            assign_flightaware_identity(flights, {key: fa} if fa else {})
         resolve_endpoints(flights, ctx, legs_by_tail)
 
         for s in kept:
@@ -2444,6 +2532,18 @@ def build_evidence_report(flights: List[FlightSegment],
             po["by_month"][f.takeoff_date_str[:7]] += 1
             po["spacing_min"].extend((q.datetime - p.datetime).total_seconds() / 60.0
                                      for p, q in zip(f.points, f.points[1:]))
+        fa = getattr(f, "fa_identity", None)
+        if fa is not None:
+            snap = getattr(f, "ends_1_4_0", None)
+            for k, (end, fa_code) in enumerate((("origin", fa[2]), ("dest", fa[3]))):
+                if not fa_code:
+                    continue
+                code, src = f.orig_free if end == "origin" else f.dest_free
+                report["agreement_flightaware"][end][src][0 if code == fa_code else 1] += 1
+                if snap is not None:
+                    old = snap[k].code if snap[k] else None
+                    report["agreement_flightaware_1_4_0"][end][snap[2 + k] or "unresolved"][
+                        0 if old == fa_code else 1] += 1
         leg = getattr(f, "planned_leg", None)
         if leg is None or f.planned_rule != 1:
             continue
@@ -2476,8 +2576,11 @@ def build_evidence_report(flights: List[FlightSegment],
 
 
 def validate_evidence_options(opts: EvidenceOptions, integrate_pos: bool,
-                              pos_folder: Optional[str]) -> Optional[str]:
+                              pos_folder: Optional[str],
+                              firehose_folder: Optional[str] = None) -> Optional[str]:
     """An error message for evidence switches that cannot work as given, else None."""
+    if opts.flightaware_identity and not (integrate_pos and firehose_folder):
+        return "--flightaware-identity needs --integrate-pos true and --firehose-folder"
     needs_pos = [name for name, on in (("--acars-identity", opts.acars_identity),
                                        ("--pos-extend-ends", opts.pos_extend_ends),
                                        ("--pos-only-flights", opts.pos_only_flights)) if on]
@@ -2499,7 +2602,8 @@ def evidence_options_meta(opts: EvidenceOptions) -> Dict[str, Any]:
             "rotation_endpoints": opts.rotation_endpoints,
             "rotation_max_gap_h": opts.rotation_max_gap_h,
             "planned_legs": [os.path.basename(x) for x in opts.planned_legs],
-            "recover_dropped": opts.recover_dropped}
+            "recover_dropped": opts.recover_dropped,
+            "flightaware_identity": opts.flightaware_identity}
 
 
 def endpoint_counts_meta(flights: List[FlightSegment]) -> Dict[str, str]:
@@ -2573,10 +2677,14 @@ def run_evidence_stage(opts: EvidenceOptions,
     for seg in all_segments:
         registrations[seg.aircraft_id] = seg.registration
     pos_by_aircraft = index_pos_by_aircraft(pos_index, unmapped_pos)
+    fa_by_aircraft = index_fa_by_aircraft(pos_index) if opts.flightaware_identity else None
+    if fa_by_aircraft is not None:
+        print(f"  FlightAware fixes with a flight id: "
+              f"{sum(len(v) for v in fa_by_aircraft.values())} for {len(fa_by_aircraft)} aircraft")
     t0 = time.time()
     flights, report = run_endpoint_evidence(kept_by_aircraft, dropped_by_aircraft,
                                             pos_by_aircraft, ctx, mapped, registrations,
-                                            legs_by_tail, recorder)
+                                            legs_by_tail, recorder, fa_by_aircraft)
     if recorder is not None:
         for f in flights:
             for change in getattr(f, "evidence_changes", []):
@@ -2686,6 +2794,22 @@ def evidence_report_markdown(gpkg_path: str, opts: EvidenceOptions, meta: Dict[s
               f"plan-free evidence now agrees with the plan on {c.get('free_now_agrees', 0)}, "
               f"changes but still differs on {c.get('free_changed_still_differs', 0)}, "
               f"leaves {c.get('unchanged', 0)} unchanged."]
+    for key, title in (("agreement_flightaware", "Agreement with FlightAware (flights with "
+                        "FlightAware fixes in their window)"),
+                       ("agreement_flightaware_1_4_0", "The same ADS-B flights as 1.4.0 "
+                        "labelled them, against FlightAware")):
+        rows = []
+        for end in ("origin", "dest"):
+            for src, (agree, disagree) in sorted(report.get(key, {}).get(end, {}).items(),
+                                                key=lambda x: -sum(x[1])):
+                n = agree + disagree
+                rows.append((end, src, n, agree, f"{100.0 * agree / n:.1f}%" if n else "-"))
+        if rows:
+            w += ["", f"## {title}", ""]
+            if key == "agreement_flightaware":
+                w += ["How often the plan-free answer (`orig_free` / `dest_free`) equals the "
+                      "airport FlightAware gives for the same flight's fixes.", ""]
+            w += _md_table(["end", "source", "flights", "agree", "agree %"], rows)
     if meta.get("planned_legs"):
         w += ["", "## Planned-leg files", ""]
         w += _md_table(["file", "legs", "from", "to"],
@@ -4168,6 +4292,11 @@ def main():
                     metavar='CSV',
                     help='F5: planned-leg CSV(s) (OFP or schedule; see docs/GEOPACKAGE.md) '
                          'used to confirm or fill endpoints and the flight number')
+    ev.add_argument('--flightaware-identity', choices=['true', 'false'], default='false',
+                    dest='flightaware_identity',
+                    help='Use the FlightAware flight (orig, dest, flight number) of the firehose '
+                         'fixes inside each flight for ends not observed (needs --integrate-pos '
+                         'true and --firehose-folder with FlightAware reports)')
     ev.add_argument('--recover-dropped', choices=['true', 'false'], default='false',
                     dest='recover_dropped',
                     help='F9: try the new evidence on segments 1.4.0 drops before dropping them')
@@ -4250,8 +4379,10 @@ def main():
         rotation_endpoints=args.rotation_endpoints == 'true',
         rotation_max_gap_h=args.rotation_max_gap_h,
         planned_legs=tuple(args.planned_legs or ()),
-        recover_dropped=args.recover_dropped == 'true')
-    evidence_error = validate_evidence_options(evidence, integrate_pos, args.pos_folder)
+        recover_dropped=args.recover_dropped == 'true',
+        flightaware_identity=args.flightaware_identity == 'true')
+    evidence_error = validate_evidence_options(evidence, integrate_pos, args.pos_folder,
+                                               args.firehose_folder)
     if evidence_error:
         print(f"Error: {evidence_error}")
         sys.exit(1)
