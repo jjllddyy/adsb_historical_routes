@@ -98,6 +98,9 @@ def test_join_carries_end_sources(ahr, make_segment, net):
     ("bearing_join", "observed", [], [], "low"),
     ("observed", "rotation_chained", [], [], "low"),
     ("observed", "rotation", [], ["BBB", "DDD"], "low"),   # more than one candidate
+    # an end confirmed by high evidence stays high whatever an earlier rescue weighed
+    ("observed", "planned:ofp:fn", [], ["BBB", "DDD"], "high"),
+    ("flightaware", "observed", ["AAA", "CCC"], [], "high"),
 ])
 def test_endpoint_confidence(ahr, osrc, dsrc, ocand, dcand, expect):
     assert ahr.endpoint_confidence(osrc, dsrc, ocand, dcand) == expect

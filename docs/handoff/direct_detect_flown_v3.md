@@ -56,7 +56,7 @@ The new LAN file is `/Volumes/jy-ext/route_gpkg/lan/2026_0714-0930_v3.gpkg`. The
 | `route_time`, `geometry`, `bearing_join` | The 1.4.0 rescue. | low |
 | `rotation_chained` | Rotation from a neighbour whose end is itself inferred. | low |
 
-An end whose rescue had more than one candidate is `low` whatever its source. A leg match is used
+An end whose rescue had more than one candidate is `low` unless its source is a `high` one. A leg match is used
 only when it is unique both ways: one candidate leg for the flight, and no other flight with that
 leg as a candidate. `ambiguous = 1` rows never match. A planned end never replaces an observed one.
 

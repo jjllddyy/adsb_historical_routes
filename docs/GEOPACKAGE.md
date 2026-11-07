@@ -264,8 +264,8 @@ The first that applies wins (request F8); every change is a `diagnostics` `evide
 ### 7.3 `endpoint_confidence`
 
 Per end: `high` = `observed`, `flightaware` or `planned:*:fn`; `medium` = `pos_observed`, `rotation` or
-`planned:*:tail`; `low` = row 6 sources, and any end whose rescue had more than one candidate
-airport (`*_candidates`). The flight's value is the lower of its two ends.
+`planned:*:tail`; `low` = row 6 sources, and any `medium` end whose rescue had more than one candidate
+airport (`*_candidates`); a `high` end stays high. The flight's value is the lower of its two ends.
 
 ### 7.4 Report
 

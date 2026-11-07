@@ -1684,7 +1684,8 @@ def end_confidence(source: Optional[str], candidates: Sequence[str] = ()) -> str
     matched on flight number (rule 1); medium: seen by
     POS, rotation from an observed neighbour, or a planned leg matched on tail and one
     observed end (rule 2); low: everything inferred (route time, geometry, bearing join,
-    chained rotation), and any end a rescue had more than one airport to choose from.
+    chained rotation), and any end a rescue had more than one airport to choose from
+    unless high evidence (observed, FlightAware, rule 1) decided it.
     """
     src = source or "unresolved"
     if src in ("observed", "flightaware") or (src.startswith("planned:")
@@ -1695,8 +1696,8 @@ def end_confidence(source: Optional[str], candidates: Sequence[str] = ()) -> str
         level = "medium"
     else:
         level = "low"
-    if len(candidates) > 1:
-        level = "low"
+    if len(candidates) > 1 and level != "high":
+        level = "low"    # the rescue had a choice; high evidence settled it independently
     return level
 
 
