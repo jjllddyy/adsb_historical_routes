@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `--flightaware-identity` (2026-11-07): for FlightAware firehose reports, each flight takes the FA flight with the most fixes in its window; its `orig` / `dest` fill ends that are not observed (`*_source = flightaware`, high confidence, after the observed ends and before planned legs and rotation; excluded from `*_free`), and its number fills `flight_number` (`flightaware`). The firehose loader keeps `flight_id`, `flight`, `orig`, `dest` and `reg` per fix. The evidence report adds agreement tables against FlightAware.
+
 - **Endpoint evidence** (request `docs/handoff/2026-11-03_endpoint_evidence_v3.md`), each switch optional and off by default:
   - `--acars-identity` (F1): flight number from the ACARS `FI` of the POS reports in the flight's window; a second number sets `flight_number_conflict`.
   - `--pos-extend-ends`, `--pos-extend-max-gap-min` (F2): carry ends ADS-B did not see at an airport on with POS, stopping at a speed jump, a gap, a ground stop, the neighbouring segment or an `FI` change; re-detect the end (`pos_observed`) or re-run the rescue on the longer track.

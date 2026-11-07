@@ -1848,7 +1848,8 @@ def assign_flightaware_identity(segments: List[FlightSegment],
     with the most fixes in the window: its first valid ``orig`` and last valid ``dest`` (FA
     updates the destination on a diversion). Placeholders such as ``L 15.80 -97.20`` are
     not airports. A second FA flight in the window sets ``fa_conflict``. The FA number
-    becomes the flight number when ACARS gave none (``flight_number_source = flightaware``).
+    becomes the flight number when ACARS gave none (``flight_number_source = flightaware``);
+    FA flights with different numbers in one window then set ``flight_number_conflict``.
     """
     for seg in segments:
         seg.fa_identity, seg.fa_conflict = None, False
@@ -1869,9 +1870,12 @@ def assign_flightaware_identity(segments: List[FlightSegment],
         number = next((p.flight_number for p in pts if p.flight_number), None)
         seg.fa_identity = (fa_id, number, orig, dest)
         seg.fa_conflict = len(by_id) > 1
+        numbers = {next((p.flight_number for p in v if p.flight_number), None)
+                   for v in by_id.values()} - {None}
         if number and not getattr(seg, "flight_number", None):
             seg.flight_number, seg.flight_number_source = number, "flightaware"
-            seg.flight_number_conflict = getattr(seg, "flight_number_conflict", False)
+            # two FA flights with different numbers in one window: a probable mis-join
+            seg.flight_number_conflict = len(numbers) > 1
 
 
 def index_fa_by_aircraft(*indexes: Dict[Tuple[str, str], List["TrackPoint"]]

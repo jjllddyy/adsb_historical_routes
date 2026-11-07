@@ -648,6 +648,15 @@ def test_flightaware_identity_majority_and_conflict(ahr, make_segment, net):
     assert s.fa_identity == ("VIV2107-1790842198-airline-89p", "VIV2107", "AAA", "DDD")
     assert s.fa_conflict
     assert (s.flight_number, s.flight_number_source) == ("VIV2107", "flightaware")
+    assert s.flight_number_conflict          # VIV2107 and VIV9 in one window
+
+
+def test_two_flightaware_ids_with_one_number_are_no_number_conflict(ahr, make_segment, net):
+    s = _seg(ahr, make_segment, net, T0, 60, (0, 0), (0, 5), orig="AAA")
+    fixes = [_fa_fix(ahr, T0 + timedelta(minutes=m), 0, m / 12) for m in (10, 20, 30)]
+    fixes.append(_fa_fix(ahr, T0 + timedelta(minutes=40), 0, 3.3, fa_id="refiled"))
+    ahr.assign_flightaware_identity([s], {"ABC101": fixes})
+    assert s.fa_conflict and not s.flight_number_conflict
 
 
 def test_flightaware_placeholder_airports_are_ignored(ahr, make_segment, net):

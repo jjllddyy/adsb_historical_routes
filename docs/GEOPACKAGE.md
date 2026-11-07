@@ -71,7 +71,7 @@ copied onto every child table, so no filter ever needs a join.
 | `source_file`, `preset` | |
 | `style_color`, `style_width`, `style_opacity` | The input KML's style, so the KML can be reproduced. The viewer ignores them. |
 | `od_gc_km`, `od_distance_ratio`, `suspect_od` | Great circle between the labelled airports; flown ÷ great circle; ratio > `--suspect-od-ratio` (§3). |
-| **v3:** `flight_number`, `flight_number_source`, `flight_number_conflict` | The ACARS `FI` number (`acars_fi`) or the planned leg's (`planned:<source>`); null without either. `flight_number_conflict = 1`: POS reports with two different numbers fell inside the flight (majority kept). |
+| **v3:** `flight_number`, `flight_number_source`, `flight_number_conflict` | The ACARS `FI` number (`acars_fi`), FlightAware's (`flightaware`) or the planned leg's (`planned:<source>`); null without any. `flight_number_conflict = 1`: reports with two different numbers fell inside the flight (majority kept). |
 | **v3:** `orig_source`, `dest_source` | Where each end came from (§7.2). |
 | **v3:** `orig_free`, `dest_free`, `orig_free_source`, `dest_free_source` | The end the builder gives **without** planned legs, and its source. Equal to `origin` / `dest` unless a planned leg changed the end. |
 | **v3:** `orig_candidates`, `dest_candidates` | `\|`-separated airports a route-time / geometry rescue accepted for that end, best first; null when no rescue ran on it. |
@@ -231,6 +231,7 @@ flight number or a planned leg**: their absence never drops, splits or downgrade
 | `--pos-fleets mapped\|all` | `mapped` | `all` also builds POS-only flights for registrations not in the tail map, and reads every POS file (1.4.0 skips unmapped files by name). |
 | `--rotation-endpoints true` (F4) | off | An end not observed takes the neighbouring flight's observed end (next flight's origin for a destination, previous flight's destination for an origin) when the ground gap is 0 to `--rotation-max-gap-h` (18) hours and it differs from the flight's own observed other end. Ends with no other evidence may then chain from an inferred neighbour (`rotation_chained`). |
 | `--planned-legs A.csv [B.csv ...]` (F5) | none | Planned legs (OFP or schedule, columns below). Rule 1: same tail, `flight_digits` = the ACARS number, takeoff in `[sched_dep − 60 min, sched_dep + 8 h]`. Rule 2 (flights without a number): same tail, the window, and one observed end equal to the leg's. A match must be unique both ways (one candidate leg for the flight, no other flight with that leg as a candidate); `ambiguous = 1` rows never match. A matched leg fills ends that are not observed, fills `flight_number` when F1 found none, and writes `planned_leg_key`; it never overrides an observed end (a disagreement sets `endpoint_conflict`). Leg airports missing from the airport list are listed in the build log. |
+| `--flightaware-identity true` | off | For a firehose folder of FlightAware reports (`flight_id`, `flight`, `orig`, `dest`, `reg` per fix): each flight takes the FlightAware flight with the most fixes inside its own time window (same hex). Its first valid `orig` and last valid `dest` (FA updates the destination on a diversion) fill ends that are not observed; placeholders such as `L 15.80 -97.20` and airports missing from the list are skipped. Its number fills `flight_number` when ACARS gave none (`flight_number_source = flightaware`). A second FA flight in the window is noted; a disagreement with an observed end sets `endpoint_conflict`. Needs `--integrate-pos true --firehose-folder`. |
 | `--recover-dropped true` (F9) | off | Segments 1.4.0 drops (`no_airport_match`, `invalid`) go through F2, F3's neighbours, F4 and F5 too; one that then has two airports and passes the 1.4.0 validity test is kept as `kept_recovered`, the rest stay dropped with their reason. |
 
 Planned-legs CSV (`tail` canonical: upper case, no hyphen; prefixes never matter, legs match on
@@ -249,6 +250,7 @@ The first that applies wins (request F8); every change is a `diagnostics` `evide
 |---|---|---|
 | 1 | `observed` | Seen at the airport by ADS-B (1.4.0 detection). |
 | 2 | `pos_observed` | Seen at the airport by a POS fix (F2 extension, or the end of a POS-only flight). |
+| 2a | `flightaware` | FlightAware's `orig` / `dest` for the FA flight whose fixes are inside this flight (`--flightaware-identity`). Comes from the filed flight plan, so it is excluded from `*_free`. |
 | 3 | `planned:<source>:fn` | Planned leg, rule 1 (flight number, tail, time). |
 | 4 | `rotation` | The aircraft's neighbouring flight's observed end (F4). |
 | 5 | `planned:<source>:tail` | Planned leg, rule 2 (tail, time, one observed end). |
@@ -256,12 +258,12 @@ The first that applies wins (request F8); every change is a `diagnostics` `evide
 | 6 | `rotation_chained` | Rotation from a neighbour whose end is itself inferred; only for ends nothing else filled. |
 | – | `unresolved` | Nothing (only on dropped POS sessions; kept flights always have two ends). |
 
-`orig_free` / `dest_free` are the same order without rows 3 and 5. Use them, not `origin` /
+`orig_free` / `dest_free` are the same order without rows 2a, 3 and 5. Use them, not `origin` /
 `dest`, whenever a planned-leg end would be counted as independent agreement with that same plan.
 
 ### 7.3 `endpoint_confidence`
 
-Per end: `high` = `observed` or `planned:*:fn`; `medium` = `pos_observed`, `rotation` or
+Per end: `high` = `observed`, `flightaware` or `planned:*:fn`; `medium` = `pos_observed`, `rotation` or
 `planned:*:tail`; `low` = row 6 sources, and any end whose rescue had more than one candidate
 airport (`*_candidates`). The flight's value is the lower of its two ends.
 
@@ -273,4 +275,5 @@ the learned prefix table, POS-only flights by registration prefix and month, F2 
 gained, F9 recoveries per reason, and the **agreement table**: for flights matched to a planned
 leg on rule 1, how often `orig_free` / `dest_free` equal the leg, by the evidence that produced
 them (the accuracy of the plan-free logic), next to the same flights as 1.4.0 labelled them.
+With `--flightaware-identity` the same tables are written against FlightAware's airports.
 `gpkg_summary.py` prints the same sections from the file.

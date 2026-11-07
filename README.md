@@ -288,6 +288,7 @@ records use the current `SPJC`. Add rows as new mismatches are found.
 | `--rotation-max-gap-h` | `18` | Longest ground gap for rotation. |
 | `--planned-legs CSV [CSV ...]` | *(none)* | F5: planned legs (OFP or schedule) confirm or fill ends and the flight number; never override an observed end. |
 | `--recover-dropped` | `false` | F9: try the new evidence on segments that would be dropped. |
+| `--flightaware-identity` | `false` | Use the FlightAware flight (`orig`, `dest`, flight number) of the firehose fixes inside each flight for ends not observed. Needs `--integrate-pos true --firehose-folder`. |
 
 `--airports` accepts several files; a code in a later file replaces an earlier one.
 

@@ -49,6 +49,7 @@ The new LAN file is `/Volumes/jy-ext/route_gpkg/lan/2026_0714-0930_v3.gpkg`. The
 |---|---|---|
 | `observed` | ADS-B saw the aircraft at the airport (1.4.0 detection). | high |
 | `pos_observed` | A POS fix at the airport (within the airport radius and below the arrival / takeoff height). | medium |
+| `flightaware` | FlightAware's `orig` / `dest` for the FA flight whose fixes are inside this flight (VIV; `--flightaware-identity`). Plan-derived, so excluded from `*_free`. | high |
 | `planned:<src>:fn` | Your leg, rule 1: `flight_digits` = the ACARS number, same tail, takeoff in `[sched_dep − 60 min, sched_dep + 8 h]`. | high |
 | `rotation` | The aircraft's next flight's observed origin (for a destination) or previous flight's observed destination (for an origin), ground gap 0–18 h. | medium |
 | `planned:<src>:tail` | Your leg, rule 2: same tail, the window, and one observed end equal to the leg's (flights without a number). | medium |
