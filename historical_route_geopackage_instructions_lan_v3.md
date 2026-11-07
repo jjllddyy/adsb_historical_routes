@@ -21,6 +21,13 @@ Every path, file and command needed to reproduce it is below.
   - With `--pos-fleets all`, the other LATAM fleets in the POS feed (CC-, HC-, N-) get POS-only
     flights.
   - Everything is recorded under the airline code `LAN`.
+- **v3.1 (2026-11-07):** `2026_0714-0930_v3.1.gpkg` is the same build, made with commit
+  `15d53d9` or later. The only difference is `endpoint_confidence`: an end confirmed by high
+  evidence (observed, FlightAware, or the OFP on flight number) is no longer demoted to `low`
+  because an earlier rescue weighed several airports. 4,136 flights move from low to high; every
+  other column and row is identical. Use v3.1. To build it, run §6 with
+  `--output $OUT/2026_0714-0930_v3.1.gpkg`; its files carry the `_v3.1` stem. The v3 file stays
+  as it was.
 - **The 1.4.0 guide** ([`historical_route_geopackage_instructions_lan.md`](historical_route_geopackage_instructions_lan.md))
   and its file `2026_0714-0930.gpkg` stay as they are. That file is direct_detect's baseline:
   never overwrite it.
@@ -668,7 +675,8 @@ file `2026_0714-0930.gpkg` built from the same traces and POS:
 | `planned:ofp:tail` | 328 | 299 |
 | `bearing_join` | 0 | 24 |
 
-`endpoint_confidence`: high 40,182 (41.4%), medium 39,692 (40.9%), low 17,246 (17.8%).
+`endpoint_confidence`: high 40,182 (41.4%), medium 39,692 (40.9%), low 17,246 (17.8%) in v3.
+In **v3.1**: high 44,318 (45.6%), medium 39,692 (40.9%), low 13,110 (13.5%).
 `endpoint_conflict`: 285 flights. 62,883 flights (64.7%) matched a planned leg.
 
 **Flight numbers:** 95,153 flights (98.0%) have one, 93,422 from ACARS `FI` and 1,731 from the
