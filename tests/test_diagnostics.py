@@ -55,6 +55,9 @@ class TestDiagnosticsRecorder:
                 "nearest_airport_start_code", "nearest_airport_start_km",
                 "nearest_airport_end_code", "nearest_airport_end_km",
                 "disposition", "drop_reason", "joined_with_segment_idx", "rescue_method",
+                "flight_id", "od_gc_km", "od_distance_ratio", "suspect_od",
+                # v3: endpoint-evidence change rows (empty on other rows)
+                "evidence_feature", "evidence_source", "endpoint", "before_code", "after_code",
             }
             assert set(reader.fieldnames) == expected
 

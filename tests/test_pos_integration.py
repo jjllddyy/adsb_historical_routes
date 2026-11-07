@@ -57,7 +57,7 @@ def test_load_firehose_points_uses_icao_and_unix_ts(ahr, tmp_path):
 def test_merge_keeps_adsb_and_fills_gaps(ahr, make_track_point, utc):
     adsb = [make_track_point(utc + timedelta(minutes=i), 0.0, i * 0.1, 10000.0) for i in range(3)]
     # one extra fix inside the (later) gap, one nearly coincident with an ADS-B fix
-    gap_fill = make_track_point(utc + timedelta(minutes=20), 0.0, 5.0, 11000.0)
+    gap_fill = make_track_point(utc + timedelta(minutes=20), 0.0, 2.0, 11000.0)  # ~670 km/h
     gap_fill.source = "POS"
     dup = make_track_point(utc + timedelta(seconds=5), 0.0, 0.0, 10000.0)
     dup.source = "POS"
@@ -66,6 +66,49 @@ def test_merge_keeps_adsb_and_fills_gaps(ahr, make_track_point, utc):
     assert sources.count("POS") == 1               # near-duplicate dropped, gap-fill kept
     assert "POS" in sources and "ADSB" in sources
     assert merged == sorted(merged, key=lambda p: p.datetime)  # chronological
+
+
+def _pos(make_track_point, t, lat, lon):
+    p = make_track_point(t, lat, lon, 11000.0)
+    p.source = "POS"
+    return p
+
+
+def test_merge_drops_repeated_reports(ahr, make_track_point, utc):
+    # The LATAM feed delivers each report twice (two ground addresses).
+    adsb = [make_track_point(utc, 0.0, 0.0), make_track_point(utc + timedelta(minutes=30), 0.0, 3.0)]
+    a = _pos(make_track_point, utc + timedelta(minutes=15), 0.0, 1.5)
+    b = _pos(make_track_point, utc + timedelta(minutes=15), 0.0, 1.5)
+    stats = {}
+    merged = ahr.merge_track_with_sources(adsb, [a, b], min_fill_gap_seconds=300, stats=stats)
+    assert [p.source for p in merged] == ["ADSB", "POS", "ADSB"]
+    assert stats == {"duplicate": 1}
+
+
+def test_merge_drops_fix_that_needs_an_impossible_speed(ahr, make_track_point, utc):
+    # 4.5 min after an ADS-B fix, a report ~435 km away (5,800 km/h): another flight's report.
+    adsb = [make_track_point(utc, -22.676, -47.167, 5240.0),
+            make_track_point(utc + timedelta(minutes=8), -22.245, -47.769, 8670.0)]
+    bad = _pos(make_track_point, utc + timedelta(seconds=270), -19.99, -50.225)
+    good = _pos(make_track_point, utc + timedelta(minutes=4), -22.46, -47.47)
+    stats = {}
+    merged = ahr.merge_track_with_sources(adsb, [bad, good], min_fill_gap_seconds=300,
+                                          stats=stats)
+    assert [(p.lat, p.source) for p in merged] == [
+        (-22.676, "ADSB"), (-22.46, "POS"), (-22.245, "ADSB")]
+    assert stats == {"implausible": 1}
+
+
+def test_merge_checks_speed_against_the_previous_accepted_fix(ahr, make_track_point, utc):
+    # Beyond the ADS-B end: each fix is checked against the last accepted one.
+    adsb = [make_track_point(utc, 0.0, 0.0)]
+    near = _pos(make_track_point, utc + timedelta(minutes=10), 0.0, 1.0)    # ~670 km/h
+    jump = _pos(make_track_point, utc + timedelta(minutes=12), 0.0, 4.0)    # ~10,000 km/h
+    later = _pos(make_track_point, utc + timedelta(minutes=20), 0.0, 2.0)   # ~670 km/h from near
+    stats = {}
+    merged = ahr.merge_track_with_sources(adsb, [near, jump, later], stats=stats)
+    assert [p.lon for p in merged] == [0.0, 1.0, 2.0]
+    assert stats == {"implausible": 1}
 
 
 # ---- enrichment (post-detection, per-flight, interior only) ---------------
@@ -129,3 +172,55 @@ def test_no_mark_sources_keeps_single_track(ahr, make_track_point, utc, tmp_path
     txt = open(out).read()
     assert txt.count("<Placemark") == 1
     assert "ff00a5ff" not in txt
+
+
+def _acars_msg(tmp_path, name, body, bucket_path=None, sent_ms=None):
+    msg = {"body": body, "attributes": {}, "message_attributes": {}}
+    if bucket_path:
+        msg["message_attributes"]["bucket_path"] = {"StringValue": bucket_path,
+                                                    "DataType": "String"}
+    if sent_ms is not None:
+        msg["attributes"]["SentTimestamp"] = str(sent_ms)
+    (tmp_path / name).write_text(json.dumps(msg))
+
+
+RAW_POS = ("QU CPYXXXX\r\n.SCLASLA 040037\r\nFML\r\nFI JJ3634/AN PR-MYV\r\n"
+           "DT QXB GRU1 040037 F83A\r\n-  POSS23156W046116,S23190W046136,003708,216,UBNOV,"
+           "005054,UMLAM,M16,32722,204/TS003708,08042675CA\r\n")
+
+
+def test_load_pos_points_parses_raw_acars_report(ahr, tmp_path):
+    _acars_msg(tmp_path, "PRMYV_raw_003721_a.json", RAW_POS,
+               bucket_path="latam/PR/PRMYV-JJ3634-20260804003719545.txt")
+    pts = ahr.load_pos_points(str(tmp_path), {"PRMYV": "E48F12"})
+    tp = pts[("E48F12", "2026-08-04")][0]
+    assert tp.source == "POS" and tp.timestamp == "2026-08-04T00:37:08Z"
+    assert abs(tp.lat - -(23 + 15.6 / 60)) < 1e-9      # DDMM.m, S negative
+    assert abs(tp.lon - -(46 + 11.6 / 60)) < 1e-9
+    assert abs(tp.alt - 21600 * 0.3048) < 1e-6          # flight level -> ft -> m
+
+
+def test_raw_acars_report_before_midnight_takes_previous_day(ahr, tmp_path):
+    # Reported 23:59:50, received 00:00:12 the next day (SentTimestamp only).
+    body = RAW_POS.replace("003708,216", "235950,216")
+    sent = 1785801612000                                 # 2026-08-04T00:00:12Z
+    _acars_msg(tmp_path, "PRMYV_raw_000012_b.json", body, sent_ms=sent)
+    pts = ahr.load_pos_points(str(tmp_path), {"PRMYV": "E48F12"})
+    assert pts[("E48F12", "2026-08-03")][0].timestamp == "2026-08-03T23:59:50Z"
+
+
+def test_raw_acars_unmapped_tail_skipped_by_name(ahr, tmp_path):
+    # Not even opened: the file is not valid JSON.
+    (tmp_path / "CCBAA_raw_000355_c.json").write_text("not json")
+    _acars_msg(tmp_path, "PRMYV_raw_003721_a.json", RAW_POS,
+               bucket_path="latam/PR/PRMYV-JJ3634-20260804003719545.txt")
+    pts = ahr.load_pos_points(str(tmp_path), {"PRMYV": "E48F12"})
+    assert list(pts) == [("E48F12", "2026-08-04")]
+
+
+def test_raw_acars_non_position_message_ignored(ahr, tmp_path):
+    body = ("QU CPYXXXX\r\n.SCLASLA 160003\r\nA80\r\nFI LP2305/AN PR-MYV\r\n"
+            "-  1001 OUTRP  2305/16 SPUR/SPJC .PR-MYV\r\n")
+    _acars_msg(tmp_path, "PRMYV_raw_000353_d.json", body,
+               bucket_path="latam/OOOI/PRMYV-LP2305-20260716000353661.txt")
+    assert not ahr.load_pos_points(str(tmp_path), {"PRMYV": "E48F12"})

@@ -1,0 +1,110 @@
+{
+ "evidence_pos": {
+  "diagnostics": {
+   "rows": 4,
+   "sha256": "0bd4ef3cf18c5f1a68c6f2be3c5678b27663271f12ed977a21776a55a190afb6"
+  },
+  "flights": {
+   "rows": 2,
+   "sha256": "d8af6ba70d9d676a8eb6f0051e1f8f82ed2148e2669817664b29c5aeea9a0c80"
+  },
+  "kml_sha256": "a2bf07fc7ec6be96b7ccd98161f4f08a072e1616f6909e46e416165856f4d647",
+  "meta": {
+   "airline": "TST",
+   "date_from": "2026-10-01",
+   "date_to": "2026-10-01",
+   "flight_count": "2",
+   "group_by": "destination",
+   "integrate_pos": "1",
+   "kml_params": "{\"group_by\": \"destination\", \"sample_minutes\": 2.0, \"override_color\": null, \"override_width\": null, \"override_opacity\": null, \"show_labels\": false, \"show_icons\": false, \"extend_to_ground\": false, \"stitch_gaps\": true, \"inferred_color\": \"ff888888\", \"stitch_gap_min\": 5.0, \"mark_sources\": true, \"pos_color\": \"ff00a5ff\", \"firehose_color\": \"ff00ff00\", \"color_mode\": \"source\", \"altitude_bands\": 24}",
+   "preset": "permissive",
+   "sample_minutes": "2.0",
+   "schema_name": "flown_routes",
+   "source_count": "1",
+   "stitch_gap_min": "5.0",
+   "suspect_od_count": "0",
+   "suspect_od_ratio": "2.5",
+   "tool": "adsb_historical_routes",
+   "track_points": "1"
+  },
+  "track_points": {
+   "rows": 308,
+   "sha256": "07981cebf9b502532d4e9be161b4c4cc1773995a29a307f9cd857e93f8661646"
+  },
+  "tracks_full": {
+   "rows": 2,
+   "sha256": "35f08a875f4cc3cf27e6bbb8d533b61dfdb9e3a07c8ab34bbce63ab123449e9f"
+  }
+ },
+ "flown_default": {
+  "diagnostics": {
+   "rows": 10,
+   "sha256": "4248a1a1c4e016ebe4479c66481b91ba7438d8ce98be7ea577c28642759d86d1"
+  },
+  "flights": {
+   "rows": 4,
+   "sha256": "485527454ed52a1d0866783ff461f7cfecf95665097478eb8ba6c2fde74cf828"
+  },
+  "kml_sha256": "c295e8ec49178fbbda24969af8fe666d86b746b15538dc6dd6544bb87466be1d",
+  "meta": {
+   "airline": "TST",
+   "date_from": "2026-10-01",
+   "date_to": "2026-10-02",
+   "flight_count": "4",
+   "group_by": "destination",
+   "integrate_pos": "0",
+   "kml_params": "{\"group_by\": \"destination\", \"sample_minutes\": 2.0, \"override_color\": null, \"override_width\": null, \"override_opacity\": null, \"show_labels\": false, \"show_icons\": false, \"extend_to_ground\": false, \"stitch_gaps\": false, \"inferred_color\": \"ff888888\", \"stitch_gap_min\": 5.0, \"mark_sources\": false, \"pos_color\": \"ff00a5ff\", \"firehose_color\": \"ff00ff00\", \"color_mode\": \"source\", \"altitude_bands\": 24}",
+   "preset": "permissive",
+   "sample_minutes": "2.0",
+   "schema_name": "flown_routes",
+   "source_count": "3",
+   "stitch_gap_min": "5.0",
+   "suspect_od_count": "0",
+   "suspect_od_ratio": "2.5",
+   "tool": "adsb_historical_routes",
+   "track_points": "0"
+  },
+  "track_points": null,
+  "tracks_full": {
+   "rows": 4,
+   "sha256": "6178479d1b5ce6b714fa9bd92ea5d564b1b0e3afea9c39fe88eb1fb74616310f"
+  }
+ },
+ "flown_firehose_stitch": {
+  "diagnostics": {
+   "rows": 10,
+   "sha256": "4248a1a1c4e016ebe4479c66481b91ba7438d8ce98be7ea577c28642759d86d1"
+  },
+  "flights": {
+   "rows": 4,
+   "sha256": "4f3a7d520af41587724cdf901d2602e9c59c1a7af2a7ef068a52c7d98c2187ff"
+  },
+  "kml_sha256": "7992bb4bb9de41df30d4cd9e042e322bc326500562a1b48384f5eca92e747301",
+  "meta": {
+   "airline": "TST",
+   "date_from": "2026-10-01",
+   "date_to": "2026-10-02",
+   "flight_count": "4",
+   "group_by": "destination",
+   "integrate_pos": "1",
+   "kml_params": "{\"group_by\": \"destination\", \"sample_minutes\": 2.0, \"override_color\": null, \"override_width\": null, \"override_opacity\": null, \"show_labels\": false, \"show_icons\": false, \"extend_to_ground\": false, \"stitch_gaps\": true, \"inferred_color\": \"ff888888\", \"stitch_gap_min\": 5.0, \"mark_sources\": true, \"pos_color\": \"ff00a5ff\", \"firehose_color\": \"ff00ff00\", \"color_mode\": \"source\", \"altitude_bands\": 24}",
+   "preset": "permissive",
+   "sample_minutes": "2.0",
+   "schema_name": "flown_routes",
+   "source_count": "3",
+   "stitch_gap_min": "5.0",
+   "suspect_od_count": "0",
+   "suspect_od_ratio": "2.5",
+   "tool": "adsb_historical_routes",
+   "track_points": "1"
+  },
+  "track_points": {
+   "rows": 687,
+   "sha256": "b59c6183b7ede9bd69b3871aa8cf32dc6a973113c21f31743fa318baa5c937e5"
+  },
+  "tracks_full": {
+   "rows": 4,
+   "sha256": "707a34a17f12868b6f865b910e76c6661bac9856fe412968801ee556692c9909"
+  }
+ }
+}

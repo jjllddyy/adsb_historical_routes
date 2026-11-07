@@ -2,8 +2,9 @@
 
 Segments continuous ADS-B flight-tracking KML into individual, airport-to-airport flight
 routes: it detects takeoffs/landings, recovers flights whose tracks are truncated or split by
-coverage gaps, matches origin/destination airports, and writes an organized KML plus a
-per-segment diagnostics CSV.
+coverage gaps, matches origin/destination airports, and writes a **GeoPackage** (for QGIS and
+`direct_detect`) and an organized **KML** (for Google Earth, rendered from the GeoPackage), plus a
+per-segment diagnostics CSV. See [docs/GEOPACKAGE.md](docs/GEOPACKAGE.md) for the GeoPackage schema.
 
 - **Zero runtime dependencies** — Python 3.6+ standard library only.
 - **Two stages**: build the airport/route reference inputs from a Cirium schedule export
@@ -222,7 +223,18 @@ records use the current `SPJC`. Add rows as new mismatches are found.
 | `--kml-files` | *(one of folder/files required)* | Explicit list of KML files (space-separated). |
 | `--airports` | *required* | The generated per-airline airports CSV: `airport,latitude,longitude,elevation_ft` (ICAO) — from `build_cirium_inputs.py`. **Not** the OurAirports `Airports_*.txt` database, and **not** the raw Cirium export. |
 | `--routes` | *required* | The generated per-airline route-time CSV: `origin,destination,avg_enroute_min` (ICAO) — from `build_cirium_inputs.py`. **Not** the raw Cirium schedule export. |
-| `--output` | *required* | Output KML path (parent dir auto-created; a `.diagnostics.csv` sidecar is written next to it). |
+| `--output` | *required* | Output KML path (parent dir auto-created; a `.diagnostics.csv` sidecar is written next to it, and the GeoPackage as `<output>.gpkg`). `{from}` / `{to}` are replaced by the first/last flight dates, e.g. `viv_flown_{from}_{to}.kml`. |
+| `--format` | `both` | `both` = `<output>.gpkg` + `<output>.kml`; `gpkg` = GeoPackage only (fastest); `kml` = KML only (a temporary GeoPackage is used and deleted). |
+| `--airline` | *(empty)* | Airline code stored in the GeoPackage (`flights.airline`, `meta`). |
+| `--gpkg-points` | off | Also write the per-point `track_points` layer. Forced on by `--integrate-pos`. |
+| `--suspect-od-ratio` | `2.5` | A flight whose flown distance exceeds this multiple of its airports' great circle is flagged `suspect_od`. |
+| `--legacy-kml` | off | Write KML with the direct (pre-GeoPackage) writer. Kept for one release. |
+| `--gpkg` | — | Deprecated alias for `--format both`. |
+| `--takeoff-from`, `--takeoff-to` | *(none)* | Keep only flights whose UTC takeoff date is in range (`YYYY-MM-DD`, inclusive); daily KML files more than a day outside it are skipped. |
+| `--qgz` | off | Also write `<output base>.qgz` next to the GeoPackage: a QGIS project built by `~/Git/qgis` `prepare` (navdb chart layers, basemaps, styles; links to the GeoPackages, copies no data). Not allowed with `--format kml`. |
+| `--navdb` | *(none)* | `navdb_<AIRAC>.gpkg` for the project's chart layers. Required with `--qgz`; checked before the build starts. |
+| `--company` | *(none)* | Optional `company_routes` GeoPackage. With it the project is the full Route Explorer (flights matched to company routes); without it, flown routes only. |
+| `--qgis-repo` | `$QGIS_REPO`, else `~/Git/qgis` | The QGIS viewer checkout whose `prepare` builds the project. |
 
 **Detection & sampling**
 
@@ -262,6 +274,23 @@ records use the current `SPJC`. Add rows as new mismatches are found.
 | `--tail-icao` | *(none)* | CSV mapping `tail_number,icao_hex` — required to key ACARS POS reports to hex. |
 | `--pos-color` | `ff00a5ff` | KML color (AABBGGRR) for ACARS-POS-sourced track portions (default orange). |
 | `--firehose-color` | `ff00ff00` | KML color (AABBGGRR) for firehose-sourced track portions (default green). |
+
+**Endpoint evidence** (v3, each optional and off by default; all off = the 1.4.0 output; see [docs/GEOPACKAGE.md §7](docs/GEOPACKAGE.md))
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--acars-identity` | `false` | F1: each flight gets the ACARS `FI` flight number of the POS reports in its window (`flights.flight_number`). Needs `--integrate-pos true`. |
+| `--pos-extend-ends` | `false` | F2: carry flight ends ADS-B did not see at an airport on with POS fixes, then re-detect them (`pos_observed`). |
+| `--pos-extend-max-gap-min` | `60` | Longest gap between POS fixes in an extension or a POS-only session. |
+| `--pos-only-flights` | `false` | F3: flights from airborne POS sessions no ADS-B segment covers (`disposition = pos_only`). |
+| `--pos-fleets` | `mapped` | `all` also builds POS-only flights for registrations not in `--tail-icao` (`aircraft_id` null). |
+| `--rotation-endpoints` | `false` | F4: an end not observed takes the aircraft's neighbouring flight's observed end. |
+| `--rotation-max-gap-h` | `18` | Longest ground gap for rotation. |
+| `--planned-legs CSV [CSV ...]` | *(none)* | F5: planned legs (OFP or schedule) confirm or fill ends and the flight number; never override an observed end. |
+| `--recover-dropped` | `false` | F9: try the new evidence on segments that would be dropped. |
+| `--flightaware-identity` | `false` | Use the FlightAware flight (`orig`, `dest`, flight number) of the firehose fixes inside each flight for ends not observed. Needs `--integrate-pos true --firehose-folder`. |
+
+`--airports` accepts several files; a code in a later file replaces an earlier one.
 
 **Styling / display**
 
@@ -364,15 +393,23 @@ feed — `--integrate-pos true` fills those gaps with measured fixes instead of 
 - For each flight, POS/firehose fixes that fall inside its own `[takeoff, landing]` window and
   land in a gap ≥ `--stitch-gap-min` minutes are merged in. ADS-B is authoritative: an extra fix
   within 30 s of an ADS-B point is dropped as redundant, so dense stretches aren't fragmented.
+  A fix repeated at the same time is dropped, and so is one that would need more than
+  1,300 km/h from the previous accepted point or to the next ADS-B point (it is not this
+  aircraft at that time). The run log prints both counts.
 - **Source-marked rendering:** ADS-B keeps the flight color, ACARS-POS portions draw in
   `--pos-color` (orange), firehose portions in `--firehose-color` (green). Because these are real
   data, the gray inferred connector is **not** drawn where a source fills the gap.
 
 **Inputs:**
 
-- `--pos-folder` — ACARS files: each an SQS message whose (URL-encoded) `body` is
-  `<Airline>_Position=[{…}]`; each report carries `tail_number`, `created_at`, and a `freetext`
-  encoding `HHMMSS, alt_ft, …, lat/lon` (e.g. `S 33.569 W 060.089`).
+- `--pos-folder` — ACARS files, each an SQS message. Two body formats are read:
+  - `<Airline>_Position=[{…}]` (URL-encoded); each report carries `tail_number`, `created_at`, and
+    a `freetext` encoding `HHMMSS, alt_ft, …, lat/lon` (e.g. `S 33.569 W 060.089`).
+  - A raw ACARS `POS` report (LATAM, e.g. `FI JJ3634/AN PR-MYV` …
+    `-  POSS23156W046116,<last wpt>,003708,216,…`): present position in DDMM.m, time HHMMSS UTC,
+    flight level. The report has no date; it comes from the receive stamp in the S3 key
+    (`…-20260804003719545.txt`) or the SQS `SentTimestamp`. Files named `<TAIL>_raw_*.json` for
+    tails not in `--tail-icao` are skipped without being read.
 - `--firehose-folder` — ADS-B firehose files: one report each, carrying `icao` (hex),
   Unix `timestamp`, `latitude`, `longitude`, `altitude` (feet).
 - `--tail-icao` — CSV `tail_number,icao_hex`. POS files key on tail; this maps them to the hex
@@ -490,6 +527,19 @@ skipped (ground noise).
 **Output KML** — three-level `Document → group (origin/destination) → route (ORIG-DEST) → flight`
 placemarks; each `gx:coord` is `lon lat alt` (altitude in meters, preserved). Document title is the
 output filename stem + grouping mode (e.g. `lan_routes_2026_0601-0731_destination`).
+
+**Output GeoPackage** (`flown_routes` v3) — `flights` (one row per flight, sampled line, with each endpoint's source and confidence),
+`tracks_full` (every point, M = epoch seconds), both MULTILINESTRINGs split at the date line;
+optional `track_points`, `diagnostics`, `meta`. Opens directly in QGIS. Without re-running the
+builder you can rebuild the KML, build the QGIS project, or print a summary:
+
+```bash
+python3 gpkg_to_kml.py output/viv_flown_2026-09-30_2026-10-19.gpkg -o viv.kml [--color-mode altitude ...]
+python3 gpkg_to_qgz.py output/viv_flown_2026-09-30_2026-10-19.gpkg --navdb ~/Git/qgis/input/navdb_2610.gpkg [--company company.gpkg]
+python3 gpkg_summary.py output/viv_flown_2026-09-30_2026-10-19.gpkg -o viv_summary.txt
+```
+
+Full schema, columns and the origin/destination check: [docs/GEOPACKAGE.md](docs/GEOPACKAGE.md).
 
 ---
 

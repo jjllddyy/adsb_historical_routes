@@ -608,7 +608,7 @@ function deletePreset() {
 var SECTION_ORDER = ['input', 'output', 'detection', 'styling', 'stitching', 'positions'];
 var GROUP_META = {
   input: { title: 'Input', desc: 'ADS-B KML tracks and reference CSVs.' },
-  output: { title: 'Output', desc: 'Where the organized route KML is written.' },
+  output: { title: 'Output', desc: 'Where the GeoPackage and/or route KML are written.' },
   detection: { title: 'Detection', desc: 'How tracks are split into flights and matched to airports.' },
   styling: { title: 'Styling', desc: 'Line color, width and embellishments in the output KML.' },
   stitching: { title: 'Gap Stitching', desc: 'Mark inferred connectors across coverage gaps.' },
@@ -618,6 +618,7 @@ var SEGMENTED_OPTIONS = {
   group: [['origin', 'Origin'], ['destination', 'Destination']],
   confidence: [['strict', 'Strict'], ['balanced', 'Balanced'], ['permissive', 'Permissive']],
   color_mode: [['source', 'Source'], ['altitude', 'Altitude']],
+  format: [['both', 'Both'], ['gpkg', 'GeoPackage'], ['kml', 'KML']],
   route_time_rescue: [['', 'Preset'], ['on', 'On'], ['off', 'Off']],
 };
 // Fields whose value only ever changes as a consequence of integrate_pos / color_mode.
@@ -875,6 +876,7 @@ function fieldRoot(key) {
 // airports/routes/tail are CSV-content files but may carry a .txt extension, so accept both.
 function fieldKind(key) {
   if (key === 'airports' || key === 'routes' || key === 'tail_icao') return ['csv', 'txt'];
+  if (key === 'navdb' || key === 'company') return ['gpkg'];
   return null;
 }
 function buildPathControl(param) {
@@ -1545,6 +1547,10 @@ function renderResultSuccess(payload) {
     stats.push(['Data reduction', s.points_in + ' → ' + s.points_out + ' pts' + (s.compression !== undefined ? ' (' + s.compression + '%)' : '')]);
   }
   if (s.connectors !== undefined) stats.push(['Inferred connectors', s.connectors]);
+  if (s.suspect_od !== undefined) stats.push(['Suspect O/D', s.suspect_od]);
+  if (s.date_from) stats.push(['Flight dates', s.date_from + ' → ' + s.date_to]);
+  if (s.gpkg && s.gpkg !== s.output) stats.push(['GeoPackage', baseOf(s.gpkg)]);
+  if (s.qgz) stats.push(['QGIS project', baseOf(s.qgz)]);
   var outName = s.output ? baseOf(s.output) : (PARAMS.output_name || '');
   stats.push(['Output', outName + (payload.output_size != null ? ' · ' + humanizeBytes(payload.output_size) : '')]);
 

@@ -5,6 +5,83 @@ All notable changes to the Flight Route Splitter project will be documented in t
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-11-03 (endpoint-evidence branch)
+
+### Added
+
+- `--flightaware-identity` (2026-11-07): for FlightAware firehose reports, each flight takes the FA flight with the most fixes in its window; its `orig` / `dest` fill ends that are not observed (`*_source = flightaware`, high confidence, after the observed ends and before planned legs and rotation; excluded from `*_free`), and its number fills `flight_number` (`flightaware`). The firehose loader keeps `flight_id`, `flight`, `orig`, `dest` and `reg` per fix. The evidence report adds agreement tables against FlightAware.
+
+- **Endpoint evidence** (request `docs/handoff/2026-11-03_endpoint_evidence_v3.md`), each switch optional and off by default:
+  - `--acars-identity` (F1): flight number from the ACARS `FI` of the POS reports in the flight's window; a second number sets `flight_number_conflict`.
+  - `--pos-extend-ends`, `--pos-extend-max-gap-min` (F2): carry ends ADS-B did not see at an airport on with POS, stopping at a speed jump, a gap, a ground stop, the neighbouring segment or an `FI` change; re-detect the end (`pos_observed`) or re-run the rescue on the longer track.
+  - `--pos-only-flights`, `--pos-fleets mapped|all` (F3): flights from POS sessions no ADS-B segment covers; `all` reads every POS file and includes registrations not in the tail map.
+  - `--rotation-endpoints`, `--rotation-max-gap-h` (F4): an end not observed takes the neighbouring flight's observed end; otherwise unfilled ends may chain (`rotation_chained`).
+  - `--planned-legs` (F5): match OFP / schedule legs on flight digits + tail + time (rule 1) or tail + time + one observed end (rule 2), uniquely both ways; fill ends that are not observed and the flight number; contradictions set `endpoint_conflict`. Leg airports missing from the airport list are warned about.
+  - `--recover-dropped` (F9): segments 1.4.0 drops are tried with the new evidence; recovered ones are `kept_recovered`.
+  - The evidence order (F8) per end, and `orig_free` / `dest_free`: the answer without planned legs.
+- `--airports` takes several files (F7); `input/lan_ofp_extra_airports.csv` (not committed) adds SGAS, SDSC, SCNT, LFBO, SBSJ, SPZO from `airport_lookup`.
+- `<gpkg stem>_evidence_report.md` next to the GeoPackage, and the same sections in `gpkg_summary.py`.
+- `tests/test_v3_equivalence.py`: with every switch off, the v2 columns, geometry, track points, diagnostics, meta and KML equal 1.4.0's (digests of the 1.4.0 output on the synthetic fixtures).
+- Handoff [`docs/handoff/direct_detect_flown_v3.md`](docs/handoff/direct_detect_flown_v3.md).
+
+### Changed
+
+- **`flown_routes` schema v3** (additive): `flights` gains `flight_number`, `flight_number_source`, `flight_number_conflict`, `orig_source`, `dest_source`, `orig_free`, `dest_free`, `orig_free_source`, `dest_free_source`, `orig_candidates`, `dest_candidates`, `endpoint_confidence`, `endpoint_conflict`, `planned_leg_key`, `n_pos_fixes`; `disposition` gains `kept_recovered` and `pos_only`; `aircraft_id` is null on POS-only flights of unmapped registrations. `diagnostics` gains `evidence` rows (`evidence_feature`, `evidence_source`, `endpoint`, `before_code`, `after_code`). The sources, candidates and confidence are filled in every build. `gpkg_to_kml.py` reads v1–v3.
+- The POS folder is listed with `os.scandir`; raw reports keep their `FI` number and registration.
+
+## [1.4.0] - 2026-10-30 (gpkg-output branch)
+
+### Added
+
+- **QGIS project output** (`--qgz`, `--navdb`, `--company`, `--qgis-repo`): writes `<output base>.qgz` next to the GeoPackage by running `~/Git/qgis` `prepare` (chart layers, basemaps, styles; links to the GeoPackages, copies no data). `--navdb` is required and checked before the build. On failure the GeoPackage is kept, the run exits 1 and the message points to the qgis handoff. Same interface as `company_route_extractor`.
+- **`gpkg_to_qgz.py`**: build the project for an existing flown GeoPackage.
+- Route Builder: *QGIS project (.qgz)*, *navdb GeoPackage* and *Company routes GeoPackage* in the Output section; `~/Git/qgis` added to the default allowed folders.
+- Handoffs: [`docs/handoff/qgis_flown_v2.md`](docs/handoff/qgis_flown_v2.md), [`docs/handoff/direct_detect_flown_v2.md`](docs/handoff/direct_detect_flown_v2.md).
+
+### Changed
+
+- **`flown_routes` schema v2**: `flights` (MULTILINESTRING Z) and `tracks_full` (MULTILINESTRING ZM) are split at the date line (±180°, lat/Z/M interpolated), so QGIS no longer draws a crossing flight across the whole map. A line that does not cross is one part with its exact coordinates. `gpkg_to_kml.py` reads v1 and v2, and the KML is unchanged. 0 of 7,125 VIV and 0 of 51,345 LAN flights cross today.
+- `gpkg_writer.py` writes and reads MULTILINESTRING (`encode_multilinestring`).
+
+### Fixed
+
+- **POS/firehose merge drops repeated and impossible fixes.** The LATAM ACARS feed delivers every report twice (two ground addresses), which wrote duplicate points; and about 1 report in 770 is not where the ADS-B track says the aircraft is (e.g. 435 km away 4½ min after an ADS-B fix), which drew a spike and inflated `distance_km`. An extra fix with the same time as an accepted one is now dropped, as is one that would need more than 1,300 km/h from the previous accepted point or to the next ADS-B point. Both counts are printed after the integration line.
+
+## [1.3.1] - 2026-10-30 (gpkg-output branch)
+
+### Added
+
+- `--takeoff-from` / `--takeoff-to`: keep only flights whose UTC takeoff date is in range; daily KML files more than a day outside it are skipped. Excluded flights are recorded in the diagnostics as `dropped_date_range`.
+- `--pos-folder` reads raw ACARS `POS` reports (LATAM's SQS feed: `FI …/AN <reg>`, `-  POS<lat><lon>,…`), dated from the S3 receive stamp. Files for tails not in `--tail-icao` are skipped by name. Checked against ADS-B on 7,726 LATAM Brasil reports: median position difference 0.33 km.
+- `--output` may name the GeoPackage (`x.gpkg`); the KML and diagnostics use the same stem.
+- **`gpkg_summary.py`**: a text summary of a `flown_routes` GeoPackage (build settings, counts, dates, sources, rescue methods, suspect O/D, top city pairs); reads attributes only, under a second on a 1 GB file.
+- [`historical_route_geopackage_instructions_lan.md`](historical_route_geopackage_instructions_lan.md): start-to-finish build of the LAN July–September GeoPackage.
+
+## [1.3.0] - 2026-10-28 (gpkg-output branch)
+
+### Added
+
+- **GeoPackage output** (`flown_routes` schema v1, see [`docs/GEOPACKAGE.md`](docs/GEOPACKAGE.md)): `flights` (one row per flight, sampled display line), `tracks_full` (every point, M = epoch seconds), optional `track_points` (per-point source, ground speed, vertical speed, track), `diagnostics` and `meta`. Written with the new standard-library `gpkg_writer.py` (no GDAL); validated with GDAL's `validate_gpkg.py`, `ogrinfo` and QGIS 3.44.
+- **Output selection** `--format both|gpkg|kml` (default `both`), `--gpkg-points`, `--airline`, `--suspect-od-ratio`; `--gpkg` is a deprecated alias for `--format both`.
+- **`gpkg_to_kml.py`**: rebuild the KML from a GeoPackage without re-running the builder; every styling/sampling option defaults to the build's.
+- **`kml_compare.py`**: the spec §6 KML equivalence check (folder tree, placemarks, descriptions, styles, coordinates to 1e-6, `when` to 1 ms), streaming, for multi-hundred-MB files.
+- `{from}` / `{to}` in `--output` are replaced by the first/last flight dates.
+- Origin/destination plausibility check: `od_gc_km`, `od_distance_ratio`, `suspect_od` on each flight, counted in the diagnostics and the run summary.
+- Diagnostics CSV gains `flight_id`, `od_gc_km`, `od_distance_ratio`, `suspect_od`.
+- Route Builder GUI: Output format, Airline code and GeoPackage track points in the Output section; result card shows suspect O/D count, flight dates and the GeoPackage.
+
+### Changed
+
+- KML is now rendered from the GeoPackage (a temporary one with `--format kml`). Output is byte-identical to the direct writer in every mode tested; the direct writer remains behind `--legacy-kml` for one release.
+
+### Fixed
+
+- **Origin/destination mislabels** (about 2.7% of VIV October flights flew > 2.5× the great circle between their labelled airports, e.g. 131 "MMTO→MMSM" flights of 2½–10 h). Four root causes in airport assignment:
+  - A farther airport could "steal" an endpoint: a climbing departure first seen 16 km from MMSM failed MMSM's altitude allowance but passed the larger, elevation-scaled one of MMTO 89 km away. The closest airport now wins when the height above it fits a 3° climb/descent path.
+  - Route-time rescue accepted a destination the track had already flown past (corridor cross-track has no along-track limit); it now applies the same along-track limit as corridor geometry.
+  - Fragments of an out-and-back across a coverage hole (MMSM→MMVA→MMSM with no coverage at MMVA) were joined into one "flight"; a reversed heading with no progress across the gap now blocks the join.
+  - A destination inferred for a short fragment survived a join that extended the track past it; it is now dropped and re-inferred on the merged track.
+
 ## [1.2.0] - 2026-09-22 (route-builder branch)
 
 ### Added

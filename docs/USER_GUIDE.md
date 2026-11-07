@@ -192,8 +192,14 @@ default shown.
 
 | Setting | What it does | Recommended |
 |---|---|---|
-| **Output folder** | Where the KML is written. | `output/` |
-| **Output filename** | Name of the KML. A name is **suggested automatically** from the batch name + enabled features (e.g. `_stitched`, `_pos`, `_altcolor`). The existing files in the folder are listed with an overwrite warning. | Accept the suggestion. |
+| **Output folder** | Where the GeoPackage and KML are written. | `output/` |
+| **Output filename** | Name of the KML; the GeoPackage gets the same name with `.gpkg`. A name is **suggested automatically** from the batch name + enabled features (e.g. `_stitched`, `_pos`, `_altcolor`). `{from}` and `{to}` in the name are replaced by the first and last flight dates. The existing files in the folder are listed with an overwrite warning. | Accept the suggestion, or e.g. `viv_flown_{from}_{to}.kml`. |
+| **Output format** | **Both** writes the GeoPackage (QGIS, `direct_detect`) and the KML (Google Earth); **GeoPackage** only is the fastest; **KML** only matches the old behaviour. The KML is identical either way. | Both. |
+| **Airline code** | Stored in the GeoPackage (`flights.airline`, `meta`). | The airline's ICAO code, e.g. `VIV`. |
+| **GeoPackage track points** | Adds the per-point `track_points` layer (speed, vertical speed, track, source). About 10× the size of the flights layer; always on with position integration. | Off unless you need per-point colouring in QGIS. |
+| **QGIS project (.qgz)** | Also writes `<name>.qgz` next to the GeoPackage, built by `~/Git/qgis` `prepare`: navdb chart layers, basemaps and styles, linked to your GeoPackage (no data copied). Needs Output format Both or GeoPackage, and a navdb. If `prepare` fails, the GeoPackage is still written and the run is shown as failed with the reason. | Off unless you will open the flights in the Route Explorer. |
+| **navdb GeoPackage** | `navdb_<AIRAC>.gpkg` for the chart layers. Required for the QGIS project. | `~/Git/qgis/input/navdb_2610.gpkg` |
+| **Company routes GeoPackage** | Optional `company_routes` file from `company_route_extractor`; the project then matches flights to company routes. | The airline's company GeoPackage, if you have one. |
 
 ### Detection & sampling
 
@@ -367,6 +373,12 @@ filename).
 each flight a `gx:Track` carrying `lon lat alt` (altitude in meters). A `<output>.diagnostics.csv`
 sidecar records every raw and final segment (disposition, airports, distances, rescue method) — the
 basis for tuning without ground truth.
+
+**The GeoPackage** (`<output>.gpkg`) holds the same flights with one row per flight — drag it into
+QGIS and each table becomes a layer (`flights`, `tracks_full`, …). The result card shows the number
+of **Suspect O/D** flights: flights that flew more than 2.5× the distance between their labelled
+airports, usually corrupt positions or a holding pattern. Downstream statistics exclude them. See
+[GEOPACKAGE.md](GEOPACKAGE.md).
 
 ---
 
