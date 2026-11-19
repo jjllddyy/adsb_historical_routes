@@ -17,6 +17,7 @@ import sys
 import os
 import gc
 import glob
+import gzip
 import json
 import bisect
 import sqlite3
@@ -36,7 +37,7 @@ import re
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gpkg_writer  # noqa: E402
 
-TOOL_VERSION = "1.5.0"
+TOOL_VERSION = "1.6.0"
 
 
 @dataclass(frozen=True)
@@ -607,6 +608,226 @@ def parse_kml_tracks(kml_file: str, aircraft_id: str) -> List[Tuple[List[TrackPo
         find_tracks_recursive(root)
     
     return all_tracks
+
+
+# ---------------------------------------------------------------------------
+# Trace JSON (readsb ``trace_full``): the ADS-B Exchange site's JSON, adsb.lol, and the S3
+# trace builder all write one file per aircraft per UTC day in this layout
+# (docs/handoff/2026-11-19_trace_json_sources.md). parse_trace_json returns what
+# parse_kml_tracks returns for the site's KML of the same day.
+# ---------------------------------------------------------------------------
+
+TRACE_JSON_RE = re.compile(r"^([0-9a-f]{6})_(\d{4}-\d{2}-\d{2})_(?:([a-z0-9]+)_)?trace\.json$")
+TRACE_NODATA_RE = re.compile(r"^([0-9a-f]{6})_(\d{4}-\d{2}-\d{2})_nodata\.json$")
+TRACE_KML_RE = re.compile(
+    r"^([0-9a-f]{6})_(\d{4}-\d{2}-\d{2})_(baro_avg|geometric|pressure|[a-z0-9]+_baro)\.kml$")
+# Files that sit beside the traces in a source folder and are not traces.
+TRACE_FOLDER_SIDE_FILES = {"manifest.csv", "SOURCE.md", "LICENSE-ODbL.txt", ".DS_Store"}
+# The style the ADS-B Exchange site writes in its KML (colour, width, opacity).
+WEBSITE_STYLE = ("ff1c1ae3", "4", "ff")
+TRACE_SOURCE_CHOICES = {"adsbx": "ADSBX", "adsblol": "ADSBLOL", "s3": "S3"}
+
+
+def _load_json_file(path: str) -> Any:
+    """JSON from ``path``, gunzipped first when it starts with the gzip magic bytes."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:2] == b"\x1f\x8b":
+        data = gzip.decompress(data)
+    return json.loads(data.decode("utf-8"))
+
+
+def _trace_value(p: Sequence[Any], i: int) -> Any:
+    return p[i] if len(p) > i else None
+
+
+def _geometric_ft(p: Sequence[Any]) -> Optional[float]:
+    """Satellite (WGS84) altitude of a point: the details' ``alt_geom``, else index 10."""
+    det = _trace_value(p, 8)
+    if isinstance(det, dict) and det.get("alt_geom") is not None:
+        return det["alt_geom"]
+    return _trace_value(p, 10)
+
+
+def _builder_label(doc: Dict[str, Any], path: str) -> str:
+    m = TRACE_JSON_RE.match(os.path.basename(path))
+    code = m.group(3) if m and m.group(3) else None
+    if not code:
+        feed = str((doc.get("builder") or {}).get("feed") or "")
+        code = {"turbofire_adsb": "ta", "turbofire_firehose": "tf"}.get(feed, feed)
+    return "S3_" + code.upper() if code else "S3"
+
+
+def parse_trace_json(path: str, aircraft_id: str, source: Optional[str] = None
+                     ) -> List[Tuple[List[TrackPoint], str, str, str, str]]:
+    """Tracks from one readsb trace file, as parse_kml_tracks returns them for the site's KML.
+
+    * Point time = top-level ``timestamp`` + index 0. Points without a position or an
+      altitude are skipped.
+    * The day is cut into sections where the point switches between ``"ground"`` and an
+      altitude, as the site's KML export does; ground sections (altitude 0) then drop out
+      through track_has_useful_altitude, as the KML's ground Placemarks do.
+    * Altitude is the satellite altitude (details ``alt_geom``, else index 10) when most
+      airborne points have one; points without it are then left out, as the site's default
+      (``baro_avg``) KML leaves them out. That altitude is within metres of the KML's; the
+      barometric one (index 3) is a median 600 m lower, which would shift detection. A file
+      without satellite altitudes (the S3 builder) uses the barometric altitude.
+    * Each point keeps the reported ground speed (``gs_kt``), vertical rate
+      (``vrate_fpm``), position source (index 9), flags, the callsign as
+      ``flight_number``, and any FlightAware ``flight_id`` / ``orig`` / ``dest`` in its
+      details (S3 firehose). ``source`` stays ``ADSB`` (the primary track);
+      ``trace_source`` is the input label (``source``, default ADSBX, or S3_<feed> for a
+      builder file).
+    """
+    doc = _load_json_file(path)
+    if not isinstance(doc, dict):
+        return []
+    label = source or (_builder_label(doc, path) if "builder" in doc else "ADSBX")
+    reg = (doc.get("r") or "").strip().upper() or aircraft_id
+    base = float(doc.get("timestamp") or 0.0)
+    raw = [p for p in (doc.get("trace") or []) if isinstance(p, list) and len(p) >= 4]
+    usable = []
+    for p in raw:
+        lat, lon, alt = p[1], p[2], p[3]
+        if lat is None or lon is None or alt is None:
+            continue
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            continue
+        usable.append(p)
+    airborne = [p for p in usable if p[3] != "ground"]
+    use_geo = bool(airborne) and (sum(1 for p in airborne if _geometric_ft(p) is not None)
+                                  >= 0.5 * len(airborne))
+
+    sections: List[List[TrackPoint]] = []
+    current: Optional[List[TrackPoint]] = None
+    current_ground: Optional[bool] = None
+    for p in usable:
+        ground = p[3] == "ground"
+        if current is None or ground != current_ground:
+            current, current_ground = [], ground
+            sections.append(current)
+        if ground:
+            alt_ft = 0.0
+        else:
+            geo = _geometric_ft(p) if use_geo else None
+            if use_geo and geo is None:
+                continue
+            alt_ft = geo if use_geo else p[3]
+        try:
+            alt_ft = float(alt_ft)
+            t = datetime.fromtimestamp(base + float(p[0]), timezone.utc)
+        except (TypeError, ValueError, OverflowError, OSError):
+            continue
+        ts = t.strftime("%Y-%m-%dT%H:%M:%S.") + f"{t.microsecond // 1000:03d}Z"
+        tp = TrackPoint(ts, float(p[2]), float(p[1]), alt_ft * 0.3048)
+        tp.trace_source = label
+        tp.gs_kt = _trace_value(p, 4)
+        tp.vrate_fpm = _trace_value(p, 7)
+        tp.trace_flags = _trace_value(p, 6)
+        tp.pos_source = _trace_value(p, 9)
+        det = _trace_value(p, 8)
+        if isinstance(det, dict):
+            tp.flight_number = (str(det.get("flight") or "").strip() or None)
+            tp.fa_flight_id = det.get("flight_id") or None
+            tp.fa_orig = det.get("orig") or None
+            tp.fa_dest = det.get("dest") or None
+        current.append(tp)
+
+    tracks = []
+    for pts in sections:
+        if pts and track_has_useful_altitude(pts):
+            for i in range(1, len(pts)):
+                pts[i].groundspeed = calculate_groundspeed(pts[i - 1], pts[i])
+            tracks.append((pts,) + (reg,) + WEBSITE_STYLE)
+    return tracks
+
+
+class TraceFolder:
+    """What a --trace-folder holds: the files to read, no-data markers, skipped names."""
+
+    def __init__(self, files, nodata, skipped, source, json_over_kml, not_downloaded):
+        self.files = files
+        self.nodata = nodata
+        self.skipped = skipped
+        self.source = source
+        self.json_over_kml = json_over_kml
+        self.not_downloaded = not_downloaded
+
+    def summary(self) -> Dict[str, Any]:
+        return {"trace_files": len(self.files),
+                "json": sum(1 for f in self.files if f.endswith(".json")),
+                "kml": sum(1 for f in self.files if f.endswith(".kml")),
+                "nodata": len(self.nodata), "not_downloaded": self.not_downloaded,
+                "skipped": len(self.skipped), "json_over_kml": self.json_over_kml}
+
+
+def _folder_source(folder: str, json_files: List[str]) -> str:
+    """ADSBX, ADSBLOL or S3_<feed>, from the folder's contents (one source per folder)."""
+    for f in json_files[:1]:
+        try:
+            doc = _load_json_file(f)
+        except (OSError, ValueError):
+            doc = None
+        if isinstance(doc, dict) and "builder" in doc:
+            return _builder_label(doc, f)
+    names = set(os.listdir(folder))
+    if ({"LICENSE-ODbL.txt", "manifest.csv"} & names
+            or os.path.basename(os.path.normpath(folder)).endswith("_traces_lol")):
+        return "ADSBLOL"
+    return "ADSBX"
+
+
+def discover_trace_folder(folder: str, source: Optional[str] = None) -> TraceFolder:
+    """The trace files of one source folder (listed once with ``os.scandir``).
+
+    Only fixed names are read: ``<icao>_<date>_[<code>_]trace.json`` and
+    ``<icao>_<date>_<alt>.kml``; ``<icao>_<date>_nodata.json`` markers ("checked, no
+    data") are counted, and every other file is skipped (hand-made website exports such as
+    ``N105JS-track-EGM96_avg.kml`` would otherwise be read as aircraft UNKNOWN). When JSON
+    and KML exist for one aircraft-day the JSON is read: it holds every point the KML has.
+    ``not_downloaded`` counts aircraft-days, for aircraft in the folder and between its
+    first and last date, with neither a trace nor a marker.
+    """
+    by_day: Dict[Tuple[str, str], Dict[str, str]] = {}
+    nodata, skipped = [], []
+    with os.scandir(folder) as it:
+        for e in it:
+            if not e.is_file() or e.name.startswith(".") or e.name in TRACE_FOLDER_SIDE_FILES:
+                continue
+            m = TRACE_JSON_RE.match(e.name)
+            if m:
+                by_day.setdefault((m.group(1), m.group(2)), {}).setdefault("json", e.path)
+                continue
+            m = TRACE_KML_RE.match(e.name)
+            if m:
+                by_day.setdefault((m.group(1), m.group(2)), {}).setdefault("kml", e.path)
+                continue
+            m = TRACE_NODATA_RE.match(e.name)
+            if m:
+                nodata.append((m.group(1), m.group(2)))
+                continue
+            skipped.append(e.name)
+    files, json_over_kml = [], 0
+    for key in sorted(by_day):
+        kinds = by_day[key]
+        if "json" in kinds:
+            files.append(kinds["json"])
+            json_over_kml += 1 if "kml" in kinds else 0
+        else:
+            files.append(kinds["kml"])
+    seen = {k for k in by_day} | set(nodata)
+    not_downloaded = 0
+    if seen:
+        days = sorted({d for _, d in seen})
+        d0 = datetime.strptime(days[0], "%Y-%m-%d")
+        n_days = (datetime.strptime(days[-1], "%Y-%m-%d") - d0).days + 1
+        icaos = {i for i, _ in seen}
+        not_downloaded = sum(1 for i in icaos for k in range(n_days)
+                             if (i, (d0 + timedelta(days=k)).strftime("%Y-%m-%d")) not in seen)
+    label = (TRACE_SOURCE_CHOICES[source] if source in TRACE_SOURCE_CHOICES
+             else _folder_source(folder, [f for f in files if f.endswith(".json")]))
+    return TraceFolder(files, sorted(nodata), sorted(skipped), label, json_over_kml,
+                       not_downloaded)
 
 
 # ---------------------------------------------------------------------------
@@ -1879,13 +2100,17 @@ def assign_flightaware_identity(segments: List[FlightSegment],
             seg.flight_number_conflict = len(numbers) > 1
 
 
-def index_fa_by_aircraft(*indexes: Dict[Tuple[str, str], List["TrackPoint"]]
-                         ) -> Dict[str, "FixSeries"]:
-    """{hex: FlightAware fixes (with an FA flight id) in time order} from (hex, date) indexes."""
+def index_fa_by_aircraft(*indexes: Dict[Tuple[str, str], List["TrackPoint"]],
+                         segments: Sequence[FlightSegment] = ()) -> Dict[str, "FixSeries"]:
+    """{hex: FlightAware fixes (with an FA flight id) in time order} from (hex, date) indexes,
+    and from the track points of ``segments`` (an S3 builder firehose trace carries them)."""
     by_key: Dict[str, List[TrackPoint]] = defaultdict(list)
     for index in indexes:
         for (key, _date), pts in index.items():
             by_key[key].extend(p for p in pts if p.fa_flight_id)
+    for seg in segments:
+        by_key[seg.aircraft_id].extend(p for p in seg.points if p.fa_flight_id)
+    by_key = {k: v for k, v in by_key.items() if v}
     return {k: FixSeries(sorted(v, key=lambda p: p.datetime)) for k, v in by_key.items()}
 
 
@@ -2582,10 +2807,12 @@ def build_evidence_report(flights: List[FlightSegment],
 
 def validate_evidence_options(opts: EvidenceOptions, integrate_pos: bool,
                               pos_folder: Optional[str],
-                              firehose_folder: Optional[str] = None) -> Optional[str]:
+                              firehose_folder: Optional[str] = None,
+                              trace_folder: Optional[str] = None) -> Optional[str]:
     """An error message for evidence switches that cannot work as given, else None."""
-    if opts.flightaware_identity and not (integrate_pos and firehose_folder):
-        return "--flightaware-identity needs --integrate-pos true and --firehose-folder"
+    if opts.flightaware_identity and not ((integrate_pos and firehose_folder) or trace_folder):
+        return ("--flightaware-identity needs --integrate-pos true and --firehose-folder, or "
+                "a --trace-folder whose points carry FlightAware fields (S3 builder tf)")
     needs_pos = [name for name, on in (("--acars-identity", opts.acars_identity),
                                        ("--pos-extend-ends", opts.pos_extend_ends),
                                        ("--pos-only-flights", opts.pos_only_flights)) if on]
@@ -2682,7 +2909,8 @@ def run_evidence_stage(opts: EvidenceOptions,
     for seg in all_segments:
         registrations[seg.aircraft_id] = seg.registration
     pos_by_aircraft = index_pos_by_aircraft(pos_index, unmapped_pos)
-    fa_by_aircraft = index_fa_by_aircraft(pos_index) if opts.flightaware_identity else None
+    fa_by_aircraft = (index_fa_by_aircraft(pos_index, segments=all_segments)
+                      if opts.flightaware_identity else None)
     if fa_by_aircraft is not None:
         print(f"  FlightAware fixes with a flight id: "
               f"{sum(len(v) for v in fa_by_aircraft.values())} for {len(fa_by_aircraft)} aircraft")
@@ -3876,6 +4104,9 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
                      takeoff_from: Optional[str] = None,
                      takeoff_to: Optional[str] = None,
                      evidence: Optional[EvidenceOptions] = None,
+                     track_input: str = "kml-folder",
+                     track_source: str = "KML",
+                     trace_summary: Optional[Dict[str, Any]] = None,
                      argv: Optional[List[str]] = None):
     """Main processing pipeline driven by a ConfidencePreset.
 
@@ -3887,7 +4118,9 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
     GeoPackage. ``takeoff_from``/``takeoff_to`` (``YYYY-MM-DD``, inclusive) keep only flights
     whose UTC takeoff date is in range. The diagnostics CSV is always written.
     ``evidence`` switches on the endpoint-evidence stage (run_endpoint_evidence); with
-    every switch off the build is 1.4.0's.
+    every switch off the build is 1.4.0's. ``kml_files`` may also hold trace JSON files
+    (parse_trace_json); ``track_input`` / ``track_source`` / ``trace_summary`` describe
+    the input in ``meta``.
     """
     evidence = evidence or EvidenceOptions()
     use_evidence = evidence.any()
@@ -3925,7 +4158,11 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
         aircraft_id = extract_aircraft_id(input_file)
         print(f"\nProcessing: {os.path.basename(input_file)} (Aircraft: {aircraft_id})")
 
-        all_tracks = parse_kml_tracks(input_file, aircraft_id)
+        if input_file.endswith(".json"):
+            all_tracks = parse_trace_json(input_file, aircraft_id,
+                                          source=None if track_source == "KML" else track_source)
+        else:
+            all_tracks = parse_kml_tracks(input_file, aircraft_id)
         print(f"Found {len(all_tracks)} useful tracks")
 
         for track_points, registration, style_color, style_width, style_opacity in all_tracks:
@@ -4092,7 +4329,10 @@ def process_kml_files(kml_files: List[str], airports: List["Airport"], routes: L
             "suspect_od_ratio": str(suspect_od_ratio),
             "suspect_od_count": str(len(suspect)),
             "evidence_options": json.dumps(evidence_options_meta(evidence)),
+            "track_input": track_input, "track_source": track_source,
         }
+        if trace_summary is not None:
+            meta["trace_folder"] = json.dumps(trace_summary)
         if use_evidence:
             meta.update(evidence_meta)
             meta.update(endpoint_counts_meta(final_segments))
@@ -4172,7 +4412,18 @@ def main():
                             help='Specific KML files to process')
     input_group.add_argument('--kml-folder', 
                             help='Folder containing KML files to process')
+    input_group.add_argument('--trace-folder', default=None, dest='trace_folder',
+                            help='Folder of one source\'s daily trace files: ADS-B Exchange '
+                                 'JSON (<icao>_<date>_trace.json), adsb.lol, or the S3 trace '
+                                 'builder (<icao>_<date>_<code>_trace.json / _<code>_baro.kml); '
+                                 'website KML (<icao>_<date>_<alt>.kml) too. Other names and '
+                                 '_nodata.json markers are not read as tracks')
     
+    parser.add_argument('--trace-source', choices=['auto', 'adsbx', 'adsblol', 's3'],
+                       default='auto', dest='trace_source',
+                       help='Which source the --trace-folder holds (default auto: an S3 builder '
+                            'file says so; a folder with manifest.csv or LICENSE-ODbL.txt, or '
+                            'named *_traces_lol, is adsb.lol; anything else is ADS-B Exchange)')
     parser.add_argument('--airports', required=True, nargs='+',
                        help='CSV file(s) containing airport data; an airport code in a later '
                             'file replaces the same code in an earlier one')
@@ -4387,19 +4638,41 @@ def main():
         recover_dropped=args.recover_dropped == 'true',
         flightaware_identity=args.flightaware_identity == 'true')
     evidence_error = validate_evidence_options(evidence, integrate_pos, args.pos_folder,
-                                               args.firehose_folder)
+                                               args.firehose_folder, args.trace_folder)
     if evidence_error:
         print(f"Error: {evidence_error}")
         sys.exit(1)
 
     kml_files = []
-    if args.kml_files:
+    track_input, track_source, trace_summary = "kml-files", "KML", None
+    if args.trace_folder:
+        if not os.path.isdir(args.trace_folder):
+            print(f"Error: trace folder not found: {args.trace_folder}")
+            sys.exit(1)
+        found = discover_trace_folder(
+            args.trace_folder, source=None if args.trace_source == 'auto' else args.trace_source)
+        track_input, track_source, trace_summary = "trace-folder", found.source, found.summary()
+        if found.skipped:
+            shown = ", ".join(found.skipped[:3]) + (", ..." if len(found.skipped) > 3 else "")
+            print(f"Warning: skipping {len(found.skipped)} file(s) whose names are not trace "
+                  f"files: {shown}")
+        kml_files = found.files
+        print(f"Trace folder ({found.source}): {len(kml_files)} trace file(s); "
+              f"{len(found.nodata)} tail-day(s) checked with no data (no-data markers); "
+              f"{found.not_downloaded} tail-day(s) with neither a trace nor a marker"
+              + (f"; JSON read instead of KML for {found.json_over_kml}"
+                 if found.json_over_kml else ""))
+        if not kml_files:
+            print(f"Error: No trace files found in {args.trace_folder}")
+            sys.exit(1)
+    elif args.kml_files:
         for f in args.kml_files:
             if not os.path.exists(f):
                 print(f"Error: KML file not found: {f}")
                 sys.exit(1)
         kml_files = args.kml_files
     else:
+        track_input = "kml-folder"
         pattern = os.path.join(args.kml_folder, "*.kml")
         kml_files = glob.glob(pattern)
         if not kml_files:
@@ -4421,9 +4694,9 @@ def main():
         kml_files, n_skipped = filter_kml_files_by_date(kml_files, args.takeoff_from,
                                                         args.takeoff_to)
         print(f"Takeoff dates {args.takeoff_from or '(any)'} .. {args.takeoff_to or '(any)'}: "
-              f"skipping {n_skipped} KML file(s) dated outside the range")
+              f"skipping {n_skipped} input file(s) dated outside the range")
         if not kml_files:
-            print("Error: No KML files left inside the takeoff date range")
+            print("Error: No input files left inside the takeoff date range")
             sys.exit(1)
 
     for path in args.airports:
@@ -4514,6 +4787,9 @@ def main():
         takeoff_from=args.takeoff_from,
         takeoff_to=args.takeoff_to,
         evidence=evidence,
+        track_input=track_input,
+        track_source=track_source,
+        trace_summary=trace_summary,
         argv=sys.argv[1:],
     )
 

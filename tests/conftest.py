@@ -253,3 +253,83 @@ def evidence_fixture(tmp_path_factory):
     return {"root": root, "kml_dir": kml_dir, "pos": pos_dir, "tails": root / "tails.csv",
             "airports": root / "airports.csv", "routes": root / "routes.csv",
             "legs": root / "legs.csv"}
+
+
+def readsb_point(day_start: datetime, t: datetime, lat, lon, alt, geom=None, gs=420.0,
+                 track=90.0, vrate=0, details=None, src="adsb_icao", flags=0):
+    """One readsb ``trace_full`` point: 14 values, time as seconds after ``day_start``."""
+    return [round((t - day_start).total_seconds(), 2), lat, lon, alt, gs, track, flags, vrate,
+            details, src, geom, None, None, None]
+
+
+def write_readsb_trace(path: Path, icao: str, reg: str, day_start: datetime, points,
+                       gzip_it: bool = False, **extra) -> Path:
+    """A trace file as the ADS-B Exchange site / adsb.lol give it (``extra``: more keys)."""
+    import gzip
+    doc = {"icao": icao, "r": reg, "t": "B38M", "dbFlags": 0,
+           "timestamp": day_start.timestamp(), "trace": points}
+    doc.update(extra)
+    data = json.dumps(doc).encode()
+    path.write_bytes(gzip.compress(data) if gzip_it else data)
+    return path
+
+
+def flight_trace(day_start, start, minutes, a, b, step_s=20, ground_min=8, geo_offset_ft=1900):
+    """readsb points for one flight a->b: taxi out on the ground, the airborne leg (climb and
+    descent over 15% each, cruise 33,000 ft barometric, satellite altitude ``geo_offset_ft``
+    higher), then taxi in. Returns the points and the airborne (t, lat, lon, geom_m) list."""
+    pts, air = [], []
+    for k in range(ground_min * 60 // step_s):
+        t = start - timedelta(seconds=(ground_min * 60) - k * step_s)
+        pts.append(readsb_point(day_start, t, a[0], a[1], "ground", gs=10.0))
+    n = int(minutes * 60 / step_s)
+    for i in range(n + 1):
+        f = i / n
+        t = start + timedelta(seconds=i * step_s)
+        baro = int(100 + 32900 * min(1.0, f / 0.15, (1 - f) / 0.15))
+        lat, lon = a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f
+        geom = baro + geo_offset_ft
+        pts.append(readsb_point(day_start, t, lat, lon, baro, geom=geom))
+        air.append((t, lat, lon, geom * 0.3048))
+    end = start + timedelta(seconds=n * step_s)
+    for k in range(1, ground_min * 60 // step_s):
+        t = end + timedelta(seconds=k * step_s)
+        pts.append(readsb_point(day_start, t, b[0], b[1], "ground", gs=10.0))
+    return pts, air
+
+
+@pytest.fixture(scope="session")
+def trace_fixture(tmp_path_factory):
+    """Synthetic ADS-B Exchange JSON day for one aircraft, and the same airborne points as a
+    website-style KML, for the JSON-vs-KML equivalence.
+
+    abc201 (XA-JSN) 2026-10-01: AAA->BBB at 10:00 (60 min), BBB->AAA at 13:00 (60 min).
+    Two airborne points have no satellite altitude (the KML leaves them out); one point has
+    no position. Also a no-data marker for abc202 and a hand-made export to be skipped.
+    """
+    root = tmp_path_factory.mktemp("trace_fixture")
+    jdir, kdir = root / "adsbx_json", root / "kml"
+    jdir.mkdir()
+    kdir.mkdir()
+    AAA, BBB = (0.0, 0.0), (0.0, 5.0)
+    (root / "airports.csv").write_text(
+        "airport,latitude,longitude,elevation_ft\nAAA,0.0,0.0,100\nBBB,0.0,5.0,100\n")
+    (root / "routes.csv").write_text(
+        "origin,destination,avg_enroute_min\nAAA,BBB,60\nBBB,AAA,60\n")
+    day = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    p1, a1 = flight_trace(day, day + timedelta(hours=10), 60, AAA, BBB)
+    p2, a2 = flight_trace(day, day + timedelta(hours=13), 60, BBB, AAA)
+    for i in (40, 41):                       # no satellite altitude
+        p1[24 + i][10] = None
+    p1[24 + 60][1] = None                    # no position
+    dropped = {p1[24 + i][0] for i in (40, 41, 60)}
+    a1 = [x for x in a1 if round((x[0] - day).total_seconds(), 2) not in dropped]
+    write_readsb_trace(jdir / "abc201_2026-10-01_trace.json", "abc201", "XA-JSN", day, p1 + p2)
+    (jdir / "abc202_2026-10-01_nodata.json").write_text(json.dumps(
+        {"icao": "abc202", "date": "2026-10-01", "http_status": 404,
+         "source": "globe.adsbexchange.com", "checked_utc": "2026-11-19T17:04:14Z"}))
+    (jdir / "XA-JSN-track-EGM96_avg.kml").write_text("<kml/>")     # a manual export
+    flights = [[(t, lat, lon, alt) for t, lat, lon, alt in a] for a in (a1, a2)]
+    _write_track_kml(kdir / "abc201_2026-10-01_baro_avg.kml", "XA-JSN", flights)
+    return {"root": root, "json_dir": jdir, "kml_dir": kdir, "day": day,
+            "airports": root / "airports.csv", "routes": root / "routes.csv"}

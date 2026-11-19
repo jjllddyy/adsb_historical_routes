@@ -5,6 +5,31 @@ All notable changes to the Flight Route Splitter project will be documented in t
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-11-19 (trace-json branch)
+
+### Added
+
+- **`--trace-folder`** reads daily trace files from one source per folder:
+  - the ADS-B Exchange site's JSON (`<icao>_<date>_trace.json`);
+  - adsb.lol (same layout and name);
+  - the S3 trace builder (`<icao>_<date>_<code>_trace.json` or `_<code>_baro.kml`);
+  - website KML.
+- Only fixed file names are read. Hand-made exports such as `N105JS-track-EGM96_avg.kml` are skipped with a warning.
+- `_nodata.json` markers are counted ("checked, no data"), and aircraft-days with neither a trace nor a marker are reported.
+- JSON is read instead of KML for the same aircraft-day. Gzip files are accepted.
+- `--trace-source auto|adsbx|adsblol|s3`.
+- `meta.track_input`, `meta.track_source` and `meta.trace_folder` record the input.
+- **`parse_trace_json`** returns what `parse_kml_tracks` returns for the website KML of the same day:
+  - it cuts the day into ground and airborne sections, and ground sections drop out as before;
+  - it uses the satellite altitude, falling back to barometric only when a file has none;
+  - each point keeps the reported speed, vertical rate, callsign, position source and flags.
+  - Checked on a real ADS-B Exchange pair (a01820, 2026-03-01): the same 5 airborne tracks, the same times and positions point for point (except the one section-end repeat the site writes per track), and altitudes within 39 m.
+- `--flightaware-identity` also reads FlightAware fields carried on the track points (S3 builder `tf` traces).
+
+### Changed
+
+- The takeoff-date filter messages say "input file(s)" instead of "KML file(s)".
+
 ## [1.5.0] - 2026-11-03 (endpoint-evidence branch)
 
 ### Added

@@ -30,3 +30,6 @@ Thumbs.db
 
 # Route Builder runtime state (seeded from manifest.default.json on first run)
 route_builder/manifest.json
+
+# Real trace data used by optional tests (not committed; see tests/test_trace_json.py)
+tests/fixtures/real/

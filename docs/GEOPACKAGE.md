@@ -32,6 +32,7 @@ python3 adsb_historical_routes.py \
 | `--navdb`, `--company`, `--qgis-repo` | none, none, `$QGIS_REPO` or `~/Git/qgis` | The project's chart-layer navdb (required with `--qgz`, checked before the build), an optional `company_routes` GeoPackage, and the qgis checkout. |
 | `--takeoff-from`, `--takeoff-to` | none | Keep only flights whose UTC takeoff date is in the range (inclusive, `YYYY-MM-DD`). Daily KML files dated more than one day outside it are not read. Excluded flights stay in the diagnostics as `dropped_date_range`. |
 | `--airports A.csv [B.csv ...]` | | One or more airport files; a code in a later file replaces the same code in an earlier one (v3). |
+| `--trace-folder`, `--trace-source` | none, `auto` | Read daily trace JSON (ADS-B Exchange, adsb.lol, S3 trace builder) instead of KML; see the README. Recorded in `meta.track_input`, `meta.track_source` and `meta.trace_folder` (file, marker and skip counts). |
 | Endpoint evidence | all off | `--acars-identity`, `--pos-extend-ends`, `--pos-only-flights`, `--pos-fleets`, `--rotation-endpoints`, `--planned-legs`, `--recover-dropped` and their limits: §7. With all of them off the flights are 1.4.0's. |
 
 - **Naming:** `{from}` and `{to}` in `--output` become the first and last flight dates (UTC takeoff).
@@ -99,6 +100,7 @@ Indexes: `flight_id` (unique), `city_pair`, `group_key`, `dest`, `origin`, `flig
 - **`meta`**: key/value rows.
   - `schema_name` (`flown_routes`), `schema_version` (`3`), `tool`, `tool_version`, `created_utc`, `airline`, `date_from`, `date_to`, `argv` (JSON), `source_count`.
   - Also `preset`, `group_by`, `sample_minutes`, `stitch_gap_min`, `integrate_pos`, `track_points`, `kml_params` (JSON), `flight_count`, `suspect_od_ratio` and `suspect_od_count`.
+  - **1.6.0:** `track_input` (`kml-folder` / `kml-files` / `trace-folder`) and `track_source` (`KML`, `ADSBX`, `ADSBLOL`, `S3_<feed>`), always; `trace_folder` (JSON counts: trace files, JSON, KML, no-data markers, aircraft-days not downloaded, skipped names, JSON read instead of KML) with `--trace-folder`.
   - **v3:** `evidence_options` (JSON, always). When the evidence stage ran: `planned_legs` (files, rows, date range), `planned_leg_airports_missing`, `flight_number_prefixes` (ACARS prefix → plan carrier, learned from rule-1 matches), `endpoint_sources`, `endpoint_confidence`, `flight_number_sources`, `flights_by_sources_disposition`, `endpoint_conflict_count`, `evidence_report` (the whole report as JSON) and `pos_read_seconds`.
 
 **Date line (v2).** `flights` and `tracks_full` are MULTILINESTRINGs. A line is cut where two

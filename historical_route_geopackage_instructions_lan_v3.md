@@ -616,7 +616,7 @@ names are hidden by default (`--labels true` shows them); the description gives 
 | `unrecognized arguments: --acars-identity` | A 1.4.0 checkout: `git checkout endpoint-evidence`. |
 | `Warning: POS folder given but no tail<->hex map` | `--tail-icao` is missing or its path is wrong. |
 | `Error: Cannot create output directory` | `/Volumes/jy-ext` is not mounted. |
-| `Error: No KML files left inside the takeoff date range` | The trace folder has no files dated within a day of 2026-07-14 … 2026-09-30. |
+| `Error: No input files left inside the takeoff date range` (1.5: `No KML files left …`) | The trace folder has no files dated within a day of 2026-07-14 … 2026-09-30. |
 | Many flights rescued to, or dropped near, one place that is not in the airports file | That airport is missing. Add it to the Cirium extract, or to `airport_overrides.csv`, and rebuild (§3). |
 | The `.gpkg.part` file is left behind | The run was interrupted. Delete it and run again; the GeoPackage is only renamed into place when complete. |
 

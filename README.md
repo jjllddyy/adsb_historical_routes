@@ -292,6 +292,20 @@ records use the current `SPJC`. Add rows as new mismatches are found.
 
 `--airports` accepts several files; a code in a later file replaces an earlier one.
 
+**Trace JSON inputs** (1.6.0; instead of `--kml-folder` / `--kml-files`)
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--trace-folder` | *(none)* | One source's daily trace files: ADS-B Exchange JSON (`<icao>_<date>_trace.json`), adsb.lol (same name), the S3 trace builder (`<icao>_<date>_<code>_trace.json` or `_<code>_baro.kml`), or website KML (`<icao>_<date>_<alt>.kml`). JSON is read instead of KML for the same aircraft-day. `<icao>_<date>_nodata.json` markers are counted ("checked, no data"); any other file name is skipped with a warning. |
+| `--trace-source` | `auto` | `adsbx`, `adsblol` or `s3`. `auto`: an S3 builder file says so; a folder with `manifest.csv` or `LICENSE-ODbL.txt`, or named `*_traces_lol`, is adsb.lol; anything else is ADS-B Exchange. Recorded as `meta.track_source`. |
+
+The JSON reader gives the same tracks as the website's KML of the same day. It cuts the day where the
+aircraft goes from ground to airborne, and uses the satellite altitude, as the website's default KML does. The barometric
+altitude is used only when a file has no satellite altitude (the S3 builder). Each point keeps the reported
+speed, vertical rate, callsign and position source. With `--flightaware-identity`, FlightAware fields on the
+track points (S3 builder `tf` files) are used as well. One folder holds one source; choosing between
+sources per flight is planned (see `docs/plans/2026-11-19-trace-inputs.md`).
+
 **Styling / display**
 
 | Parameter | Default | Description |
